@@ -1,0 +1,14 @@
+{
+  "name": "student-simple-06sept26",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=24.21.0 <25.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
