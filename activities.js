@@ -1951,9 +1951,14 @@ async function handleItem(req, res, studentId) {
  *             the request's own stream failed before it could be answered, in
  *             which case the fault is logged here and the response destroyed,
  *             so no request is ever left claimed and hanging.
- *   `false` — the path lies outside the namespace. NOTHING has been written to
- *             `res`, not a status and not a header, so the caller's own
- *             response is exactly what it always was.
+ *   `false` — the request target does not resolve into the namespace, which
+ *             happens in two ways. Either this module will not name the
+ *             target at all — it is not origin-form, it will not parse, or
+ *             its resolved origin is foreign or opaque — or the normalized
+ *             pathname it does name lies outside the namespace. NOTHING has
+ *             been written to `res` in either case, not a status and not a
+ *             header, because both returns sit ahead of every write, so the
+ *             caller's own response is exactly what it always was.
  *
  * Route resolution happens before the method is considered, and both happen
  * before any I/O. Every store refusal is mapped to its own status here; a

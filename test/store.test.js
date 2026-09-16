@@ -328,13 +328,22 @@ const MAX_ENTRY_COMPRESSED_BYTES = 1024 * 1024;
 const MAX_PART_BYTES = 4 * 1024 * 1024;
 const LAST_COLUMN_LETTERS = 'XFD';
 
-/** The reader refusal codes this suite scripts, and tests membership against. */
+/**
+ * The reader's complete declared refusal vocabulary, in the reader's own
+ * order. Both consumers need it whole: the membership assertion has to admit
+ * every code a refusal can carry, and the translation loop drives one case per
+ * code.
+ */
 const READER_REFUSAL_CODES = [
   E_XLSX_UNSUPPORTED_COMPRESSION,
   E_XLSX_UNSUPPORTED_FLAGS,
+  E_XLSX_UNSUPPORTED_SOURCE,
   E_XLSX_PART_NOT_FOUND,
   E_XLSX_SHARED_STRINGS_UNSUPPORTED,
+  E_XLSX_UNSUPPORTED_CELL_TYPE,
   E_XLSX_TRUNCATED,
+  E_XLSX_MALFORMED_XML,
+  E_XLSX_LIMIT_EXCEEDED,
 ];
 
 /* ========================================================================= *

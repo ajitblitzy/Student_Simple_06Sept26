@@ -48,11 +48,15 @@
  *     `ACTIVITY_STORE` pointing inside a `mkdtemp` directory that is removed
  *     afterwards. Without it a child would materialise `activities.json` in the
  *     repository root, because that is the store's documented default.
- *   - NO RELIANCE ON `--test-force-exit`. This file spawns children rather than
- *     importing the service, so it holds no listener; every request is made
- *     with `agent: false` and `Connection: close` so no keep-alive socket
- *     outlives its response. If the runner ever hangs on this file, that is a
- *     defect in this file.
+ *   - NO RELIANCE ON `--test-force-exit`. This file is child-process-driven,
+ *     and the one case that requires `../server` binds port 0 and closes that
+ *     listener in a `finally` on a bounded deadline, so no listener outlives
+ *     the run — requiring the module binds nothing, which that case asserts.
+ *     Every request is made with `agent: false` and `Connection: close`, so no
+ *     keep-alive socket outlives its response; the handle that would hold the
+ *     loop open is an exchange that never settled, which the deadlines below
+ *     prevent. If the runner ever hangs on this file, that is a defect in this
+ *     file.
  *   - THE ASSERTIONS DESCRIBE THE RESPONSE AS IT SHIPS. The `Content-Type` of
  *     the preserved response is asserted to be exactly `text/plain`, with no
  *     charset parameter, because that absence is preserved behaviour and this
@@ -1257,13 +1261,13 @@ async function stopService(handle) {
  * unnoticed — the one thing a byte-for-byte assertion exists to catch.
  *
  * EVERY EXCHANGE IS DEADLINED, and a response that never completes is a
- * FAILURE rather than a wait. An earlier form of this helper settled only on
- * the response's `'end'` event, which left two product defects with no
- * assertion to fail: a service that accepts a connection and never answers,
- * and a response whose socket closes before the body is complete. Either left
- * the promise and its socket pending until the runner's ambient timeout fired
- * somewhere else entirely, turning a legible defect into a hang with no
- * diagnosis. Both now reject, naming the request and what was observed.
+ * FAILURE rather than a wait. Settling only on the response's `'end'` event
+ * would leave two product defects with no assertion to fail: a service that
+ * accepts a connection and never answers, and a response whose socket closes
+ * before the body is complete. Either would leave the promise and its socket
+ * pending until the runner's ambient timeout fired somewhere else entirely,
+ * turning a legible defect into a hang with no diagnosis. Both reject here,
+ * naming the request and what was observed.
  *
  * Three guards, because they catch different shapes of the same fault: an
  * ABSOLUTE deadline on the whole exchange, a SOCKET-INACTIVITY deadline via
