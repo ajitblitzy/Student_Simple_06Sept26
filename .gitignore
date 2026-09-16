@@ -1,6 +1,25 @@
+# Ignore policy - the repository's first. Governing rule:
+# Ajit_AddNewFeature_Rule, minimal-change area: every pattern below names
+# something this feature or its tests actually produce, and nothing more.
+# These rules prevent the accident, not the act: `git add -f` overrides them,
+# and a path's absence from `git status` says nothing about the index or history.
+# No blank lines here, deliberately: core.autocrlf=true checks this file out
+# with CRLF, and a blank CRLF line parses as a live empty pattern.
+#
+# Runtime activity store and its atomic-write staging sibling: submitted data
+# linked to Student IDs, written by the service, never committed, never
+# pre-created. Exact names, never an `activities*` glob, which would silently
+# un-track activities.js and activity-store.js. Default in-tree names only;
+# ACTIVITY_STORE can move both outside the checkout.
 activities.json
 activities.json.tmp
+#
+# npm install output: zero dependencies are declared, but a manifest now exists.
 node_modules/
+#
+# Test evidence: --experimental-test-coverage output and captured server logs.
 coverage/
 *.log
+#
+# Local environment files; the feature's only variable is ACTIVITY_STORE.
 .env*
