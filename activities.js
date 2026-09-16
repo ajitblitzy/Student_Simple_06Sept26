@@ -5,12 +5,7 @@
  *
  * WHAT THIS MODULE OWNS
  * ---------------------
- * The request surface, and only that. This is the first code in the project
- * that reads a request — until now `req` was a declared parameter that no
- * statement dereferenced — and it carries the project's first user interface,
- * a submission form rendered from a template literal further down this file.
- *
- * Three routes, one namespace:
+ * The request surface, and only that. The routes of the namespace are:
  *
  *   GET  /activities               the submission form (HTML)
  *   POST /activities               a submission, form-encoded or JSON
@@ -18,11 +13,16 @@
  *
  * The single export is `handle`, and its BOOLEAN RESULT is the whole
  * integration surface: `true` means this module claimed the request and has
- * answered it, `false` means the path lies outside the namespace and the
- * caller should fall through to its own behaviour. That one bit is what keeps
- * the change in `server.js` to a single branch, and it is why NOTHING is
- * written to `res` on the `false` path — a request this module declines has to
- * be left exactly as it was found, header for header.
+ * answered it, `false` means the request target does not resolve into the
+ * namespace and the caller falls through to its own behaviour. That one bit is
+ * what keeps the caller's side of the integration to a single branch, and it
+ * is why NOTHING is written to `res` on the `false` path — a request this
+ * module declines is left exactly as it was found, header for header.
+ * `handle` is asynchronous, so a caller awaits it inside an asynchronous
+ * request handler and returns early once it answers `true`.
+ *
+ * The form and its result pages are template literals in this file, so there
+ * is no static asset and nothing is read from disk to render a page.
  *
  * WHAT THIS MODULE DOES NOT OWN
  * -----------------------------
@@ -34,56 +34,11 @@
  * store" would spread one rule across two files and leave neither able to
  * enforce it.
  *
- * It does not own `internal_error` either. That fourth 500 belongs to the
+ * It does not own `internal_error` either. That 500 belongs to the
  * `try`/`catch` in `server.js`, which is the rejection boundary for anything
  * this module fails to anticipate. Everything the store can refuse IS
  * anticipated here and mapped to a code of its own, because an escaped
  * rejection would arrive as `internal_error` and mask the real cause.
- *
- * GOVERNING RULE: `Ajit_AddNewFeature_Rule`
- * -----------------------------------------
- * Summarized, never reproduced. Three of its areas bear on this file.
- *
- * Its SYSTEM BOUNDARIES area is why the namespace predicate below is exact
- * rather than convenient. The path is taken from `new URL(...).pathname`, so a
- * query string cannot reach the match; a single trailing slash is stripped;
- * and the test is segment-safe. A `startsWith` against the raw `req.url` would
- * capture `/activities-old` and `/activitieslist`, and the promise that every
- * path outside this namespace behaves exactly as it did before would quietly
- * become false.
- *
- * Its TECHNICAL IMPLEMENTATION area is why every row of the response matrix is
- * implemented, in the documented validation order, behind the guarded body
- * read — those are the deliverable, not hardening to be added later.
- *
- * Its MINIMAL CHANGE AND DISCIPLINE area is why there is no framework, no
- * router library, no template engine, no static asset, no client-side
- * JavaScript, no bundler, no CORS header, no cookie, no session, no request
- * logging and no fourth endpoint. The form and the result page are template
- * literals here, so the repository root gains no asset and nothing is read
- * from disk to render a page. The only `require` is `./activity-store`: `URL`
- * and `URLSearchParams` are globals, so not even `node:querystring` is needed,
- * and `node:http` is not required because this module is handed the request
- * and response objects rather than creating a server.
- *
- * Usage, from `server.js`. The call belongs INSIDE an asynchronous request
- * handler: `handle` is async, so the `await` and the early `return` below are
- * only legal there, and the example is written out in full because a fragment
- * of it does not parse on its own. `server.js` additionally wraps the call in
- * the rejection boundary that owns `internal_error`, which is not reproduced
- * here — that boundary is its contract, not this module's.
- *
- *   const http = require('node:http');
- *   const activities = require('./activities');
- *
- *   const server = http.createServer(async (req, res) => {
- *     if (await activities.handle(req, res)) {
- *       return;                                     // claimed and answered
- *     }
- *     res.statusCode = 200;                         // a path this module
- *     res.setHeader('Content-Type', 'text/plain');  // declined, answered
- *     res.end('Hello, World Welcome to Sharebot!\n'); // exactly as before
- *   });
  */
 
 const store = require('./activity-store');
@@ -92,7 +47,11 @@ const store = require('./activity-store');
  * The namespace, and the shape of a Student ID
  * ------------------------------------------------------------------------- */
 
-/** The only path this module claims. Nothing outside it is touched. */
+/**
+ * The namespace root. This module claims this path and its sub-resources —
+ * including a sub-resource that resolves to no route, which it answers `404` —
+ * and declines every other path.
+ */
 const NAMESPACE_PATH = '/activities';
 
 /**
@@ -111,9 +70,85 @@ const NAMESPACE_PREFIX = `${NAMESPACE_PATH}/`;
 const PATH_RESOLUTION_BASE = 'http://localhost';
 
 /**
- * The Student ID form, taken from the data rather than invented: all thirty
- * Student ID cells across the three workbooks are `S` followed by exactly
- * three digits.
+ * The origin a resolved target must still carry.
+ *
+ * Resolving a path against the base leaves the base's origin in place. A target
+ * naming a DIFFERENT authority carries that authority instead
+ * (`//evil.example/activities` resolves to origin `http://evil.example`), and a
+ * target naming a non-special scheme carries the opaque origin `null`
+ * (`javascript:/activities`). Comparing against this value catches exactly
+ * those two outcomes and nothing else.
+ *
+ * What it does NOT establish is that the target was a path. A target naming
+ * THIS base's own authority resolves to this very origin: the authority-form
+ * and absolute-form targets that spell out `localhost` both yield origin
+ * `http://localhost` and pathname `/activities`, so the only thing standing
+ * between those forms and the namespace is the syntax test below. The origin
+ * comparison is a backstop for the foreign-authority and opaque-origin cases,
+ * not a second enforcement of origin-form.
+ *
+ * It is kept because those are the cases where a canonicalized pathname is most
+ * misleading, and because the value is derived from the base rather than written
+ * out, so the pair cannot drift apart.
+ */
+const PATH_RESOLUTION_ORIGIN = new URL(PATH_RESOLUTION_BASE).origin;
+
+/**
+ * The syntax a request target must have before its pathname is trusted:
+ * origin-form, which is the form a client addressing this service directly
+ * sends.
+ *
+ * `URL` resolution canonicalizes; it does not validate. It yields a namespace
+ * pathname for targets that are not paths at all, so without this test the
+ * namespace is reachable by a target that never named it. Each form below is
+ * written with the pathname it actually resolves to:
+ *
+ *   - `//evil.example/activities`, and `/\evil.example/activities` — a second
+ *     leading slash, and a leading backslash, both begin an AUTHORITY, so the
+ *     resolved URL carries that authority in place of the base's while its
+ *     pathname reads `/activities`.
+ *   - `http://evil.example/activities` — absolute-form, the same effect written
+ *     out in full. The pair that spells out the resolution base's OWN authority
+ *     is sharper still: it keeps that origin as well as the pathname, so
+ *     nothing but this test distinguishes it from the path `/activities`.
+ *   - `javascript:/activities` — a scheme of its own, so the resolved URL is
+ *     not an HTTP URL at all, yet its pathname still reads `/activities`.
+ *   - `\activities` — a leading backslash where the slash belongs, which
+ *     resolves to the pathname `/activities` on this very origin.
+ *   - `/activities\S001` and `/activities\` — under a special scheme a
+ *     backslash IS a path separator, so these resolve to `/activities/S001`
+ *     and `/activities/`, reaching the item route and the collection route
+ *     respectively rather than the pathname the target spelled.
+ *   - a target holding a tab, CR or LF — those characters are stripped before
+ *     parsing, so `/activ<TAB>ities` resolves to `/activities`.
+ *
+ * Two further forms are refused here without ever having canonicalized into the
+ * namespace — `*`, which resolves to `/*`, and `data:text/html,/activities`,
+ * whose pathname is `text/html,/activities`. Neither is a path, so neither has
+ * business being matched against the route table at all.
+ *
+ * Three clauses cover all of it: exactly one leading slash, which excludes
+ * absolute-form, asterisk-form and every scheme form; no character the parser
+ * reads as a separator immediately after that slash, which excludes both
+ * authority forms; and no C0 control, space or DEL anywhere, which excludes the
+ * stripped characters. A backslash is excluded outright rather than handled as
+ * a separator, because a request target has no use for one.
+ *
+ * Characters above the ASCII range are deliberately admitted: they are
+ * percent-encoded rather than interpreted, they cannot become a separator, and
+ * the namespace is pure ASCII, so such a target resolves to a pathname outside
+ * it and is declined on that basis instead.
+ *
+ * A target this pattern refuses is answered `null` by `requestPathname`, so it
+ * leaves the namespace to the caller's fall-through — the same response every
+ * unclaimed path receives. Some of these forms never reach a handler at all —
+ * the runtime answers an invalid request line with its own `400` first — and
+ * the rest arrive here, which is why the test is worth having.
+ */
+const ORIGIN_FORM_TARGET = /^\/(?![/\\])[^\\\u0000-\u0020\u007f]*$/;
+
+/**
+ * The Student ID form: `S` followed by exactly three digits.
  *
  * This duplicates a pattern `activity-store.js` also holds, deliberately.
  * `isKnownStudent` answers `false` for a malformed value without reading a
@@ -143,19 +178,19 @@ const ALLOW_COLLECTION = 'GET, POST';
 const ALLOW_ITEM = 'GET';
 
 /**
- * The two request media types `POST /activities` accepts. The first is what a
- * browser form posts by default, which is exactly why the form below needs no
- * client-side JavaScript: its native encoding and this endpoint's accepted
- * type are the same thing.
+ * The request media types `POST /activities` accepts. The form encoding is
+ * what a browser form posts by default, which is exactly why the form below
+ * needs no client-side JavaScript: its native encoding and this endpoint's
+ * accepted type are the same thing.
  */
 const MEDIA_TYPE_FORM = 'application/x-www-form-urlencoded';
 const MEDIA_TYPE_JSON = 'application/json';
 
 /**
- * Response media types. Both carry an explicit charset. The legacy
- * `text/plain` response in `server.js` deliberately carries none, and is not
- * touched by this feature — a path outside this namespace must stay byte for
- * byte what it was.
+ * The response media types for everything this module answers. Both carry an
+ * explicit charset. A request whose path falls outside the namespace is
+ * answered by the caller, which sets its own headers: this module writes none
+ * on that path, so nothing here reaches a response it did not claim.
  */
 const CONTENT_TYPE_HTML = 'text/html; charset=utf-8';
 const CONTENT_TYPE_JSON = 'application/json; charset=utf-8';
@@ -178,7 +213,6 @@ const MAX_BODY_BYTES = 8192;
 const MODE_FORM = 'form';
 const MODE_JSON = 'json';
 
-/** The two body fields a submission carries. */
 const FIELD_STUDENT_ID = 'studentId';
 const FIELD_ACTIVITY = 'activity';
 
@@ -239,19 +273,6 @@ const FAILURES = Object.freeze({
     400,
     'activity_invalid',
     'An activity must be a label of 1 to 60 characters and must not contain control characters.'
-  ),
-  /**
-   * A submission a browser was made to send from somewhere other than this
-   * service's own form. `403` rather than `400`: the request is perfectly
-   * well-formed, and what is refused is the authority to act on it, which is
-   * exactly the distinction the 400-versus-404 split already draws elsewhere
-   * in this vocabulary. The sentence names the remedy without naming the
-   * offending origin, so nothing a client sent is reflected back at it.
-   */
-  CROSS_ORIGIN_SUBMISSION: failure(
-    403,
-    'cross_origin_submission',
-    "A submission must be sent from this service's own form, not from another origin."
   ),
   STUDENT_NOT_FOUND: failure(
     404,
@@ -338,10 +359,11 @@ function storeFailureFor(error) {
  * The failure codes a person who filled in the form can actually act on, and
  * therefore the only ones rendered as HTML.
  *
- * Everything else stays the JSON envelope in both request modes: 413 and 415
- * are decided before the body's format is known, an unresolved route has no
- * form context to re-display, a 405 answers a client that chose its own
- * method, and a 500 is a fault no amount of retyping fixes.
+ * Everything else stays the JSON envelope in both request modes: a 415 refuses
+ * the declared media type, so no accepted mode exists to render into; a 413
+ * refuses the body unread, so there are no submitted values to re-display; an
+ * unresolved route has no form context to re-display, a 405 answers a client
+ * that chose its own method, and a 500 is a fault no amount of retyping fixes.
  *
  * `malformed_json` and `body_not_an_object` are absent because they are
  * unreachable from a form submission by construction — a form body is parsed
@@ -366,7 +388,6 @@ const FORM_RENDERABLE_CODES = new Set([
 const SIGNAL_BODY_TOO_LARGE = 'E_BODY_TOO_LARGE';
 const SIGNAL_REQUEST_STREAM_FAILED = 'E_REQUEST_STREAM_FAILED';
 
-/** Which of the two page states a rendered message represents. */
 const MESSAGE_SUCCESS = 'success';
 const MESSAGE_ERROR = 'error';
 
@@ -414,20 +435,19 @@ function escapeHtml(value) {
 }
 
 /* ------------------------------------------------------------------------- *
- * The page — this project's first user interface
+ * The page
  *
  * One page serves every state a submitter can reach: the empty form, the
  * confirmation, the already-recorded notice and the validation error. It is a
- * heading, two labelled text inputs and a submit button, and nothing more.
+ * heading, a labelled text input for each submitted field, and a submit
+ * button, and nothing more.
  *
- * No component library, design system or token source exists anywhere in this
- * repository, and no design was supplied, so semantic HTML carries the whole
- * burden: `lang` on the root element, a `<meta charset>`, exactly one `<h1>`, a
- * real `<form method="post">` with a real `<button type="submit">`, and a
- * `<label for>` bound to every `<input id>`. No `<div>` stands in for a
- * control, and there is no `<script>` of any kind — the form posts natively,
- * which is precisely why its default encoding and the endpoint's accepted media
- * type are the same thing.
+ * Semantic HTML carries the whole burden: `lang` on the root element, a
+ * `<meta charset>`, exactly one `<h1>`, a real `<form method="post">` with a
+ * real `<button type="submit">`, and a `<label for>` bound to every `<input
+ * id>`. No `<div>` stands in for a control, and there is no `<script>` of any
+ * kind — the form posts natively, which is precisely why its default encoding
+ * and the endpoint's accepted media type are the same thing.
  *
  * Outcome is conveyed as TEXT. The colour classes are reinforcement; a reader
  * who cannot perceive them loses nothing, because the sentence says what
@@ -435,28 +455,20 @@ function escapeHtml(value) {
  * ------------------------------------------------------------------------- */
 
 /**
- * The page's entire stylesheet: one inline `<style>` block, SIXTEEN
- * declarations, six unique colours (`#ffffff` serves both the page background
- * and the button text). Keeping it to a single site means a later migration to
- * design tokens has exactly one place to change.
+ * The page's entire stylesheet: one inline `<style>` block. Keeping it to a
+ * single site means a later migration to design tokens has exactly one place
+ * to change.
  *
- * There are deliberately no breakpoints, no elevation or z-index, no
- * transitions, and no icon or image assets. Vertical rhythm between a label
- * and its input comes from a `<br>` in the markup rather than from
- * `display: block` on the label, because a seventeenth declaration is not
- * available to spend.
- *
- * The input border is written as `border-color` and not as the `border`
- * shorthand for the same reason. The inventory authorizes ONE value for it —
- * the colour `#767676` — so a shorthand would smuggle in a width literal and
- * a style keyword that the inventory does not list, and an unlisted literal is
- * a deviation from the specified design values whether or not it looks
- * reasonable. The border still renders: a browser's own default supplies the
- * width and the style for a text input, and this declaration recolours them.
- * Measured in headless Chrome, the computed result is `border-color`
- * `rgb(118, 118, 118)` — exactly `#767676` — over the user agent's own
- * `2px inset`, so the specified colour is what a reader sees without this
- * stylesheet asserting a width or a style it was never given.
+ * Only the values the design specifies may appear here, which is what decides
+ * two details that would otherwise look arbitrary. Vertical rhythm between a
+ * label and its input comes from a `<br>` in the markup rather than from a
+ * `display` declaration on the label, and the input border is written as
+ * `border-color` rather than as the `border` shorthand: the shorthand would
+ * smuggle in a width literal and a style keyword that were never specified,
+ * and an unspecified literal is a deviation from the design whether or not it
+ * looks reasonable. The border still renders — a browser's own default
+ * supplies the width and the style for a text input, and this declaration
+ * recolours them.
  */
 const STYLE_BLOCK = `      body {
         font-family: system-ui, sans-serif;
@@ -582,11 +594,6 @@ ${messageMarkup}    <form method="post" action="${NAMESPACE_PATH}">
 `;
 }
 
-/**
- * The empty form, as served by `GET /activities`.
- *
- * @returns {string} A complete HTML document.
- */
 function renderEmptyForm() {
   return renderPage({
     message: null,
@@ -599,9 +606,9 @@ function renderEmptyForm() {
 
 /**
  * The value `activity-store.js` writes into a record it seeded from the
- * workbook column. Mirrored here — not imported, because the store's surface
- * is its five functions — and used for exactly one purpose: choosing between
- * two sentences on the already-recorded page. A label that came from the
+ * workbook column. Mirrored as a literal here rather than imported, because
+ * the store exports functions and not this marker, and read here to choose the
+ * accurate sentence for the already-recorded page: a label that came from the
  * student record was never submitted by anyone, and telling a submitter it was
  * "already submitted" would be false.
  */
@@ -777,9 +784,16 @@ function drain(req) {
 /* ------------------------------------------------------------------------- *
  * The namespace boundary
  *
- * This is the single most consequential predicate in the feature. Everything
- * outside it must behave exactly as it did before this feature existed, and a
- * loose test is how that promise quietly stops being true.
+ * This is the single most consequential predicate in the feature, because it
+ * decides who answers. A request it declines is answered by the caller's own
+ * fixed response — one status, one header, one 34-byte body, identical for
+ * every method on every path — and that response is the service's contract for
+ * everything outside `/activities`.
+ *
+ * So the predicate claims exactly two things: the namespace root, and a
+ * sub-resource of it named by an origin-form target. Anything broader hands
+ * the feature requests the fall-through owns; anything looser lets a target
+ * that never named the namespace reach the store behind it.
  * ------------------------------------------------------------------------- */
 
 const ROUTE_OUTSIDE = 'outside';
@@ -790,41 +804,65 @@ const ROUTE_UNRESOLVED = 'unresolved';
 /**
  * Reduces a request target to the pathname the route table is matched against.
  *
- * Two normalizations, both deliberate:
+ * One admission test and two normalizations, each deliberate:
  *
+ *   0. The target must be origin-form — `ORIGIN_FORM_TARGET` above states the
+ *      syntax and why each clause of it is there. The test comes FIRST because
+ *      `URL` resolution canonicalizes rather than validates: it reads an
+ *      authority, a foreign scheme or a backslash separator out of a target and
+ *      still yields a pathname, and a pathname obtained that way names the
+ *      namespace without the target ever having done so.
  *   1. The pathname is read from a parsed `URL`, so the query string and any
  *      fragment are gone before matching. A `startsWith` against the raw
  *      `req.url` would misclassify `/activities?x=1` as a sub-resource named
- *      `?x=1`.
+ *      `?x=1`. The resolved origin is then compared with the base's, which
+ *      catches a foreign authority or an opaque origin and nothing more — step
+ *      0 already refuses every target that could reach it, including the
+ *      same-authority forms the comparison cannot see. `PATH_RESOLUTION_ORIGIN`
+ *      states its exact reach.
  *   2. A single trailing slash is stripped, so `/activities/` is `/activities`
  *      and `/activities/S001/` is `/activities/S001`. The root `/` keeps its
  *      slash: stripping it would leave the empty string, which matches nothing
  *      here anyway, but a pathname that no longer starts with `/` is a
  *      surprise waiting for the next reader.
  *
- * An unparseable target is answered `null`, which the caller treats as outside
- * the namespace. That is the conservative direction: a request this module
- * cannot even name is left to behave exactly as it did before the feature
- * existed. In practice the runtime rejects a malformed request line with its
- * own 400 before a handler runs, so this is a floor rather than a path.
+ * Percent-encoding is left encoded, which is what the route table matches
+ * against: `%2f` and `%5c` are not separators, so `/activities%2fS001` is one
+ * segment that is not the namespace root and is therefore outside it. Dot
+ * segments ARE resolved, because they resolve within the fixed base: both
+ * `/x/../activities` and `/%2e%2e/activities` name the namespace root, and
+ * that is the route they reach.
+ *
+ * `null` means this module will not name the target: it is not origin-form, or
+ * it will not parse at all. The caller treats that as outside the namespace,
+ * which is the conservative direction — the request is answered by the
+ * fall-through, the one response that holds for every path the feature does
+ * not claim. Some such targets never reach a handler in the first place,
+ * because the runtime answers an invalid request line with its own `400`; the
+ * rest arrive here and are declined.
  *
  * @param {import('node:http').IncomingMessage} req The request.
- * @returns {string|null} The normalized pathname, or `null` when the target
- *   cannot be parsed.
+ * @returns {string|null} The normalized pathname, or `null` when the target is
+ *   not an origin-form path this module will match on.
  */
 function requestPathname(req) {
   const target = req.url;
-  if (typeof target !== 'string' || target.length === 0) {
+  if (typeof target !== 'string' || !ORIGIN_FORM_TARGET.test(target)) {
     return null;
   }
 
-  let pathname;
+  let resolved;
   try {
-    pathname = new URL(target, PATH_RESOLUTION_BASE).pathname;
+    resolved = new URL(target, PATH_RESOLUTION_BASE);
   } catch {
     return null;
   }
 
+  if (resolved.origin !== PATH_RESOLUTION_ORIGIN) {
+    return null;
+  }
+
+  const pathname = resolved.pathname;
   if (pathname.length > 1 && pathname.endsWith('/')) {
     return pathname.slice(0, -1);
   }
@@ -859,8 +897,9 @@ function decodeSegment(segment) {
  * The predicate is segment-safe: the request belongs to this feature only when
  * the pathname EQUALS `/activities` or BEGINS WITH `/activities/`. A path that
  * merely shares those characters as text — `/activities-old`,
- * `/activitieslist` — does not, and is answered `ROUTE_OUTSIDE` so the caller
- * falls through to the response it has always given.
+ * `/activitieslist` — does not, and is answered `ROUTE_OUTSIDE`, which the
+ * caller answers with its own fixed fall-through response: the one the service
+ * gives for every path this feature does not claim.
  *
  * Resolution is by PATH ONLY; the method is not consulted here. That ordering
  * is why `DELETE /activities/S001/extra` is a `404` and not a `405`: a `405`
@@ -894,25 +933,25 @@ function resolveRoute(pathname) {
  * Reading a header that must be declared exactly once
  *
  * `req.headers` is a CONVENIENCE, and for the headers this module makes
- * decisions on it is the wrong one. Node's normalized map keeps the FIRST
- * `Content-Type` line and silently discards every later one — measured, not
- * assumed: a request declaring `application/json` and then `text/plain`
- * presents as plain `application/json` there, while `req.headersDistinct`
- * shows both. A decision taken on the collapsed view therefore cannot tell a
- * single unambiguous declaration from two conflicting ones, and answers a
- * request whose meaning was never agreed.
+ * decisions on it is the wrong one. It is a COLLAPSED view, and how it
+ * collapses depends on the field name: a singleton field such as
+ * `Content-Type` or `Host` keeps its first line and silently discards every
+ * later one, while a field such as `Origin` or `Accept` arrives joined into
+ * one comma-separated string. Either way a single unambiguous declaration is
+ * indistinguishable from two conflicting ones, so a decision taken on that
+ * view answers a request whose meaning was never agreed.
+ * `req.headersDistinct` keeps every field line, which is what makes the
+ * difference visible at all.
  *
- * So every header this module routes or authorizes on is read through the one
- * primitive below, which reports AMBIGUITY as a state of its own. A header
- * declared twice is refused exactly like one that is absent: the endpoint does
- * not guess which line the sender meant, for the same reason it does not guess
- * at a body's format.
+ * So every header this module decides on is read through the one primitive
+ * below, which reports THREE states: absent, exactly one value, or ambiguous
+ * because it was declared more than once. Each caller maps those states onto
+ * its own policy; the media-type check is the one that treats absent and
+ * ambiguous alike, answering `415` rather than guessing which line the sender
+ * meant.
  * ------------------------------------------------------------------------- */
 
 const HEADER_CONTENT_TYPE = 'content-type';
-const HEADER_HOST = 'host';
-const HEADER_ORIGIN = 'origin';
-const HEADER_SEC_FETCH_SITE = 'sec-fetch-site';
 
 /**
  * Reads one header, distinguishing absent from declared-more-than-once.
@@ -964,9 +1003,12 @@ function declaration(req, name) {
  * Normalized before comparison — parameters split off at the first `;`,
  * surrounding space trimmed, lowercased — so `application/json`,
  * `Application/JSON` and `application/json; charset=utf-8` all match, as do
- * the equivalent forms of `application/x-www-form-urlencoded`. A browser form
- * sends a charset parameter, so a comparison against the raw header would
- * reject the very client this feature is built for.
+ * the equivalent forms of `application/x-www-form-urlencoded`. Senders differ
+ * in exactly this: a native HTML form posts the bare type with no parameters,
+ * while other clients append `charset` or another parameter and vary in case.
+ * Normalizing is what lets one comparison accept every spelling of the two
+ * accepted types; comparing the raw header would refuse legitimate clients
+ * over punctuation the type does not depend on.
  *
  * Exactly ONE declaration is required. Zero and two both answer `null`, which
  * the caller turns into `415`: an ambiguous declaration is not a media type
@@ -1014,122 +1056,27 @@ function submissionMode(req) {
 }
 
 /* ------------------------------------------------------------------------- *
- * Submission intent — the cross-site forgery boundary
- *
- * `POST /activities` changes stored state, and an HTML form can be made to
- * submit across origins: a page on any other site can carry a form whose
- * action is this service and whose encoding is form-urlencoded, and a browser
- * that loads that page will send the request. Media type and field validation
- * cannot tell that request from the real form's, because it IS a real form
- * submission — of somebody else's form. Nothing else in this service stands in
- * the way: there is no authentication, no session, no cookie and no token
- * anywhere in the codebase, and the loopback bind is not a defence here, since
- * the browser making the request is itself on the loopback host.
- *
- * What a browser cannot forge is where it says the request came from. Two
- * headers carry that, both set by the browser and both unreachable from page
- * script, and this is the whole of the check:
- *
- *   `Sec-Fetch-Site`  the browser's own classification. `same-origin` and
- *                     `none` (a user-initiated navigation) are this service's
- *                     own form; `same-site` and `cross-site` are not.
- *   `Origin`          sent on every browser POST. It must parse, it must be
- *                     `http:` — this service speaks no other scheme — and its
- *                     host must equal the host the request was addressed to.
- *                     `Origin: null`, the opaque origin a sandboxed document
- *                     sends, is refused rather than interpreted.
- *
- * Comparing `Origin` against the request's own `Host` is what makes the check
- * work on any port, including the ephemeral one the endpoint suite binds, and
- * it is sound precisely because an attacker's page controls the first and the
- * browser controls the second.
- *
- * A request carrying NEITHER header is ACCEPTED, and that is a decision rather
- * than an oversight. No browser omits `Origin` on a POST, so a request without
- * it is not a browser form submission — it is `curl`, a script, or the test
- * suite, which this service is documented to serve and whose published
- * commands send no such header. The check therefore refuses forged browser
- * submissions without inventing an authentication requirement the service does
- * not have; what it cannot do is establish WHO is submitting, which stays true
- * of this feature exactly as documented.
- * ------------------------------------------------------------------------- */
-
-/** The classifications `Sec-Fetch-Site` may carry for this service's own form. */
-const SAME_ORIGIN_FETCH_SITES = new Set(['same-origin', 'none']);
-
-/** The opaque origin. A literal value, never a missing header. */
-const OPAQUE_ORIGIN = 'null';
-
-/** The only scheme this service is reachable over, so the only one accepted. */
-const SERVICE_SCHEME = 'http:';
-
-/**
- * Decides whether a state-changing request came from this service's own form.
- *
- * @param {import('node:http').IncomingMessage} req The request.
- * @returns {boolean} True when the request carries no browser origin signal at
- *   all, or carries one that names this service itself.
- */
-function isSameOriginSubmission(req) {
-  const fetchSite = declaration(req, HEADER_SEC_FETCH_SITE);
-  if (fetchSite.present) {
-    if (fetchSite.ambiguous || !SAME_ORIGIN_FETCH_SITES.has(fetchSite.value.trim().toLowerCase())) {
-      return false;
-    }
-  }
-
-  const origin = declaration(req, HEADER_ORIGIN);
-  if (!origin.present) {
-    // No browser sends a POST without this header, so there is no browser to
-    // protect here. See the reasoning above.
-    return true;
-  }
-  if (origin.ambiguous) {
-    return false;
-  }
-
-  const value = origin.value.trim();
-  if (value.toLowerCase() === OPAQUE_ORIGIN) {
-    return false;
-  }
-
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    return false;
-  }
-  if (parsed.protocol !== SERVICE_SCHEME) {
-    return false;
-  }
-
-  const host = declaration(req, HEADER_HOST);
-  if (!host.present || host.ambiguous) {
-    return false;
-  }
-
-  return parsed.host.toLowerCase() === host.value.trim().toLowerCase();
-}
-
-/* ------------------------------------------------------------------------- *
  * Reading the request body
  *
- * The obvious implementation of a size limit CRASHES THE PROCESS, so the shape
- * below is prescribed rather than preferred. Two measured failures it avoids:
+ * The obvious implementations of a size limit either end the process or never
+ * deliver the status, so the shape below is prescribed rather than preferred.
+ * Two failures it avoids:
  *
  *   Writing the 413 from inside the `data` handler and then continuing to
- *   receive chunks throws ERR_HTTP_HEADERS_SENT on the next chunk and
- *   terminates the process — reproduced with a 200 KB body.
+ *   receive chunks writes to `res` again once the headers are already sent.
+ *   That throws ERR_HTTP_HEADERS_SENT inside the `'data'` listener, where
+ *   nothing catches it, so the next chunk terminates the process.
  *
  *   Calling `req.destroy()` on exceeding the limit makes the client observe a
- *   connection reset and never see the 413 at all, so the one thing the limit
+ *   connection reset and never read the 413 at all, so the one thing the limit
  *   was supposed to communicate is the one thing that does not arrive.
  *
- * What works, verified against bodies of 8192 B, 9000 B, 200 KB and 5 MB with
- * the process surviving every one: stop accumulating, detach the listener,
- * drain the remainder so the socket closes cleanly, and reject exactly once.
- * The response is then written by the caller from the rejection path alone,
- * where `send`'s guard makes a second write impossible.
+ * What works: stop accumulating, detach the accumulation listener, drain the
+ * remainder, and reject exactly once. The drain consumes the body the sender
+ * declared, so the request completes and the connection is left correctly
+ * framed and reusable rather than torn down mid-message. The response is then
+ * written by the caller from the rejection path alone, where `send`'s guard
+ * makes a second write impossible.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -1170,24 +1117,24 @@ function readRequestBody(req) {
      * Stops accumulation without disarming the stream.
      *
      * This is the oversize path's detachment, and the distinction from
-     * `detachAll` is the whole of it. `req.resume()` below keeps the stream
-     * running — measured on this runtime, an oversize request is answered
-     * `413` with `Connection: keep-alive` and the connection then stays open
-     * waiting for the rest of a body the sender declared, with the drain still
-     * in progress. If the `'error'` listener were removed at that point, a
-     * client that reset the connection mid-drain would emit `'error'` on an
-     * EventEmitter with no listener for it, which THROWS and takes the process
-     * down: the denial of service would be one aborted upload, and the limit
-     * meant to bound a request's cost would have become the way to end the
-     * service. So `'error'` and `'close'` stay attached until the stream is
-     * actually finished.
+     * `detachAll` is the whole of it. Only the two listeners that carry a
+     * successful read come off: `'data'`, which accumulates, and `'end'`,
+     * which would resolve a promise that has already rejected. `'error'` and
+     * `'close'` stay attached, because `req.resume()` below keeps the stream
+     * running until the body the sender declared has been drained, and the
+     * read has to stay observable for the whole of that span. A fault during
+     * the drain is delivered to `onError`, where the `done` guard absorbs it
+     * rather than rejecting a second time or touching `res`, and `'close'`
+     * performs the terminal detachment whichever way the drain ended.
+     * Detaching them here would end the observation early — a request stream
+     * carries its error nowhere once nothing is listening for it — and leave
+     * the cleanup with nothing to trigger it.
      */
     function detachAccumulation() {
       req.off('data', onData);
       req.off('end', onEnd);
     }
 
-    /** The terminal detachment, once nothing further can arrive. */
     function detachAll() {
       detachAccumulation();
       req.off('error', onError);
@@ -1273,7 +1220,6 @@ function readRequestBody(req) {
  * order the validation demands.
  * ------------------------------------------------------------------------- */
 
-/** The values to pre-fill when a failure happened before any field was read. */
 const EMPTY_SUBMISSION = Object.freeze({ studentId: '', activity: '' });
 
 /**
@@ -1393,9 +1339,18 @@ function parseSubmission(body, mode) {
  *
  * All of this runs BEFORE `addActivity` is called. No schema file, no key
  * declaration and no workbook data-validation part exists anywhere in this
- * repository, and JSON offers no constraint mechanism either, so this is the
- * only place the link between an activity and a student can be enforced.
- * There is no second line of defence.
+ * repository, and JSON offers no constraint mechanism either, so the link
+ * between an activity and a student is enforced only in code — here, and at
+ * two further points inside `activity-store.js` that do not rely on this one
+ * having run: a write guard on every Student ID `addActivity` appends, and a
+ * load check over every record already in the document.
+ *
+ * This layer owns the user-facing half of that work, and it is the only one
+ * of the three that can turn a bad reference into the `400`/`404` split
+ * above. The store's two refuse as faults — `500 internal_error` for the
+ * write guard, `500 store_unreadable` for the load check — because they exist
+ * to protect a document a person can hand-edit, not to answer a submitter.
+ * That is what makes this check mandatory rather than redundant.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -1469,9 +1424,12 @@ function validateSubmission(candidate) {
  *
  * A form submitter gets the form back with the offending field flagged, but
  * only for the outcomes retyping can fix. Everything else is the JSON envelope
- * in both modes: 413 and 415 are settled before the body's format is known, a
- * 405 answers a method the client chose, an unresolved path has no form
- * context, and a 500 is a fault no correction addresses.
+ * in both modes: a 415 refuses the declared media type itself, so there is no
+ * accepted mode to render into; a 413 knows the mode but has no read body, so
+ * there are no submitted values to re-display and the envelope is the
+ * deliberate representation; a 405 answers a method the client chose, an
+ * unresolved path has no form context, and a 500 is a fault no correction
+ * addresses.
  *
  * @param {import('node:http').ServerResponse} res The response.
  * @param {string} mode `MODE_FORM` or `MODE_JSON`.
@@ -1496,8 +1454,12 @@ function respondToFailure(res, mode, outcome, submitted, invalidField) {
  * carried by the status code, which is what makes idempotency observable from
  * outside the process rather than something a caller has to infer.
  *
- * `Location` is sent only with the `201`, and its interpolated Student ID has
- * already matched `/^S\d{3}$/`, so no submitted text can reach a header.
+ * `Location` is sent only with the `201`, and the Student ID interpolated into
+ * it is the one submitted value that reaches a response header. That is safe
+ * precisely because it has already matched `/^S\d{3}$/`: an `S` and three
+ * digits cannot carry a separator, a newline or a control character into the
+ * header. The activity label, which is free text, never appears in a header at
+ * all.
  *
  * @param {import('node:http').ServerResponse} res The response.
  * @param {string} mode `MODE_FORM` or `MODE_JSON`.
@@ -1521,15 +1483,15 @@ function respondToOutcome(res, mode, created, record) {
 /* ------------------------------------------------------------------------- *
  * Server-side failure evidence
  *
- * Two faults in this file are invisible from outside the process unless they
- * are written down, and until they were, both left NO server evidence at all.
- * A `500` told its client which of the four codes applied and told the
- * operator nothing, so `reference_data_unavailable`, `store_unreadable` and
- * `store_write_failed` were indistinguishable after the fact, and the five
- * ways the workbook reader can refuse a package were indistinguishable from
- * each other. A request whose stream died mid-body left nothing whatsoever.
+ * A mapped `500`, and a request whose stream dies mid-body, are invisible from
+ * outside this process unless they are written down here. A `500` tells its
+ * client which code applied and tells the operator nothing, so without this
+ * evidence `reference_data_unavailable`, `store_unreadable` and
+ * `store_write_failed` are indistinguishable after the fact, as is every way
+ * the workbook reader can refuse a package; and a failed request stream is
+ * recorded nowhere else at all.
  *
- * WHAT MAY BE LOGGED IS AN ALLOW-LIST, NEVER A MESSAGE. `activity-store.js`
+ * NOTHING A MESSAGE CARRIES IS EVER LOGGED. `activity-store.js`
  * and `xlsx-read.js` deliberately put the offending detail in their `message`
  * — a workbook path, the configured store path, a stored record's Student ID,
  * an activity label — because that detail belongs in a diagnosis and not in a
@@ -1537,204 +1499,102 @@ function respondToOutcome(res, mode, created, record) {
  * data this feature refuses to reflect to a client into a file that outlives
  * the request. So the message, the `cause` chain and the `Error` object itself
  * are all excluded here by construction: every field below is either a
- * constant of this module or the output of a sanitizer, and a nested code is
- * emitted only if it is one of the codes named below.
+ * constant of this module or a value taken from the store's declared
+ * diagnostic and re-checked against the shape a field of that name may hold.
  *
- * The finer distinctions survive anyway, and the way they do is the delicate
- * part. `store_unreadable` covers a dozen different faults, and a log that
- * could not tell "the document declares the wrong schema version" from "the
- * record at index 4 has a source nobody recognises" would leave an operator
- * exactly where no log at all leaves them. So each refusal is CLASSIFIED: its
- * message is tested against a fixed table of anchor phrases, and what gets
- * emitted is the TOKEN THIS FILE HOLDS for the matching phrase — never any
- * part of the message itself. Two bounded integers travel with it, parsed from
- * strictly delimited digit groups: the record index or workbook row a refusal
- * names, and the ZIP compression method or flag bits the reader rejected. An
- * array position and a compression method are positions and numbers; neither
- * is a Student ID, a label, or a path, and no other value is ever extracted.
+ * THE DISTINCTION IS READ, NOT RECONSTRUCTED. `store_unreadable` covers a
+ * dozen different faults, and a log that could not tell "the document declares
+ * the wrong schema version" from "the record at index 4 has a source nobody
+ * recognises" would leave an operator exactly where no log at all leaves them.
+ * Each refusal therefore arrives already classified: `activity-store.js`
+ * attaches a `diagnostic` where it raises the refusal — a stable token, the
+ * code of the fault underneath it, and up to two bounded numbers — and it
+ * adopts the reader's own diagnostic when it wraps a reader refusal, so a
+ * rejected compression method and a missing part stay distinguishable through
+ * that wrapper. This module reads that one object off the error it was handed.
+ * It holds no table of refusals, inspects no message, and does not walk the
+ * `cause` chain into a module it does not depend on: `activity-store.js` is
+ * its only neighbour, and the store's diagnostic is the whole of what it
+ * consumes.
  *
- * A refusal the table does not recognise is `unclassified`, which is the
- * failure mode worth having: it loses specificity and cannot leak anything.
- * The classifier also looks one level down the `cause` chain, because the store
- * wraps a reader refusal in its own generic sentence — without that step, an
- * unsupported compression method and a missing part would both read as
- * "a workbook column could not be read".
- *
- * The anchors couple this file to wording that lives in two modules it does
- * not own. That coupling is deliberate and is held in place by tests: the
- * endpoint suite induces representative refusals and asserts the tokens, so a
- * rewording upstream fails a test here rather than quietly degrading every
- * future log line to `unclassified`. The alternative — structured properties
- * attached at each `throw` site in `activity-store.js` and `xlsx-read.js` —
- * would be a better home for this and is a change to those modules.
+ * What it does do is CHECK. A field is emitted only if it still has the shape
+ * a field of that name may hold — a lower-snake-case token, an upper-case
+ * code, a non-negative integer — and anything else is reported as
+ * `unclassified` or `none`. That check is not distrust of the store; it is
+ * what keeps this function total for a thrown value that turns out not to be
+ * a store refusal at all, which is precisely the case the request boundary
+ * exists to survive.
  * ------------------------------------------------------------------------- */
 
-/** The store or reader refused, and the refusal became one of the 500s. */
-const EVENT_STORE_FAILURE = 'store_failure';
+/* The `event` field of a log line: which kind of failure the line records, and
+ * the value a consumer filters on to count one kind without matching the
+ * other. */
 
-/** A request's own stream failed while its body was being read. */
+const EVENT_STORE_FAILURE = 'store_failure';
 const EVENT_REQUEST_STREAM_FAILED = 'request_stream_failed';
 
 /**
- * The only nested codes that may be logged, by name.
+ * The shape a `reason` token may have.
  *
- * Nothing reaches a log by matching a shape or a pattern: a code is emitted
- * only if it is literally one of these. Anything else — including a code some
- * future module invents — is reported as unclassified, so the allow-list can
- * never be widened by accident.
+ * A token is emitted for matching this, not for appearing on a list of the
+ * refusals that exist today. `activity-store.js` and `xlsx-read.js` own that
+ * vocabulary and extend it whenever they add a refusal, so a list kept here
+ * would be a second copy of theirs — and a stale copy is worse than none,
+ * because it silently downgrades every new refusal to `unclassified` while
+ * looking maintained.
  */
-const LOGGABLE_DETAIL_CODES = new Set([
-  // `xlsx-read.js` — the five refusals that define its supported subset, and
-  // the distinction this log exists to preserve.
-  'E_XLSX_UNSUPPORTED_COMPRESSION',
-  'E_XLSX_UNSUPPORTED_FLAGS',
-  'E_XLSX_PART_NOT_FOUND',
-  'E_XLSX_SHARED_STRINGS_UNSUPPORTED',
-  'E_XLSX_TRUNCATED',
-  // `activity-store.js` — its four declared codes, for a refusal nested
-  // inside another.
-  'E_REFERENCE_DATA',
-  'E_LABEL_INVALID',
-  'E_STORE_UNREADABLE',
-  'E_STORE_WRITE_FAILED',
-  // The system errno a filesystem or socket fault arrives as. This is the
-  // difference between "the store could not be written" and knowing whether
-  // the directory was missing, read-only, or full.
-  'EACCES',
-  'EBUSY',
-  'ECONNABORTED',
-  'ECONNRESET',
-  'EEXIST',
-  'EIO',
-  'EISDIR',
-  'ELOOP',
-  'EMFILE',
-  'ENAMETOOLONG',
-  'ENFILE',
-  'ENOENT',
-  'ENOSPC',
-  'ENOTDIR',
-  'EPERM',
-  'EPIPE',
-  'EROFS',
-  'ETIMEDOUT',
-  'EXDEV',
-]);
+const REASON_TOKEN_PATTERN = /^[a-z][a-z0-9_]{0,47}$/;
 
-/** There was no underlying fault to name. */
+/**
+ * The shape a `detail` code may have.
+ *
+ * What makes this field safe to write out is the producer contract:
+ * `activity-store.js` declares `detail` to be the code of a module or runtime
+ * fault — a `node:fs` errno, or a declared `E_*` code — and never a fragment
+ * of anything a caller sent. This pattern is the check underneath that
+ * contract rather than a substitute for it. It rejects whatever falls outside
+ * the shape of a code, so a path, a sentence or a mixed-case value fails at
+ * its first lower-case letter, space or separator and is reported as
+ * unclassified; a bare upper-case word would satisfy the shape, which is why
+ * the contract, not this pattern, is what keeps submitted text out of the
+ * field.
+ */
+const DETAIL_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,47}$/;
+
+/* The two values `detail` takes when it names no code. They are distinct on
+ * purpose: `none` says the failure had no fault underneath it, `unclassified`
+ * says it had one this module would not write out, and collapsing them would
+ * hide the second behind the first. */
+
 const DETAIL_NONE = 'none';
-
-/** There was one, and it is not on the allow-list. */
 const DETAIL_UNCLASSIFIED = 'unclassified';
 
-/**
- * The refusal classification table: an anchor phrase, and the token this file
- * emits when a message contains it.
- *
- * ONLY THE TOKEN IS EMITTED. The anchor is a search needle and never appears
- * in output, so a message's surrounding text — a path, a Student ID, a label —
- * has no route into a log line.
- *
- * Order is significant: the first match wins, so a specific phrase must precede
- * a general one that also matches it. Three pairs depend on that, and each is
- * marked where it sits. The anchors are the fixed prose of the refusals raised
- * by `activity-store.js` and `xlsx-read.js`; the interpolated values in those
- * sentences are deliberately outside every anchor.
- */
-const REFUSAL_REASONS = Object.freeze([
-  /* The workbook reader's own refusals, which reach here through the store's
-   * wrapper and are recovered from the `cause` chain. */
-  ['uses compression method ', 'zip_compression_method'],
-  ['sets general-purpose bit flag 0x', 'zip_general_purpose_flag'],
-  ['is a shared-string reference', 'cell_shared_string'],
-  ['has no part named ', 'package_part_missing'],
-  ['does not begin with a ZIP local file header', 'package_not_a_zip'],
-  ['ends inside the local file header at offset', 'zip_header_truncated'],
-  ['ends inside the entry name at offset', 'zip_entry_name_truncated'],
-  ['but the file is', 'zip_entry_out_of_range'],
-  ['trailing byte(s) at offset', 'zip_trailing_bytes'],
-  ['ends inside the value of attribute', 'xml_attribute_truncated'],
-  ['ends inside the <', 'xml_start_tag_truncated'],
-  ['ends before the closing', 'xml_closing_tag_missing'],
+/* The `reason` reported for a thrown value that carries no diagnostic, or
+ * whose token did not survive the check above. */
 
-  /* The store document as a whole. `exists but could not be read` precedes the
-   * reference data's `could not be read (` below, which it would otherwise
-   * match. */
-  ['does not hold parseable JSON', 'store_json_unparseable'],
-  ['is not valid UTF-8', 'store_not_utf8'],
-  ['exists but could not be read', 'store_file_unreadable'],
-  ['must hold a JSON object', 'store_not_an_object'],
-  ['declares a schemaVersion of', 'store_schema_version'],
-  ['must hold an activities array', 'store_activities_not_an_array'],
-  ['share the composite key', 'store_duplicate_composite_key'],
-
-  /* One record inside the store. `names studentId` precedes the seed's
-   * `which is absent from the key set in`, which it would otherwise match. */
-  ['must be an object; it is', 'record_not_an_object'],
-  ['has a studentId of', 'record_student_id_malformed'],
-  ['names studentId', 'record_student_id_unknown'],
-  ['has a label that', 'record_label_invalid'],
-  ['has the label', 'record_label_not_normalized'],
-  ['has a source of', 'record_source_unrecognised'],
-  ['whose submittedAt is', 'record_submitted_at_invalid'],
-  ['carries submittedAt', 'record_submitted_at_on_seeded'],
-
-  /* The workbooks as reference data. `could not be written (` precedes
-   * `could not be read (` only for readability; the two cannot collide. */
-  ['could not be written (', 'store_write_refused'],
-  ['where a Student ID of the form S000 was expected', 'key_not_a_student_id'],
-  ['repeats Student ID', 'key_repeated'],
-  ['holds no Student ID', 'key_set_empty'],
-  ['which is absent from the key set in', 'seed_student_unknown'],
-  ['record the same activity for', 'seed_activity_duplicated'],
-  ['the activity in row ', 'seed_label_invalid'],
-  ['could not be read (', 'workbook_column_unreadable'],
-
-  /* A submitted label the store re-inspected. Answered 400, so never logged
-   * from the mapping boundary; present so the table is complete. */
-  ['the activity label ', 'submitted_label_invalid'],
-]);
-
-/** The generic wrapper the store puts around a reader refusal. */
-const REASON_WRAPPER = 'workbook_column_unreadable';
-
-/** No anchor matched. */
 const REASON_UNCLASSIFIED = 'unclassified';
 
-/**
- * Where a refusal says the fault is: a record index, or a workbook row.
- *
- * Each pattern delimits its digits on both sides and caps them at six, so a
- * match is a position and cannot run into an interpolated value. The
- * duplicate-key refusal names two positions; the first is taken, which is the
- * one an operator edits first.
- */
-const POSITION_PATTERNS = Object.freeze([
-  /\bat index (\d{1,6})\b/,
-  /\bindex (\d{1,6})\b/,
-  /\brows (\d{1,6}) and\b/,
-  /\brow (\d{1,6}) of\b/,
-]);
-
-/** The ZIP compression method a package used, as a decimal group. */
-const COMPRESSION_METHOD_PATTERN = /\buses compression method (\d{1,5})\b/;
-
-/** The ZIP general-purpose bit flag, which the reader renders as hex. */
-const GENERAL_PURPOSE_FLAG_PATTERN = /\bbit flag 0x([0-9a-f]{1,4})\b/;
-
-/** A method that is not a bare token, which the runtime should never deliver. */
 const UNKNOWN_METHOD = 'UNKNOWN';
 
-/** A request target that could not be parsed into a pathname. */
 const UNPARSEABLE_PATH = 'unparseable';
 
-/** An HTTP method token, bounded in length as well as in alphabet. */
+/**
+ * The shape an HTTP method must have to be written to a log record as itself.
+ * `req.method` is client-controlled, and a value outside this shape is replaced
+ * by a fixed placeholder rather than truncated, so the length ceiling only has
+ * to sit clear of real method tokens — a few characters each — while keeping a
+ * fabricated one out of the record entirely.
+ */
 const METHOD_TOKEN_PATTERN = /^[A-Za-z]{1,16}$/;
 
-/** Anything outside printable US-ASCII, which no sanitized value may carry. */
 const NON_PRINTABLE_PATTERN = /[^\u0020-\u007E]/g;
 
-/** How much pathname a log line may carry. */
+/**
+ * The ceiling on the pathname a log record carries. The request target is
+ * client-controlled, so the pathname is truncated rather than logged whole and
+ * a caller cannot inflate a record with a long target. This namespace's own
+ * paths — the collection, and one Student ID under it — fit well inside it.
+ */
 const MAX_LOGGED_PATH_LENGTH = 64;
 
 /**
@@ -1775,135 +1635,125 @@ function safePath(req) {
 }
 
 /**
- * Names the underlying fault, if it may be named at all.
+ * The diagnostic a refusal arrived with, or `null` for a value carrying none.
+ *
+ * One property access on the error this module was handed. A refusal from
+ * `activity-store.js` always carries one, and the store has already folded a
+ * wrapped reader refusal into it, so there is nothing further down to reach
+ * for.
  *
  * @param {unknown} error The value thrown — not assumed to be an `Error`.
- * @returns {string} An allow-listed code, or one of the two fixed placeholders.
+ * @returns {object|null} The diagnostic, or `null`.
  */
-function safeDetail(error) {
+function diagnosticOf(error) {
   if (error === null || typeof error !== 'object') {
-    return DETAIL_NONE;
+    return null;
+  }
+
+  const diagnostic = error.diagnostic;
+  return diagnostic !== null && typeof diagnostic === 'object' ? diagnostic : null;
+}
+
+/**
+ * A reason token that still has the shape of one, or the placeholder.
+ *
+ * @param {unknown} reason The diagnostic's `reason`, not assumed to be a token.
+ * @returns {string} The token, or `unclassified`.
+ */
+function safeReason(reason) {
+  return typeof reason === 'string' && REASON_TOKEN_PATTERN.test(reason)
+    ? reason
+    : REASON_UNCLASSIFIED;
+}
+
+/**
+ * A position a log line may carry, or `null`.
+ *
+ * A record index, a workbook row, a byte offset and a ZIP header field are all
+ * non-negative integers, and an integer is the one thing a submitted label, a
+ * Student ID or a filesystem path cannot be. That is what lets these two
+ * fields be emitted exactly as the producer set them while no other value from
+ * a refusal can be emitted at all.
+ *
+ * @param {unknown} value The diagnostic's `at` or `number`.
+ * @returns {number|null} The integer, or `null`.
+ */
+function safePosition(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * The `code` of the fault behind one of this module's own body-read signals.
+ *
+ * Narrow on purpose. It answers for this module's own body-read signal codes
+ * and nothing else, so a refusal that arrived without a diagnostic is reported
+ * as carrying no detail rather than having its `cause` inspected here. A
+ * body-read signal is the one case where the fault underneath belongs to THIS
+ * module: the request stream failed, and this file is what built the signal and
+ * attached that fault to it, so reading its `code` reads a value put there
+ * here. Without it, a socket reset and a client that simply stopped sending
+ * would record identically.
+ *
+ * @param {unknown} error The value thrown.
+ * @returns {unknown} The cause's `code`, or `null`.
+ */
+function ownSignalCause(error) {
+  if (error === null || typeof error !== 'object') {
+    return null;
+  }
+  if (error.code !== SIGNAL_BODY_TOO_LARGE && error.code !== SIGNAL_REQUEST_STREAM_FAILED) {
+    return null;
   }
 
   const cause = error.cause;
-  if (cause === null || cause === undefined || typeof cause !== 'object') {
+  return cause !== null && typeof cause === 'object' ? cause.code : null;
+}
+
+/**
+ * The code of the fault underneath a failure, where it may be named at all.
+ *
+ * @param {unknown} error The value thrown, for the body-read signal case.
+ * @param {object|null} diagnostic The refusal's diagnostic, or `null`.
+ * @returns {string} A code, or one of the two fixed placeholders.
+ */
+function safeDetail(error, diagnostic) {
+  const code = diagnostic !== null ? diagnostic.detail : ownSignalCause(error);
+  if (code === null || code === undefined) {
     return DETAIL_NONE;
   }
 
-  return typeof cause.code === 'string' && LOGGABLE_DETAIL_CODES.has(cause.code)
-    ? cause.code
+  return typeof code === 'string' && DETAIL_CODE_PATTERN.test(code)
+    ? code
     : DETAIL_UNCLASSIFIED;
 }
 
 /**
- * A message's own text, or the empty string for anything that has none.
+ * Reads the classification a refusal arrived with, and checks it.
  *
- * @param {unknown} value A thrown value, not assumed to be an `Error`.
- * @returns {string} The message, or `''`.
- */
-function messageOf(value) {
-  return value !== null && typeof value === 'object' && typeof value.message === 'string'
-    ? value.message
-    : '';
-}
-
-/**
- * The first bounded integer a message delimits, or `null`.
+ * `activity-store.js` documents the object this reads — a `reason` token, the
+ * `detail` code of the fault underneath, and `at` and `number` as bounded
+ * positions — and documents that it adopts the reader's diagnostic when it
+ * wraps a reader refusal. So a rejected compression method arrives here
+ * already named as one, and this module needs no knowledge of the reader to
+ * record it.
  *
- * @param {string} message The message to search.
- * @returns {number|null} A record index or workbook row.
- */
-function positionIn(message) {
-  for (const pattern of POSITION_PATTERNS) {
-    const match = pattern.exec(message);
-    if (match !== null) {
-      return Number.parseInt(match[1], 10);
-    }
-  }
-  return null;
-}
-
-/**
- * The bounded numeric a reader refusal rejected — a compression method, or the
- * general-purpose flag bits — or `null`.
- *
- * @param {string} message The message to search.
- * @returns {number|null} The method as decimal, or the flag as an integer.
- */
-function rejectedNumberIn(message) {
-  const method = COMPRESSION_METHOD_PATTERN.exec(message);
-  if (method !== null) {
-    return Number.parseInt(method[1], 10);
-  }
-
-  const flag = GENERAL_PURPOSE_FLAG_PATTERN.exec(message);
-  if (flag !== null) {
-    return Number.parseInt(flag[1], 16);
-  }
-
-  return null;
-}
-
-/**
- * The token for whichever anchor a message contains first.
- *
- * @param {string} message The message to classify.
- * @returns {string|null} A token from the table, or `null` for no match.
- */
-function reasonIn(message) {
-  if (message === '') {
-    return null;
-  }
-  for (const [anchor, reason] of REFUSAL_REASONS) {
-    if (message.includes(anchor)) {
-      return reason;
-    }
-  }
-  return null;
-}
-
-/**
- * Classifies a refusal into the three safe values a log line carries.
- *
- * The `cause` chain is consulted when the refusal's own message classifies as
- * the store's generic wrapper, or does not classify at all. That is what
- * carries a reader's compression method, flag or missing part through the
- * wrapper the store puts around it: without this step every one of the five
- * reader refusals would read as `workbook_column_unreadable` and the
- * distinction the reader took care to make would end at the wrap.
+ * Each field is then re-checked against the shape a field of that name may
+ * hold. A thrown value with no diagnostic is not a store refusal, and the
+ * request boundary must answer for those too, so it classifies as
+ * `unclassified` with no positions rather than failing here.
  *
  * @param {unknown} error The value thrown.
- * @returns {{reason: string, at: number|null, number: number|null}} A token
- *   from this file's own table, and two bounded integers or `null`.
+ * @returns {{reason: string, detail: string, at: number|null, number: number|null}}
+ *   A checked classification, safe to write to a log verbatim.
  */
 function classifyRefusal(error) {
-  const ownMessage = messageOf(error);
-  const ownReason = reasonIn(ownMessage);
-
-  if (ownReason !== null && ownReason !== REASON_WRAPPER) {
-    return {
-      reason: ownReason,
-      at: positionIn(ownMessage),
-      number: rejectedNumberIn(ownMessage),
-    };
-  }
-
-  const causeMessage =
-    error !== null && typeof error === 'object' ? messageOf(error.cause) : '';
-  const causeReason = reasonIn(causeMessage);
-
-  if (causeReason !== null) {
-    return {
-      reason: causeReason,
-      at: positionIn(causeMessage) ?? positionIn(ownMessage),
-      number: rejectedNumberIn(causeMessage),
-    };
-  }
+  const diagnostic = diagnosticOf(error);
 
   return {
-    reason: ownReason ?? REASON_UNCLASSIFIED,
-    at: positionIn(ownMessage),
-    number: null,
+    reason: diagnostic === null ? REASON_UNCLASSIFIED : safeReason(diagnostic.reason),
+    detail: safeDetail(error, diagnostic),
+    at: diagnostic === null ? null : safePosition(diagnostic.at),
+    number: diagnostic === null ? null : safePosition(diagnostic.number),
   };
 }
 
@@ -1911,19 +1761,19 @@ function classifyRefusal(error) {
  * Writes one fixed-shape line of failure evidence.
  *
  * Serialized with `JSON.stringify` so the line is one parseable record whose
- * field set never varies — always these eight keys, `null` where a value does
- * not apply — which is what makes the evidence greppable and countable. The
- * thrown value is passed in only to be classified and to have its nested code
- * looked up against the allow-list; it is never formatted as an object, and
- * neither its message nor its `cause` is ever emitted.
+ * field set never varies — the same keys every time, `null` where a value does
+ * not apply — which is what makes the evidence greppable and countable, and
+ * what lets a consumer count one `event` without matching another. The thrown
+ * value is passed in only to be classified: it is never formatted as an
+ * object, and neither its message nor its `cause` is ever emitted.
  *
- * @param {string} event One of the two event constants above.
+ * @param {string} event Which kind of failure this records, from the event
+ *   constants above.
  * @param {string} code The code the outcome is identified by: the public error
  *   code the client was given, or — when the request could not be answered at
  *   all — this module's own internal signal for the fault. Both are constants
  *   of this file, never anything derived from a request.
- * @param {unknown} error The value thrown, for its classification, its bounded
- *   positions and its nested code.
+ * @param {unknown} error The value thrown, for its classification.
  * @param {import('node:http').IncomingMessage} req The request.
  * @returns {void}
  */
@@ -1935,7 +1785,7 @@ function logFailure(event, code, error, req) {
       event,
       code,
       reason: classified.reason,
-      detail: safeDetail(error),
+      detail: classified.detail,
       at: classified.at,
       number: classified.number,
       method: safeMethod(req.method),
@@ -1957,20 +1807,12 @@ function logFailure(event, code, error, req) {
  * @throws {Error} A store refusal, which `handle` maps to a 500.
  */
 async function handleSubmission(req, res) {
-  // Intent first, before the media type and before a byte of the body is
-  // read. A submission from somebody else's page is refused as a whole rather
-  // than parsed and then refused: the request is well-formed, and what is
-  // missing is the authority to act on it. Like the 413 and the 415, this is
-  // settled before the body's format is known, so it answers the JSON envelope
-  // in both modes — re-rendering the form for a cross-origin caller would
-  // reflect its own input back into a page it controls, and there is no person
-  // on the other end to correct anything.
-  if (!isSameOriginSubmission(req)) {
-    sendFailure(res, FAILURES.CROSS_ORIGIN_SUBMISSION);
-    drain(req);
-    return;
-  }
-
+  // The media type first, and with it the submission mode, before a byte of
+  // the body is read: an unaccepted type is refused as a whole rather than
+  // parsed and then refused. The mode decided here renders the outcomes a
+  // person filling in the form can act on — the two successes and the
+  // validation refusals. A protocol refusal or a fault answers the JSON
+  // envelope in either mode, exactly as the matrix specifies.
   const mode = submissionMode(req);
   if (mode === null) {
     sendFailure(res, FAILURES.UNSUPPORTED_MEDIA_TYPE);

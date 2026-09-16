@@ -1,67 +1,51 @@
 /**
  * server.js — the HTTP listener, and the one place the system boundary is drawn.
  *
- * WHAT CHANGED, AND WHAT DID NOT
- * ------------------------------
- * This file used to answer every method on every path with the same fixed
- * 34-byte greeting: `req` was a declared parameter that no statement
- * dereferenced, and there was no routing, no asynchrony, no failure handling
- * and no export. The `/activities` feature is integrated here by a single
- * delegation branch, and by nothing else.
- *
- * `activities.handle` returns `true` when it has claimed AND answered the
- * request, `false` when the path lies outside its namespace — and on `false` it
- * has written nothing to `res`, not a status and not a header. That one bit is
- * the whole integration surface, which is why the boundary reads as one `if`
- * that returns early followed by the three legacy statements, untouched. Every
- * path outside `/activities` — `/`, `/nonsense`, and the lookalikes
- * `/activities-old` and `/activitieslist` — therefore still receives that
- * greeting byte for byte. The namespace predicate is `activities.js`'s to own;
- * no routing logic lives here.
+ * THE BOUNDARY
+ * ------------
+ * `activities.handle(req, res)` sees every request first and returns the one
+ * bit this file routes on: `true` when it has claimed AND answered the
+ * request, `false` when the path lies outside the `/activities` namespace —
+ * and on `false` it has written nothing to `res`, not a status and not a
+ * header. That one bit is the whole integration surface, which is why the
+ * boundary reads as one `if` that returns early followed by the three
+ * fall-through statements. The namespace predicate is `activities.js`'s to
+ * own; no routing logic lives here. Every path outside `/activities` — `/`,
+ * `/nonsense`, and the lookalikes `/activities-old` and `/activitieslist` —
+ * is answered by those fall-through statements at the foot of the handler.
  *
  * ERROR OWNERSHIP, SPLIT TWO WAYS
  * -------------------------------
  * This file owns exactly two failures, and they are not interchangeable:
  *
  *   - REQUEST faults — anything thrown or rejected inside `activities.handle`
- *     that the feature did not anticipate. Owned by the `try`/`catch` around
+ *     that the feature does not anticipate. Owned by the `try`/`catch` around
  *     the delegation, answered `500 internal_error` in the same two-field
- *     `{ error, message }` envelope every other failure uses, and recorded as
- *     one fixed-shape log line built from allow-listed fields only. Measured
- *     on the pinned
- *     runtime: when an `async` handler rejects with nothing catching it,
- *     `server.on('error')` does not fire, `uncaughtException` does not fire,
- *     the client receives NO response at all and the request hangs until the
- *     caller's own timeout, and the process then terminates. The `try` is
- *     therefore mandatory, not stylistic.
+ *     `{ error, message }` envelope every other service-generated failure
+ *     uses, and recorded as one fixed-shape log line built from allow-listed
+ *     fields only.
  *   - LISTENER faults — a failure to bind, such as `EADDRINUSE`. Owned by the
  *     `'error'` listener below, which logs the code and exits non-zero instead
  *     of terminating on an unhandled `'error'` event.
+ *
+ * The `try` is mandatory rather than stylistic: when an `async` handler
+ * rejects with nothing catching it, `server.on('error')` does not fire and
+ * `uncaughtException` does not fire, so the client receives NO response at all
+ * and the request hangs until the caller's own timeout, and the process then
+ * terminates on the unhandled rejection.
  *
  * Every FORESEEABLE failure belongs to neither: an unreadable workbook, an
  * unreadable store, a failed write and every validation refusal are caught and
  * mapped inside `activities.js` and `activity-store.js`, and arrive here as an
  * answered response with `handle` returning `true`. That mapping is not
- * duplicated here — doing so would report a failure that did not happen.
+ * duplicated here — duplicating it would report a failure that did not happen.
  *
  * THE COMPOSITION SEAM
  * --------------------
- * `server.listen` used to run at module top level, so merely loading this file
- * bound TCP port 3000 as a side effect while yielding an object with no keys —
- * nothing could be driven by a test harness. The main-module guard and
- * `module.exports` fix that: `node server.js` behaves identically because the
- * guard is true, while loading the module from a harness binds nothing. This is
- * a declared, deliberate behaviour change.
- *
- * GOVERNING RULE: `Ajit_AddNewFeature_Rule`
- * -----------------------------------------
- * Summarized, never reproduced. Its SYSTEM BOUNDARIES area is why the boundary
- * is one early-returning `if` above three untouched statements rather than
- * logic woven through them. Its MINIMAL CHANGE AND DISCIPLINE area is why the
- * host and port stay bare literals that read no environment variable, why the
- * greeting's wording and its charset-less `text/plain` header are left exactly
- * as found, and why there is no request logging, no metrics, no health
- * endpoint, no graceful-shutdown handler, no CORS header and no second route.
+ * The main-module guard at the foot of the file separates execution from
+ * loading: running this file directly listens on the host and port below and
+ * prints the readiness line, while loading it as a module binds nothing and
+ * leaves the exported server for the caller to listen on.
  */
 
 const http = require('http');
@@ -83,30 +67,38 @@ const port = 3000;
  * ------------------------------------------------------------------------- */
 
 /**
- * The `500` body, in the two-field envelope EVERY error response uses.
+ * The `500` body, in the two-field envelope every error this service generates
+ * uses.
  *
- * The authoritative response matrix admits exactly one error shape — a stable
- * machine-readable `error` code and a fixed English `message` sentence for
- * that code — and `internal_error` is one of its rows, so this boundary is no
- * exception to it: a client parsing failures gets one schema whether the fault
- * was anticipated or not. The sentence is a literal. It is never interpolated,
- * never derived from the thrown value, and carries no stack, no filesystem
- * path and no internal detail, because a client learns nothing useful from
- * those and an attacker does. Frozen, so a fault path cannot mutate the one
- * body every fault shares.
+ * The response contract admits exactly one shape for a service-generated
+ * error — a stable machine-readable `error` code and a fixed English `message`
+ * sentence for that code — and `internal_error` is one of its rows, so this
+ * boundary is no exception to it: a client parsing failures gets one schema
+ * whether the fault was anticipated or not. One class of failure sits outside
+ * that shape because it is answered before this handler runs: the runtime
+ * rejects a request it cannot read with a bodyless response carrying no
+ * envelope at all — an oversized header block gets `431` and an unparseable
+ * request line gets `400`, each with no body to put an `error` code in.
+ * The sentence is a literal. It is never interpolated, never derived from the
+ * thrown value, and carries no stack, no filesystem path and no internal
+ * detail, because a client learns nothing useful from those and an attacker
+ * does. Frozen, so a fault path cannot mutate the one body every fault shares.
  */
 const INTERNAL_ERROR_BODY = Object.freeze({
   error: 'internal_error',
   message: 'The request could not be completed because of an unexpected internal error.',
 });
 
-/** The stable event code that opens the request-failure log line. */
 const REQUEST_FAILURE_EVENT = 'request_handler_failed';
 
 /** What a log field holds when its value is absent or fails its allow-list. */
 const LOG_FIELD_UNAVAILABLE = '-';
 
-/** The ceiling on the logged pathname, in characters. */
+/**
+ * 120 characters sits far above the longest target this service routes —
+ * `/activities/S001` is 16 characters — so a real pathname is never
+ * truncated, while an arbitrarily long target cannot grow the line unbounded.
+ */
 const LOG_PATH_MAX_CHARS = 120;
 
 /**
@@ -244,20 +236,16 @@ const server = http.createServer(async (req, res) => {
   try {
     // The delegation branch — the only place the feature can claim a request.
     // `handle` is read off the module object at call time rather than
-    // destructured at require time, so the exported seam stays patchable: the
-    // suite replaces this property to drive the `catch` below, which is
-    // otherwise unreachable because every foreseeable fault is already mapped
-    // upstream. Decided on the return value alone; `res` is never inspected.
+    // destructured at require time, so the exported seam stays late-bound and
+    // a caller holding this same module instance can substitute it. The branch
+    // is decided on the return value alone; `res` is never inspected.
     if (await activities.handle(req, res)) return;
   } catch (err) {
     // One pre-formatted line, from allow-listed fields only — never the thrown
-    // value itself, and never the raw request target. What the naive form
-    // emits instead was measured on this codebase: `console.error(msg, err)`
-    // printed the Error's inspected form, which named the absolute path of
-    // every source file in the stack, and `${req.url}` would have carried the
-    // query string a caller controls. Both are the operator's log rather than
-    // the client's response, and both are exactly where a store path or a
-    // submitted label leaks without anyone noticing.
+    // value itself, whose inspected form names the absolute path of every
+    // source file in its stack, and never the raw request target, whose query
+    // string is caller-controlled and can carry a Student ID or an activity
+    // label. The operator's log is exactly where such a value leaks unnoticed.
     console.error(requestFailureLine(req, err));
     // Checked BEFORE writing: once headers are out the response cannot be
     // corrected, and writing anyway throws ERR_HTTP_HEADERS_SENT and kills the
@@ -270,14 +258,13 @@ const server = http.createServer(async (req, res) => {
     // internal detail — because a client learns nothing useful from those and
     // an attacker does.
     res.end(JSON.stringify(INTERNAL_ERROR_BODY) + '\n');
-    // Returns so control never reaches the legacy response below.
     return;
   }
 
-  // PRESERVED VERBATIM — the three statements below are character-identical to
-  // the pre-feature file, down to the absent `charset` parameter. The body is
-  // exactly 34 bytes and `test/lifecycle.test.js` asserts its sha256, so this
-  // is the fall-through for every request `activities.handle` declined.
+  // The fall-through for every request `activities.handle` declined: `200`
+  // with a `Content-Type: text/plain` that carries no `charset` parameter, and
+  // a body of exactly 34 bytes. Both the header and the body are exact — the
+  // header down to that absent parameter, the body down to its final newline.
   res.statusCode = 200;
   res.setHeader('Content-Type', 'text/plain');
   res.end('Hello, World Welcome to Sharebot!\n');
@@ -287,11 +274,10 @@ const server = http.createServer(async (req, res) => {
  * Listener faults only — a failure to bind, overwhelmingly `EADDRINUSE`.
  *
  * Without this listener an unhandled `'error'` event terminates the process on
- * a stack trace, which reads as a crash rather than as "the port is held"; the
- * test harness's pre-flight check depends on the difference. `process.exitCode`
- * rather than `process.exit()` so the log is flushed before the process leaves:
- * a failed bind holds no handle, so the loop drains immediately and the exit is
- * still non-zero.
+ * a stack trace, which reads as a crash rather than naming the condition that
+ * caused it. `process.exitCode` rather than `process.exit()` so the log is
+ * flushed before the process leaves: a failed bind holds no handle, so the loop
+ * drains immediately and the exit is still non-zero.
  *
  * This cannot substitute for the request-level `try`/`catch` above, and that
  * `catch` cannot substitute for this: a rejected handler never reaches here.
@@ -301,21 +287,18 @@ server.on('error', (err) => {
   process.exitCode = 1;
 });
 
-// Listening is now a main-module behaviour rather than a load-time side effect.
-// The call and its readiness line are preserved unchanged — the guard's braces
-// and the two spaces of indentation they impose are the only difference — so
-// `node server.js` still prints exactly one `Server running at ...` line.
+// Direct execution listens on the host and port above and prints exactly one
+// `Server running at ...` readiness line; loading this file as a module binds
+// nothing.
 if (require.main === module) {
   server.listen(port, hostname, () => {
     console.log(`Server running at http://${hostname}:${port}/`);
   });
 }
 
-// The composition seam. `server` is the live instance, so a harness can listen
-// on an ephemeral port; `hostname` and `port` are exported as the values this
-// module actually bound rather than re-derived by the caller. All three have a
-// consumer: `test/activities.test.js` listens on the exported `server` and
-// asserts this export's exact key set, that `hostname` is the loopback literal
-// the listener binds, and that `port` is 3000 — so a drift in either literal
-// fails a test rather than passing unnoticed.
+// The composition seam. `server` is the live instance — the listening one under
+// direct execution, and unbound when this file is loaded as a module, so a
+// caller can listen on a port of its own choosing. `hostname` and `port` are
+// the values the guarded `listen` call above uses, exported so a caller can
+// address the service without re-deriving the literals.
 module.exports = { server, hostname, port };

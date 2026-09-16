@@ -1,95 +1,102 @@
 'use strict';
 
 /**
- * A focused, zero-dependency reader for the SpreadsheetML (ECMA-376 /
- * ISO-IEC 29500) workbooks this repository ships.
+ * A zero-dependency reader for SpreadsheetML (ECMA-376 / ISO-IEC 29500)
+ * workbook packages, built on `node:fs` and `node:zlib` alone.
  *
- * WHAT THIS MODULE IS
- * -------------------
- * A reader, not a spreadsheet library. The feature needs exactly two things
- * out of the workbooks: the authoritative Student ID key set in
- * `student_details.xlsx` (sheet `Student Details`, column A) and the
- * `Extracurricular Activity` labels in `student_other_info.xlsx` (sheet
- * `Other Info`, column C, taken with the Student ID in column A that each
- * label belongs to). All of those are plain cells inside a single worksheet
- * part, so `node:fs` and `node:zlib` cover the entire job and no package from
- * the public registry is added to a project that declares zero dependencies.
+ * SCOPE
+ * -----
+ * A reader, not a spreadsheet library: it locates a part inside a package,
+ * inflates it, and returns either that part's bytes or the cell values of a
+ * worksheet part.
  *
- * WHAT THIS MODULE IS NOT
- * -----------------------
- * There is NO write path here and none may be added: the feature never
- * modifies a workbook, so no package part is ever repacked and the whole
- * class of corrupt-package failure stays off the risk surface. Equally absent,
- * and deliberately so — sheet-name resolution through `xl/workbook.xml`, style
- * or theme parsing, date-serial conversion, any cache or memoization (the
- * caller owns caching), and any asynchronous variant.
+ * There is NO write path here and none may be added, so no package part is
+ * ever repacked and a package opened here cannot be corrupted here. Equally
+ * absent, and deliberately so — sheet-name resolution through
+ * `xl/workbook.xml`, style or theme parsing, date-serial conversion, any cache
+ * or memoization (the caller owns caching), and any asynchronous variant.
  *
- * GOVERNING RULE: `Ajit_AddNewFeature_Rule`
- * -----------------------------------------
- * Its technical-implementation area is why the supported subset below is
- * declared and testable rather than a best effort: every refusal carries a
- * named `code` a test can match on, and every tolerated oddity is written
- * down. Its minimal-change and discipline area is why this module stops at
- * the four functions at the foot of the file, and why two built-in modules do
- * a job no dependency is installed for.
- *
- * THE SUPPORTED SUBSET, AND THE REFUSAL FOR EVERYTHING OUTSIDE IT
- * ---------------------------------------------------------------
+ * FAILS CLOSED, WITH A CODED REFUSAL FOR EVERY DECLARED LIMIT
+ * -----------------------------------------------------------
  * A bespoke reader has to declare its limits, because silently mishandling an
- * unsupported package is worse than refusing it. This reader therefore FAILS
- * CLOSED: it never salvages, repairs or approximates input it cannot read.
- * Each refusal is an `Error` whose `code` is the exact string below and whose
- * message names the offending detail. No partial or placeholder data is ever
- * returned with, or instead of, a refusal.
+ * unsupported package is worse than refusing it. Nothing here salvages,
+ * repairs or approximates input it cannot read, and no partial or placeholder
+ * data is ever returned with, or instead of, a refusal. Each refusal is an
+ * `Error` whose `code` is one of the exact strings below and whose message
+ * names the offending detail; the function that enforces a limit documents
+ * that limit in full.
  *
- *   Compression  DEFLATE (8) and STORED (0) are read. Any other method throws
- *                E_XLSX_UNSUPPORTED_COMPRESSION naming the method number. The
- *                bytes are NOT handed back as-is: they are still compressed,
- *                and returning them as though they were XML is a silent
+ *   E_XLSX_UNSUPPORTED_COMPRESSION  A compression method other than DEFLATE
+ *                (8) or STORED (0). Still-compressed bytes are never handed
+ *                back as though they were XML, which would be a silent
  *                corruption.
- *   Flags        The general-purpose bit flag must be 0. Anything else throws
- *                E_XLSX_UNSUPPORTED_FLAGS. A set encryption bit (0x1) means
- *                the data cannot be read at all; a set data-descriptor bit
- *                (0x8) means the local header's size fields are zero and
- *                cannot be trusted, which would make the walk itself wrong.
- *   Parts        Any part present in the package can be fetched by name. A
- *                requested part that is absent throws E_XLSX_PART_NOT_FOUND
- *                naming the part.
- *   Cell types   `t="inlineStr"` with nested `<is><t>`, and `t="n"`. A
- *                `t="s"` shared-string reference throws
- *                E_XLSX_SHARED_STRINGS_UNSUPPORTED: no workbook here has an
- *                `xl/sharedStrings.xml` part, so there is no table to resolve
- *                the index against and a silently empty value would corrupt
- *                the key set.
- *   Bounds       An entry's header, name and data must all fall inside the
- *                buffer, and a package must begin with a local file header.
- *                Otherwise E_XLSX_TRUNCATED. That code covers every case in
- *                which the DECLARED BYTES AND THE STRUCTURE THEY SHOULD HOLD
- *                DISAGREE: a part whose XML ends inside a start tag or without
- *                its closing tag, an entry whose data will not inflate, and an
- *                entry whose declared compressed size overshoots its DEFLATE
- *                stream and leaves trailing junk behind it.
- *   Well-formed  An interpreted part must be valid UTF-8 and well formed
- *                where this reader relies on structure, or it throws
- *                E_XLSX_MALFORMED_XML: an attribute with no value, a stray
- *                delimiter where an attribute name belongs, an unquoted or
- *                repeated attribute, a cell whose `r` reference is present but
- *                not a well-formed in-grid reference, a row holding more cells
- *                than the grid has columns, and a `t="inlineStr"` cell with no
- *                `<t>` element. Each of those was previously salvaged, and
- *                salvage here erases, shifts or fabricates a key or a label.
- *   Ceilings     A package, a declared entry and an expanded part each have a
- *                documented size ceiling (see MAX_PACKAGE_BYTES and its two
- *                siblings). Exceeding one throws E_XLSX_LIMIT_EXCEEDED. The
- *                package is measured BEFORE it is read into memory and the
- *                part while it inflates, so neither a large file nor a small
+ *   E_XLSX_UNSUPPORTED_FLAGS  A general-purpose bit flag other than 0. A set
+ *                encryption bit (0x1) means the data cannot be read at all; a
+ *                set data-descriptor bit (0x8) means the local header's size
+ *                fields are zero and cannot be trusted, which would make the
+ *                walk itself wrong.
+ *   E_XLSX_UNSUPPORTED_SOURCE  A package that is not a REGULAR FILE. A
+ *                directory, a pipe, a socket or a device is refused naming the
+ *                kind: such a source has no size that can be bounded before it
+ *                is read, and several of them report a size of zero and then
+ *                yield bytes without end.
+ *   E_XLSX_PART_NOT_FOUND  A requested part the package does not hold. Any
+ *                part it does hold can be fetched by name.
+ *   E_XLSX_SHARED_STRINGS_UNSUPPORTED  A `t="s"` cell. The cell types read are
+ *                `t="inlineStr"` with a nested `<is><t>`, `t="n"`, and a cell
+ *                with no `t` attribute at all, which ECMA-376 makes implicitly
+ *                numeric; no string table is resolved here, so there is nothing
+ *                to resolve a shared-string index against and a silently empty
+ *                value would corrupt the data read through this module.
+ *   E_XLSX_UNSUPPORTED_CELL_TYPE  EVERY OTHER DECLARED TYPE — `b`, `d`, `e`,
+ *                `str`, or any string a package cares to write — and a numeric
+ *                cell whose `<v>` holds something that is not a number. A cell
+ *                is read only when this reader can honour the type it declares:
+ *                returning the literal verbatim would let a substituted
+ *                workbook state a Student ID as `t="str"` or as a non-numeric
+ *                `t="n"`, and the key set that every submission is validated
+ *                against is exactly one such column of one such workbook.
+ *   E_XLSX_TRUNCATED  The DECLARED BYTES AND THE STRUCTURE THEY SHOULD HOLD
+ *                DISAGREE: an entry's header, name or data running past the
+ *                buffer, a package that does not begin with a local file
+ *                header, an entry whose data will not inflate, an entry whose
+ *                declared compressed size overshoots its DEFLATE stream and
+ *                leaves trailing junk behind it, and a part whose XML ends
+ *                inside a start tag or without its closing tag.
+ *   E_XLSX_MALFORMED_XML  An interpreted part that is not valid UTF-8, or whose
+ *                structure this reader relies on is broken: an attribute with
+ *                no value, a stray delimiter where an attribute name belongs,
+ *                an unquoted or repeated attribute, a raw `<` inside a tag or
+ *                an attribute value, character data outside the root element,
+ *                an end tag that closes nothing, a cell whose `r` reference is
+ *                present but not a well-formed in-grid reference, two cells of
+ *                one row landing in the same column, a row holding more cells
+ *                than the grid has columns, a second `<sheetData>` element, an
+ *                element this reader interprets appearing outside the parent
+ *                the descent below expects it in, or a `t="inlineStr"` cell
+ *                with no `<t>` element. The same code refuses a COMMENT, a
+ *                CDATA SECTION, a markup DECLARATION such as `<!DOCTYPE`, and
+ *                any PROCESSING INSTRUCTION other than one leading
+ *                `<?xml …?>`: an interpreted part is validated as XML before a
+ *                single element is matched, because this reader matches
+ *                elements by scanning text, so markup inside a construct it
+ *                does not interpret would be read as live structure — and a
+ *                commented-out `<row>` holding `S999` is well-formed XML that
+ *                every other tool ignores. Salvaging any of those erases,
+ *                shifts or fabricates a value.
+ *   E_XLSX_LIMIT_EXCEEDED  A package, a declared entry or an expanded part past
+ *                its size ceiling (the ceilings are declared below). A package
+ *                is measured before it is allocated for AND AGAIN AS IT IS READ
+ *                — the size a descriptor reports is a claim, not a fact, so the
+ *                read itself stops one byte past the ceiling and refuses — and
+ *                a part is measured while it inflates, so neither a large file,
+ *                a file that grows under the reader, nor a small
  *                highly-compressed one can exhaust the process.
  *
- * Refusals are raised while the entry chain is walked, for every entry in the
- * package rather than only the one being fetched. That is deliberate: a
- * package holding an entry this reader cannot read is not a package it should
- * report on, and the data-descriptor case makes the walk unreliable in any
- * case. So `listEntries` refuses exactly what `readEntry` refuses.
+ * Every entry is checked as the chain is walked, not only the entry being
+ * fetched: a package holding an entry this reader cannot read is not a package
+ * it should report on, and the data-descriptor case makes the walk unreliable
+ * in any case. So `listEntries` refuses exactly what `readEntry` refuses.
  *
  * STRUCTURE IS ALWAYS CHECKED; VALUES ARE READ ONLY WHERE ASKED FOR
  * -----------------------------------------------------------------
@@ -97,47 +104,31 @@
  * always uses it. When a selection is given, every cell in the worksheet is
  * still walked and structurally validated — its start tag, its `r` reference
  * and its cell type — but the TEXT of a cell outside the selection is never
- * sliced, decoded or returned. That is what lets a caller read the Student ID
- * column of `student_details.xlsx` without materialising the name, date of
- * birth, email, phone and city sitting beside it, which the feature has no
- * business holding. The two halves of the guarantee are deliberately
- * different: structure is a property of the package and is enforced
- * everywhere, while a value is personal data and is read only where the
- * caller asked for it.
+ * sliced, decoded or returned. A caller therefore reads one column without
+ * materialising the values sitting beside it in the same rows. The two halves
+ * of the guarantee are deliberately different: structure is a property of the
+ * package and is enforced everywhere, while a value may be data the caller has
+ * no business holding and is read only where the caller asked for it.
  *
  * THE VALUE CONTRACT
  * ------------------
- * Every cell value is returned as a STRING, numerics included — `Age` 20
- * arrives as `'20'` and a GPA of 8.199999999999999 arrives with all of its
- * digits. The key set and the activity labels are text, so string is the
- * simpler contract, and it is also the lossless one: no float round-trip and
- * no locale in the way. A caller wanting a number converts it explicitly.
- * Nothing here converts a date serial to a date — that is out of scope.
+ * Every cell value is returned as a STRING, numerics included, carrying the
+ * digits the part records. String is the lossless contract: no float
+ * round-trip and no locale in the way. A caller wanting a number converts it
+ * explicitly, and a date serial stays the serial the package stored — nothing
+ * here converts one to a date.
  *
  * MODULE CHARACTERISTICS
  * ----------------------
- * Synchronous (`readFileSync`, `inflateRawSync`), stateless (no module-level
- * cache, no memoization, no mutable module state), and free of side effects:
- * it never modifies a file, never logs, and reads no environment variable.
+ * Synchronous (`openSync`, `readSync`, `inflateRawSync`), stateless (no
+ * module-level cache, no memoization, no mutable module state), and free of
+ * side effects: it never modifies a file, never logs, and reads no
+ * environment variable.
  * Every call re-reads the file from disk, which is what lets the caller decide
  * what to cache and for how long. A caller needing two columns of one
  * worksheet should therefore ask for both in a single `readSheetRows` call
  * rather than calling `readColumn` twice, which would read, inflate and parse
- * the same package twice over. Element names are read unprefixed, as every
- * writer of these packages produces them.
- *
- * Usage — the key-set read, one column:
- *   const xlsxRead = require('./xlsx-read');
- *   const sheet = 'xl/worksheets/sheet1.xml';
- *   const ids = xlsxRead.readColumn('student_details.xlsx', sheet, 'A');
- *   // ids[0] is the header 'Student ID'; ids[1] through ids[10] are the ten
- *   // Student IDs 'S001' to 'S010', in worksheet order.
- *
- * Usage — the seed read, two columns of one worksheet in a single pass:
- *   const rows = xlsxRead.readSheetRows('student_other_info.xlsx', sheet, ['A', 'C']);
- *   // rows[0] is { A: 'Student ID', C: 'Extracurricular Activity' };
- *   // rows[1] is { A: 'S001', C: 'Robotics Club' }. No other column of the
- *   // worksheet is decoded, and rows.length is 11 for these workbooks.
+ * the same package twice over. Element names are read unprefixed.
  */
 
 const fs = require('node:fs');
@@ -168,16 +159,21 @@ const FLAG_DATA_DESCRIPTOR = 0x0008;
 /* ------------------------------------------------------------------------- *
  * Resource ceilings.
  *
- * The three workbooks are fixed, committed reference files, and they were
- * measured rather than guessed at: the largest package is 6,018 bytes, its
- * largest part inflates to 10,140 bytes, and all nine parts of a package come
- * to 23,790 bytes together. The ceilings below sit two to three orders of
- * magnitude above those figures, so no workbook this repository ships can
- * approach one — while a package substituted for one of them cannot consume
- * the process. Left to its defaults `inflateRawSync` will produce output up to
- * `buffer.kMaxLength`, which is how a few kilobytes of crafted DEFLATE
- * exhausts memory, and `readFileSync` will happily allocate a file of any
- * size at all.
+ * Both reads this module performs would be unbounded left to their defaults:
+ * `readFileSync` allocates a file of any size at all, and `inflateRawSync`
+ * produces output up to `buffer.kMaxLength`, which is how a few kilobytes of
+ * crafted DEFLATE exhausts memory. The ceilings below bound each of them, which
+ * is why the package is read by a bounded loop rather than by one
+ * `readFileSync`, and why the bound is the ceiling rather than the size the
+ * file claims to have.
+ *
+ * They bound the workload this reader accepts rather than describing a limit
+ * of the SpreadsheetML format: a package, a declared entry or an expanded part
+ * beyond one of them is refused with E_XLSX_LIMIT_EXCEEDED even when it is a
+ * perfectly valid workbook. That is the intended trade — this reader holds a
+ * whole package and a whole part in memory at once, so each ceiling is the
+ * memory a single call may claim, and a workload of larger workbooks needs a
+ * streaming reader rather than a larger number here.
  * ------------------------------------------------------------------------- */
 
 /** A package file larger than this is refused before it is read into memory. */
@@ -190,15 +186,18 @@ const MAX_ENTRY_COMPRESSED_BYTES = 1024 * 1024;
 const MAX_PART_BYTES = 4 * 1024 * 1024;
 
 /* ------------------------------------------------------------------------- *
- * The refusal codes. Exported nowhere by design — the four public functions
- * are the whole surface, and a test matches on `err.code`, never on message
- * text.
+ * The refusal codes. These exact strings are the refusal contract: a caller
+ * tells one refusal from another by `err.code`, never by message text, which
+ * names the offending detail and is free to change. The constants themselves
+ * are module-private; the strings they hold are what a caller depends on.
  * ------------------------------------------------------------------------- */
 
 const CODE_UNSUPPORTED_COMPRESSION = 'E_XLSX_UNSUPPORTED_COMPRESSION';
 const CODE_UNSUPPORTED_FLAGS = 'E_XLSX_UNSUPPORTED_FLAGS';
+const CODE_UNSUPPORTED_SOURCE = 'E_XLSX_UNSUPPORTED_SOURCE';
 const CODE_PART_NOT_FOUND = 'E_XLSX_PART_NOT_FOUND';
 const CODE_SHARED_STRINGS_UNSUPPORTED = 'E_XLSX_SHARED_STRINGS_UNSUPPORTED';
+const CODE_UNSUPPORTED_CELL_TYPE = 'E_XLSX_UNSUPPORTED_CELL_TYPE';
 const CODE_TRUNCATED = 'E_XLSX_TRUNCATED';
 const CODE_MALFORMED_XML = 'E_XLSX_MALFORMED_XML';
 const CODE_LIMIT_EXCEEDED = 'E_XLSX_LIMIT_EXCEEDED';
@@ -215,11 +214,71 @@ const RUNTIME_TRAILING_JUNK = 'ERR_TRAILING_JUNK_AFTER_STREAM_END';
 
 const CELL_TYPE_INLINE_STRING = 'inlineStr';
 const CELL_TYPE_SHARED_STRING = 's';
+const CELL_TYPE_NUMBER = 'n';
 const ELEMENT_SHEET_DATA = 'sheetData';
 const ELEMENT_ROW = 'row';
 const ELEMENT_CELL = 'c';
 const ELEMENT_VALUE = 'v';
 const ELEMENT_TEXT = 't';
+const ELEMENT_INLINE_STRING = 'is';
+const ELEMENT_RICH_TEXT_RUN = 'r';
+
+/* The lexical space of a numeric cell, which is the xsd:double form ECMA-376
+ * writes: an optional sign, digits with an optional fraction, and an optional
+ * exponent. `INF`, `-INF` and `NaN` are part of xsd:double and are deliberately
+ * NOT accepted — no grid cell legitimately holds one, and accepting them would
+ * hand a caller a string that looks like a label.
+ *
+ * The check exists because a numeric cell's text is returned VERBATIM (see THE
+ * VALUE CONTRACT below), so without it `<c r="A2" t="n"><v>S999</v></c>` hands
+ * back `'S999'` as faithfully as it hands back `'20'`. */
+const NUMERIC_VALUE_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
+
+/* The elements whose position this reader depends on, and the parents ECMA-376
+ * puts them under. The descent in `readSheetRows` finds each of them by
+ * scanning the span of its parent, so an element of one of these names sitting
+ * anywhere else is either meaningless to the reader or — the case that matters
+ * — a value hiding where the scan will find it and attribute it to the wrong
+ * place. `is` and `r` both appear for `<t>`: `<is><t>` is the plain inline
+ * string these workbooks write, and `<is><r><t>` is the rich-text form whose
+ * runs make up one logical value. */
+const INTERPRETED_ELEMENT_PARENTS = new Map([
+  [ELEMENT_ROW, [ELEMENT_SHEET_DATA]],
+  [ELEMENT_CELL, [ELEMENT_ROW]],
+  [ELEMENT_VALUE, [ELEMENT_CELL]],
+  [ELEMENT_TEXT, [ELEMENT_INLINE_STRING, ELEMENT_RICH_TEXT_RUN]],
+]);
+
+/* Lexical constructs an interpreted part may not contain, with the leading XML
+ * declaration handled separately because every part is entitled to one. */
+const XML_COMMENT_OPEN = '<!--';
+const XML_CDATA_OPEN = '<![CDATA[';
+const XML_DECLARATION_OPEN = '<?xml';
+const XML_NAME_START_PATTERN = /[A-Za-z_:]/;
+const XML_NAME_PATTERN = /^[A-Za-z_:][A-Za-z0-9._:-]*$/;
+
+/* The XML declaration, as XML 1.0 section 2.8 defines it and nothing wider:
+ * `version` then an optional `encoding` then an optional `standalone`, in that
+ * order, each value quoted, with the value sets the specification fixes. The
+ * whitespace class is XML's own four characters rather than `\s`, which would
+ * admit Unicode spaces no XML processor accepts.
+ *
+ * It is matched STRICTLY because the declaration is the one region this
+ * reader skips: a permissive "everything up to the first ?>" would leave a
+ * pseudo-attribute free to carry `<sheetData>…<t>S999</t>…</sheetData>`, which
+ * the element matching would then find and read as the worksheet's real rows.
+ * A declaration matching this pattern cannot contain `<` at all. */
+const XML_WHITESPACE_CLASS = '[ \\t\\r\\n]';
+const XML_DECLARATION_PATTERN = new RegExp(
+  `^<\\?xml${XML_WHITESPACE_CLASS}+version${XML_WHITESPACE_CLASS}*=${XML_WHITESPACE_CLASS}*("1\\.[0-9]+"|'1\\.[0-9]+')` +
+    `(?:${XML_WHITESPACE_CLASS}+encoding${XML_WHITESPACE_CLASS}*=${XML_WHITESPACE_CLASS}*("[A-Za-z][A-Za-z0-9._-]*"|'[A-Za-z][A-Za-z0-9._-]*'))?` +
+    `(?:${XML_WHITESPACE_CLASS}+standalone${XML_WHITESPACE_CLASS}*=${XML_WHITESPACE_CLASS}*("(?:yes|no)"|'(?:yes|no)'))?` +
+    `${XML_WHITESPACE_CLASS}*\\?>$`,
+  'u'
+);
+
+/** How much of an offending cell value a refusal message may quote. */
+const MAX_MESSAGE_VALUE_LENGTH = 40;
 
 /* Lexical constants for the XML scan and the column-letter arithmetic. */
 
@@ -275,13 +334,49 @@ const NAMED_XML_ENTITIES = {
  * thrown so each call site reads as a `throw` of `refuse`, keeping the control
  * flow obvious at the point the package is rejected.
  *
+ * THE DIAGNOSTIC CONTRACT. Every refusal carries a frozen `diagnostic` beside
+ * its `code` and `message`, and that object — never the message — is what a
+ * caller may act on programmatically. The split is deliberate: `message`
+ * names the offending detail, so it holds the package path, the entry name or
+ * the part listing, which makes it a diagnosis for a person and unstable by
+ * design. `diagnostic` is data:
+ *
+ *   reason  A stable lower-snake-case token naming WHICH refusal this is,
+ *           finer-grained than `code`, which groups conditions: several
+ *           distinct malformations share `E_XLSX_MALFORMED_XML`, and the token
+ *           is what tells them apart. A token is part of this module's
+ *           contract, so renaming one is a contract change and shows up in
+ *           this file's diff. A caller that instead recovered the same
+ *           distinction by searching `message` for a phrase would lose it
+ *           silently the next time a sentence was reworded.
+ *   detail  Always `null` here. The field exists so one shape travels the
+ *           whole chain: `activity-store.js` fills it with this module's
+ *           `code` when it wraps a refusal of ours. A zlib failure is folded
+ *           into `message` rather than re-exposed, so there is nothing else to
+ *           put in it.
+ *   at      The byte offset or position the refusal names, or `null`.
+ *   number  The bounded ZIP field or size the refusal rejected — a compression
+ *           method, general-purpose flag bits, a declared size past a ceiling
+ *           — or `null`.
+ *
+ * Every value in it is either a token of this file or a bounded number that
+ * describes where or how much — a parser position, a byte offset, a ZIP header
+ * field, a declared size. None of them is sliced out of the package's text, so
+ * a caller that logs the whole object still writes no path and no cell value
+ * anywhere.
+ *
  * @param {string} code One of the CODE_* constants above.
  * @param {string} message Names the offending detail.
- * @returns {Error} An error whose `code` property is `code`.
+ * @param {string} reason The stable token for this refusal.
+ * @param {number|null} [at] A byte offset or position, where one applies.
+ * @param {number|null} [number] A rejected ZIP field or size, where one
+ *   applies.
+ * @returns {Error} An error carrying `code` and a frozen `diagnostic`.
  */
-function refuse(code, message) {
+function refuse(code, message, reason, at = null, number = null) {
   const error = new Error(message);
   error.code = code;
+  error.diagnostic = Object.freeze({ reason, detail: null, at, number });
   return error;
 }
 
@@ -355,8 +450,7 @@ function normalizeColumnLetter(columnLetter) {
 /**
  * Normalizes the optional column selection `readSheetRows` accepts.
  *
- * `null` or `undefined` means "every column", which is the behaviour every
- * caller had before the selection existed. An array names the columns whose
+ * `null` or `undefined` selects every column. An array names the columns whose
  * values may be read; an empty array is a caller fault rather than a request
  * for nothing, because a row object with no keys is never what a caller wants
  * and silently returning one would hide the mistake.
@@ -453,11 +547,12 @@ function columnLettersFromCellReference(reference) {
 /**
  * Decodes the five predefined XML entities and numeric character references.
  *
- * The labels in these workbooks need none of this today, but an activity name
- * containing `&` could reach a workbook later, and a raw `&amp;` surfacing in
- * a key or a seed label would be a silent data bug. An unrecognized entity or
- * an out-of-range code point is left verbatim rather than dropped, so nothing
- * disappears without a trace.
+ * A value written with an entity or a character reference means the character
+ * that reference stands for, so handing the reference back verbatim would
+ * return a string the package does not hold — a raw `&amp;` surfacing in a
+ * cell value is a silent data bug. An unrecognized entity or an out-of-range
+ * code point is left verbatim rather than dropped, so nothing disappears
+ * without a trace.
  *
  * @param {string} text Raw XML character data.
  * @returns {string} The decoded text.
@@ -497,6 +592,456 @@ function codePointToString(codePoint, original) {
   return String.fromCodePoint(codePoint);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Lexical validation
+ *
+ * The element matching below scans TEXT. That is what keeps the walk cheap and
+ * free of substrings, and it is sound for exactly one class of document: one
+ * whose markup-looking text IS markup. XML offers three ways to write text that
+ * looks like markup and is not — a comment, a CDATA section and a processing
+ * instruction — plus a fourth, a raw `<` inside a tag, which is not well formed
+ * but which a lenient scan would still walk over. In all four a crafted
+ * `<row><c r="A2" t="inlineStr"><is><t>S999</t></is></c></row>` would be read
+ * as a live row while every conforming parser treated it as inert text, and one
+ * fabricated row in `student_details.xlsx` column A is one fabricated member of
+ * the key set that authorizes submissions.
+ *
+ * So an interpreted part is validated ONCE, up front, and refused if it holds
+ * any of them. Refusing rather than skipping is deliberate: skipping needs the
+ * same lexical bookkeeping in every one of the five places this module searches
+ * for an element, and a package carrying a comment inside its worksheet was not
+ * written by anything this reader claims to read. The same pass settles the
+ * two structural properties the span descent silently assumes — that tags
+ * balance, and that a `<row>`, `<c>`, `<v>` or `<t>` element sits under the
+ * parent the descent expects — because an element found in the wrong place is a
+ * value attributed to the wrong cell.
+ *
+ * No cell text is sliced or decoded here. The pass looks at tag internals and
+ * at the characters between elements; a cell's value is still read only where
+ * the caller asked for it.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Validates an interpreted part as XML, before a single element is matched.
+ *
+ * The index it returns is where the part's interpreted content begins — just
+ * past the XML declaration, if there is one. Element matching starts THERE
+ * rather than at zero, so no search ever re-enters the one region this pass
+ * consumed whole instead of walking.
+ *
+ * @param {string} xml The decoded part.
+ * @param {string} partName Part name, for the refusal messages.
+ * @param {string} filePath Package path, for the refusal messages.
+ * @returns {number} The index at which interpreted content begins.
+ * @throws {Error} E_XLSX_MALFORMED_XML for a comment, a CDATA section, a
+ *   markup declaration, a malformed or over-permissive XML declaration, a
+ *   processing instruction, a raw `<` inside a tag, character data outside the
+ *   root element, a second root, a second `<sheetData>`, an end tag that
+ *   closes nothing, or an interpreted element under an unexpected parent;
+ *   E_XLSX_TRUNCATED when the part ends with a tag or an element unclosed.
+ */
+function validateInterpretedStructure(xml, partName, filePath) {
+  const contentStart = consumeXmlDeclaration(xml, partName, filePath);
+  let index = contentStart;
+  const open = [];
+  let roots = 0;
+  let sheetDataElements = 0;
+
+  while (index < xml.length) {
+    const tagStart = xml.indexOf('<', index);
+    if (tagStart === -1) {
+      requireNoCharacterDataOutsideRoot(xml, index, xml.length, open, partName, filePath);
+      break;
+    }
+    requireNoCharacterDataOutsideRoot(xml, index, tagStart, open, partName, filePath);
+
+    const marker = xml[tagStart + 1];
+    if (marker === '!') {
+      throw refuse(
+        CODE_MALFORMED_XML,
+        `xlsx-read: part ${partName} of ${filePath} holds ${describeMarkupConstruct(xml, tagStart)} at offset ${tagStart}, whose content this reader will not interpret as markup and will not skip past either`,
+        'xml_markup_construct_unsupported'
+      );
+    }
+    if (marker === '?') {
+      throw refuse(
+        CODE_MALFORMED_XML,
+        `xlsx-read: part ${partName} of ${filePath} holds a processing instruction at offset ${tagStart}; only a leading XML declaration is accepted`,
+        'xml_processing_instruction'
+      );
+    }
+    if (marker === '/') {
+      index = consumeEndTag(xml, tagStart, open, partName, filePath);
+      continue;
+    }
+
+    const tag = consumeStartTagShape(xml, tagStart, partName, filePath);
+    if (open.length === 0) {
+      roots += 1;
+      if (roots > 1) {
+        throw refuse(
+          CODE_MALFORMED_XML,
+          `xlsx-read: part ${partName} of ${filePath} holds a second root element <${tag.name}> at offset ${tagStart}`,
+          'xml_second_root_element'
+        );
+      }
+    }
+    if (tag.name === ELEMENT_SHEET_DATA) {
+      sheetDataElements += 1;
+      if (sheetDataElements > 1) {
+        // The descent takes the FIRST `<sheetData>`, so a second one is a
+        // second set of rows that either shadows the real one or is ignored.
+        // Which of those it is depends on document order, which is exactly the
+        // kind of thing a reader must not decide silently.
+        throw refuse(
+          CODE_MALFORMED_XML,
+          `xlsx-read: part ${partName} of ${filePath} holds more than one <${ELEMENT_SHEET_DATA}> element, so which one holds its rows is undefined`,
+          'xml_sheet_data_repeated'
+        );
+      }
+    }
+    requireExpectedParent(tag.name, open, tagStart, partName, filePath);
+    if (!tag.selfClosing) {
+      open.push(tag.name);
+    }
+    index = tag.end;
+  }
+
+  if (open.length > 0) {
+    throw refuse(
+      CODE_TRUNCATED,
+      `xlsx-read: part ${partName} of ${filePath} ends with its <${open[open.length - 1]}> element unclosed`,
+      'xml_element_unclosed'
+    );
+  }
+  return contentStart;
+}
+
+/**
+ * Consumes a leading XML declaration, which every part is entitled to, and
+ * holds it to the grammar rather than skipping to the first `?>`.
+ *
+ * This is the one region of a part the validation below does not walk element
+ * by element, which makes it the one place markup could otherwise hide: a
+ * lenient skip would accept `<?xml version="1.0" hidden="<sheetData>…"?>` and
+ * leave that `<sheetData>` for the element matching to find and read as the
+ * worksheet's rows. So the whole declaration is matched against
+ * XML_DECLARATION_PATTERN, which admits only `version`, `encoding` and
+ * `standalone` with quoted values and therefore cannot contain `<`. A
+ * declaration whose terminating `?>` sits inside a quoted value fails the same
+ * pattern, because the region up to the first `?>` is then not a declaration.
+ *
+ * `<?xml` followed by anything other than whitespace — `<?xml-stylesheet`, for
+ * instance — is a processing instruction rather than a declaration, and is
+ * left for the scan to refuse as one.
+ *
+ * @param {string} xml The decoded part.
+ * @param {string} partName Part name, for the refusal message.
+ * @param {string} filePath Package path, for the refusal message.
+ * @returns {number} The index just past the declaration, or 0.
+ * @throws {Error} E_XLSX_TRUNCATED when the declaration never ends, or
+ *   E_XLSX_MALFORMED_XML when it is not a well-formed XML declaration.
+ */
+function consumeXmlDeclaration(xml, partName, filePath) {
+  if (!xml.startsWith(XML_DECLARATION_OPEN)) {
+    return 0;
+  }
+  const following = xml[XML_DECLARATION_OPEN.length];
+  if (following !== undefined && !XML_WHITESPACE.includes(following)) {
+    return 0;
+  }
+  const end = xml.indexOf('?>', XML_DECLARATION_OPEN.length);
+  if (end === -1) {
+    throw refuse(
+      CODE_TRUNCATED,
+      `xlsx-read: part ${partName} of ${filePath} ends inside its XML declaration`,
+      'xml_declaration_truncated'
+    );
+  }
+  const declarationEnd = end + 2;
+  if (!XML_DECLARATION_PATTERN.test(xml.slice(0, declarationEnd))) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} begins with something that is not a well-formed XML declaration; only version, encoding and standalone are permitted, in that order, with quoted values`,
+      'xml_declaration_malformed'
+    );
+  }
+  return declarationEnd;
+}
+
+/**
+ * Names the `<!`-introduced construct at an offset, for the refusal message.
+ *
+ * @param {string} xml The decoded part.
+ * @param {number} tagStart Index of the `<`.
+ * @returns {string} A short description, with an article.
+ */
+function describeMarkupConstruct(xml, tagStart) {
+  if (xml.startsWith(XML_COMMENT_OPEN, tagStart)) {
+    return 'an XML comment';
+  }
+  if (xml.startsWith(XML_CDATA_OPEN, tagStart)) {
+    return 'a CDATA section';
+  }
+  return 'a markup declaration';
+}
+
+/**
+ * Refuses character data outside the root element, and tolerates whitespace.
+ *
+ * Text between elements is ordinary once a root is open — it is the cell
+ * content this reader reads elsewhere — so the check applies only at depth
+ * zero, where XML permits nothing but whitespace. It walks by index rather
+ * than slicing, so no run of text is copied to be inspected.
+ *
+ * @param {string} xml The decoded part.
+ * @param {number} from First index to inspect.
+ * @param {number} to One past the last index to inspect.
+ * @param {string[]} open The elements currently open.
+ * @param {string} partName Part name, for the refusal message.
+ * @param {string} filePath Package path, for the refusal message.
+ * @returns {void}
+ * @throws {Error} E_XLSX_MALFORMED_XML for non-whitespace outside the root.
+ */
+function requireNoCharacterDataOutsideRoot(xml, from, to, open, partName, filePath) {
+  if (open.length > 0) {
+    return;
+  }
+  for (let at = from; at < to; at += 1) {
+    if (!XML_WHITESPACE.includes(xml[at])) {
+      throw refuse(
+        CODE_MALFORMED_XML,
+        `xlsx-read: part ${partName} of ${filePath} holds character data outside its root element at offset ${at}`,
+        'xml_character_data_outside_root'
+      );
+    }
+  }
+}
+
+/**
+ * Reads a start tag's SHAPE — its name, whether it closes itself, and where it
+ * ends — without interpreting its attributes.
+ *
+ * Attributes are deliberately not validated here: `parseStartTag` does that,
+ * with the strictness its own refusals document, for the tags this reader
+ * actually interprets. What this function must get exactly right is the END of
+ * the tag, because everything after it is classified relative to that point.
+ * Hence the quote awareness — an attribute value may legitimately contain `>` —
+ * and hence the refusal of a raw `<` anywhere inside the tag: XML forbids it in
+ * an attribute value, and tolerating it would leave markup hiding in a place
+ * the element matching below would find and treat as real.
+ *
+ * @param {string} xml The decoded part.
+ * @param {number} tagStart Index of the `<`.
+ * @param {string} partName Part name, for the refusal messages.
+ * @param {string} filePath Package path, for the refusal messages.
+ * @returns {{name: string, selfClosing: boolean, end: number}}
+ * @throws {Error} E_XLSX_MALFORMED_XML for a bad element name or a raw `<`,
+ *   E_XLSX_TRUNCATED when the tag never ends.
+ */
+function consumeStartTagShape(xml, tagStart, partName, filePath) {
+  const nameStart = tagStart + 1;
+  if (nameStart >= xml.length) {
+    throw refuse(
+      CODE_TRUNCATED,
+      `xlsx-read: part ${partName} of ${filePath} ends with an unterminated "<" at offset ${tagStart}`,
+      'xml_tag_unterminated'
+    );
+  }
+  if (!XML_NAME_START_PATTERN.test(xml[nameStart])) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(xml[nameStart])} where an element name belongs at offset ${nameStart}`,
+      'xml_element_name_invalid'
+    );
+  }
+
+  let index = nameStart;
+  while (index < xml.length && !isTagNameBoundary(xml[index])) {
+    index += 1;
+  }
+  const name = xml.slice(nameStart, index);
+  if (!XML_NAME_PATTERN.test(name)) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(name)} where an XML element name belongs at offset ${nameStart}`,
+      'xml_element_name_invalid'
+    );
+  }
+
+  let selfClosing = false;
+  let closed = false;
+  while (index < xml.length) {
+    const character = xml[index];
+    if (character === '"' || character === "'") {
+      /* The value is walked FORWARD, one character at a time, and the walk
+       * ends at the closing quote. Searching backwards for a `<` from the end
+       * of each value instead would rescan the whole tag once per attribute,
+       * which is quadratic in the length of a tag and would let a part of a
+       * few hundred kilobytes — well inside every ceiling — block this
+       * synchronous reader, and with it the request that called it. Every
+       * character of a tag is visited exactly once here. */
+      let cursor = index + 1;
+      while (cursor < xml.length && xml[cursor] !== character) {
+        if (xml[cursor] === '<') {
+          throw refuse(
+            CODE_MALFORMED_XML,
+            `xlsx-read: part ${partName} of ${filePath} has a raw "<" inside an attribute value on <${name}> at offset ${cursor}`,
+            'xml_attribute_value_raw_lt'
+          );
+        }
+        cursor += 1;
+      }
+      if (cursor >= xml.length) {
+        throw refuse(
+          CODE_TRUNCATED,
+          `xlsx-read: part ${partName} of ${filePath} ends inside an attribute value on <${name}>`,
+          'xml_attribute_truncated'
+        );
+      }
+      index = cursor + 1;
+      continue;
+    }
+    if (character === '<') {
+      throw refuse(
+        CODE_MALFORMED_XML,
+        `xlsx-read: part ${partName} of ${filePath} has a raw "<" inside the <${name}> tag at offset ${index}`,
+        'xml_tag_raw_lt'
+      );
+    }
+    if (character === '>') {
+      index += 1;
+      closed = true;
+      break;
+    }
+    if (character === '/' && xml[index + 1] === '>') {
+      index += 2;
+      selfClosing = true;
+      closed = true;
+      break;
+    }
+    index += 1;
+  }
+  if (!closed) {
+    throw refuse(
+      CODE_TRUNCATED,
+      `xlsx-read: part ${partName} of ${filePath} ends inside the <${name}> start tag`,
+      'xml_start_tag_truncated'
+    );
+  }
+  return { name, selfClosing, end: index };
+}
+
+/**
+ * Matches an end tag against the innermost open element.
+ *
+ * The two failures are told apart rather than lumped together, because they
+ * mean different things about the bytes. An end tag naming an element that IS
+ * open but not innermost means the inner element was never closed, which is the
+ * same disagreement between declared bytes and structure that E_XLSX_TRUNCATED
+ * covers everywhere else in this module. An end tag naming nothing that is open
+ * is a document saying something wrong, which is E_XLSX_MALFORMED_XML.
+ *
+ * @param {string} xml The decoded part.
+ * @param {number} tagStart Index of the `<`.
+ * @param {string[]} open The elements currently open; mutated on a match.
+ * @param {string} partName Part name, for the refusal messages.
+ * @param {string} filePath Package path, for the refusal messages.
+ * @returns {number} The index just past the end tag.
+ * @throws {Error} E_XLSX_MALFORMED_XML or E_XLSX_TRUNCATED.
+ */
+function consumeEndTag(xml, tagStart, open, partName, filePath) {
+  const nameStart = tagStart + 2;
+  let index = nameStart;
+  while (index < xml.length && !isTagNameBoundary(xml[index])) {
+    index += 1;
+  }
+  const name = xml.slice(nameStart, index);
+  while (index < xml.length && XML_WHITESPACE.includes(xml[index])) {
+    index += 1;
+  }
+  if (index >= xml.length) {
+    throw refuse(
+      CODE_TRUNCATED,
+      `xlsx-read: part ${partName} of ${filePath} ends inside an end tag at offset ${tagStart}`,
+      'xml_end_tag_truncated'
+    );
+  }
+  if (xml[index] !== '>' || !XML_NAME_PATTERN.test(name)) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has a malformed end tag at offset ${tagStart}`,
+      'xml_end_tag_malformed'
+    );
+  }
+
+  const innermost = open.length === 0 ? undefined : open[open.length - 1];
+  if (innermost === undefined) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has an end tag </${name}> at offset ${tagStart} that closes no open element`,
+      'xml_end_tag_unmatched'
+    );
+  }
+  if (innermost !== name) {
+    if (open.includes(name)) {
+      throw refuse(
+        CODE_TRUNCATED,
+        `xlsx-read: part ${partName} of ${filePath} closes <${name}> at offset ${tagStart} while <${innermost}> is still open, so <${innermost}> is never closed`,
+        'xml_end_tag_misnested'
+      );
+    }
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has an end tag </${name}> at offset ${tagStart} where </${innermost}> belongs`,
+      'xml_end_tag_mismatched'
+    );
+  }
+  open.pop();
+  return index + 1;
+}
+
+/**
+ * Holds an interpreted element to the parent ECMA-376 puts it under.
+ *
+ * Only the four names the descent searches for are constrained; every other
+ * element in a worksheet — `sheetPr`, `cols`, `pageMargins` and the rest — is
+ * walked for its shape and otherwise left alone.
+ *
+ * @param {string} name The element's name.
+ * @param {string[]} open The elements currently open.
+ * @param {number} tagStart Index of the `<`, for the refusal message.
+ * @param {string} partName Part name, for the refusal message.
+ * @param {string} filePath Package path, for the refusal message.
+ * @returns {void}
+ * @throws {Error} E_XLSX_MALFORMED_XML when the parent is not one the reader
+ *   expects.
+ */
+function requireExpectedParent(name, open, tagStart, partName, filePath) {
+  const expected = INTERPRETED_ELEMENT_PARENTS.get(name);
+  if (expected === undefined) {
+    return;
+  }
+  const parent = open.length === 0 ? undefined : open[open.length - 1];
+  if (parent === undefined || !expected.includes(parent)) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has a <${name}> element at offset ${tagStart} inside ${parent === undefined ? 'no element' : `<${parent}>`}; this reader reads <${name}> only inside ${expected.map((candidate) => `<${candidate}>`).join(' or ')}`,
+      'xml_element_unexpected_parent'
+    );
+  }
+}
+
+/**
+ * Reports whether a character ends an element name inside a tag.
+ *
+ * @param {string} character One character of the part.
+ * @returns {boolean} True at whitespace, `/` or `>`.
+ */
+function isTagNameBoundary(character) {
+  return character === '>' || character === '/' || XML_WHITESPACE.includes(character);
+}
+
 /**
  * Finds the start of the next `<tagName` element inside a span, requiring a
  * real delimiter after the name so a search for `<c` never matches `<cols`.
@@ -505,6 +1050,10 @@ function codePointToString(codePoint, original) {
  * substring, which is what lets the walk descend into a row and a cell without
  * ever copying their text. See the module header: a value is only ever
  * extracted for a column the caller asked for.
+ *
+ * A plain scan is sound here only because `validateInterpretedStructure` has
+ * already refused every part in which markup-looking text is not markup. That
+ * pass is a precondition of this function, not an optional extra.
  *
  * @param {string} xml The document being scanned.
  * @param {string} tagName Unprefixed element name.
@@ -533,9 +1082,9 @@ function findElementStart(xml, tagName, fromIndex, endIndex) {
 /**
  * Parses a start tag's attributes and reports where its content begins.
  *
- * Attributes are parsed properly rather than pattern-matched, for two reasons
- * measured against these files: the cells carry `r`, `s` and `t` in that
- * order, so nothing may assume `t` follows `r`; and an attribute value is
+ * Attributes are parsed properly rather than pattern-matched, because the XML
+ * grammar allows neither shortcut: attribute order is not fixed, so nothing
+ * may assume one attribute follows another; and an attribute value is
  * permitted to contain a raw `>`, which a scan for the next `>` would take
  * for the end of the tag.
  *
@@ -590,7 +1139,9 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
       // parser agrees on, which is precisely the salvage this module refuses.
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} runs two attributes together with no separating whitespace on <${tagName}> at offset ${index}`
+        `xlsx-read: part ${partName} of ${filePath} runs two attributes together with no separating whitespace on <${tagName}> at offset ${index}`,
+        'xml_attributes_unseparated',
+        index
       );
     }
 
@@ -612,20 +1163,24 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
       // interpreted. Refuse instead.
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(xml[index])} where an attribute name belongs on <${tagName}> at offset ${index}`
+        `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(xml[index])} where an attribute name belongs on <${tagName}> at offset ${index}`,
+        'xml_attribute_name_invalid',
+        index
       );
     }
     const attributeName = xml.slice(index, nameEnd);
     if (!XML_ATTRIBUTE_NAME_PATTERN.test(attributeName)) {
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(attributeName)} where an XML attribute name belongs on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} has ${JSON.stringify(attributeName)} where an XML attribute name belongs on <${tagName}>`,
+        'xml_attribute_name_invalid'
       );
     }
     if (Object.prototype.hasOwnProperty.call(attributes, attributeName)) {
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} repeats attribute ${attributeName} on <${tagName}>, so which value applies is undefined`
+        `xlsx-read: part ${partName} of ${filePath} repeats attribute ${attributeName} on <${tagName}>, so which value applies is undefined`,
+        'xml_attribute_repeated'
       );
     }
     index = nameEnd;
@@ -637,7 +1192,8 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
     if (index >= endIndex) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: part ${partName} of ${filePath} ends after attribute ${attributeName} on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} ends after attribute ${attributeName} on <${tagName}>`,
+        'xml_attribute_truncated'
       );
     }
     if (xml[index] !== '=') {
@@ -647,7 +1203,8 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
       // reader would then treat as absent.
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} has attribute ${attributeName} with no value on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} has attribute ${attributeName} with no value on <${tagName}>`,
+        'xml_attribute_value_missing'
       );
     }
     index += 1;
@@ -657,7 +1214,8 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
     if (index >= endIndex) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: part ${partName} of ${filePath} ends before the value of attribute ${attributeName} on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} ends before the value of attribute ${attributeName} on <${tagName}>`,
+        'xml_attribute_truncated'
       );
     }
     const quote = xml[index];
@@ -667,14 +1225,16 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
       // stops rather than a fact about the document.
       throw refuse(
         CODE_MALFORMED_XML,
-        `xlsx-read: part ${partName} of ${filePath} has an unquoted value for attribute ${attributeName} on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} has an unquoted value for attribute ${attributeName} on <${tagName}>`,
+        'xml_attribute_value_unquoted'
       );
     }
     const valueEnd = xml.indexOf(quote, index + 1);
     if (valueEnd === -1 || valueEnd >= endIndex) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: part ${partName} of ${filePath} ends inside the value of attribute ${attributeName} on <${tagName}>`
+        `xlsx-read: part ${partName} of ${filePath} ends inside the value of attribute ${attributeName} on <${tagName}>`,
+        'xml_attribute_truncated'
       );
     }
     attributes[attributeName] = decodeXmlText(xml.slice(index + 1, valueEnd));
@@ -685,7 +1245,8 @@ function parseStartTag(xml, startIndex, tagName, endIndex, partName, filePath) {
   if (!closed) {
     throw refuse(
       CODE_TRUNCATED,
-      `xlsx-read: part ${partName} of ${filePath} ends inside the <${tagName}> start tag`
+      `xlsx-read: part ${partName} of ${filePath} ends inside the <${tagName}> start tag`,
+      'xml_start_tag_truncated'
     );
   }
   return { attributes, selfClosing, contentStart: index };
@@ -712,7 +1273,8 @@ function findClosingTag(xml, tagName, fromIndex, endIndex, partName, filePath) {
   if (contentEnd === -1 || contentEnd + closing.length > endIndex) {
     throw refuse(
       CODE_TRUNCATED,
-      `xlsx-read: part ${partName} of ${filePath} ends before the closing ${closing} tag`
+      `xlsx-read: part ${partName} of ${filePath} ends before the closing ${closing} tag`,
+      'xml_closing_tag_missing'
     );
   }
   return { contentEnd, nextIndex: contentEnd + closing.length };
@@ -771,8 +1333,9 @@ function collectTextElements(xml, fromIndex, endIndex, partName, filePath) {
 /**
  * Builds the refusal for an inline string with no `<t>` element.
  *
- * One function because two call sites raise it: the value path, which has the
- * text in hand, and the skip path, which deliberately does not.
+ * Built in one place so the same refusal is raised whether or not the cell's
+ * text was read: a cell outside the caller's selection is held to the
+ * structure it declares without its value ever being decoded.
  *
  * @param {string} reference The cell's reference or column, for the message.
  * @param {string} partName Part name, for the refusal message.
@@ -782,7 +1345,8 @@ function collectTextElements(xml, fromIndex, endIndex, partName, filePath) {
 function malformedInlineString(reference, partName, filePath) {
   return refuse(
     CODE_MALFORMED_XML,
-    `xlsx-read: cell ${reference} in part ${partName} of ${filePath} declares t="${CELL_TYPE_INLINE_STRING}" but holds no <${ELEMENT_TEXT}> element`
+    `xlsx-read: cell ${reference} in part ${partName} of ${filePath} declares t="${CELL_TYPE_INLINE_STRING}" but holds no <${ELEMENT_TEXT}> element`,
+    'cell_inline_string_empty'
   );
 }
 
@@ -821,11 +1385,11 @@ function requireInlineStringElement(xml, contentStart, contentEnd, reference, pa
  * Walks the chain of local file headers and describes every entry in the
  * package, in the order the entries physically appear.
  *
- * The walk must reach the end of the chain rather than stop early: in all
- * three workbooks the worksheet is the 4th entry and `[Content_Types].xml` is
- * the LAST, so no part's position may be assumed. It stops cleanly at the
- * first signature that is not a local file header, which is where the central
- * directory begins.
+ * No part's position in the package is assumed, so the walk must reach the end
+ * of the chain rather than stop early: the part a caller asks for may be the
+ * last entry, and the last entry has to be reachable. The walk stops cleanly
+ * at the first signature that is not a local file header, which is where the
+ * central directory begins.
  *
  * Every entry is checked against the supported subset as it is walked, so the
  * package is refused whichever function the caller reached for.
@@ -842,7 +1406,9 @@ function walkPackageEntries(buffer, filePath) {
     if (offset + SIGNATURE_LENGTH > buffer.length) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: ${filePath} has ${buffer.length - offset} trailing byte(s) at offset ${offset}, too few to hold a header signature`
+        `xlsx-read: ${filePath} has ${buffer.length - offset} trailing byte(s) at offset ${offset}, too few to hold a header signature`,
+        'zip_trailing_bytes',
+        offset
       );
     }
     if (buffer.readUInt32LE(offset) !== LOCAL_FILE_HEADER_SIGNATURE) {
@@ -851,7 +1417,9 @@ function walkPackageEntries(buffer, filePath) {
     if (offset + LOCAL_FILE_HEADER_LENGTH > buffer.length) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: ${filePath} ends inside the local file header at offset ${offset}`
+        `xlsx-read: ${filePath} ends inside the local file header at offset ${offset}`,
+        'zip_header_truncated',
+        offset
       );
     }
 
@@ -866,7 +1434,9 @@ function walkPackageEntries(buffer, filePath) {
     if (nameEnd > buffer.length) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: ${filePath} ends inside the entry name at offset ${nameStart}`
+        `xlsx-read: ${filePath} ends inside the entry name at offset ${nameStart}`,
+        'zip_entry_name_truncated',
+        nameStart
       );
     }
     const name = buffer.toString('utf8', nameStart, nameEnd);
@@ -877,13 +1447,19 @@ function walkPackageEntries(buffer, filePath) {
     if (flag !== FLAG_NONE) {
       throw refuse(
         CODE_UNSUPPORTED_FLAGS,
-        `xlsx-read: entry ${name} in ${filePath} sets general-purpose bit flag 0x${flag.toString(16)}${describeFlag(flag)}; only flag 0 is supported`
+        `xlsx-read: entry ${name} in ${filePath} sets general-purpose bit flag 0x${flag.toString(16)}${describeFlag(flag)}; only flag 0 is supported`,
+        'zip_general_purpose_flag',
+        offset,
+        flag
       );
     }
     if (method !== COMPRESSION_STORED && method !== COMPRESSION_DEFLATE) {
       throw refuse(
         CODE_UNSUPPORTED_COMPRESSION,
-        `xlsx-read: entry ${name} in ${filePath} uses compression method ${method}; only ${COMPRESSION_DEFLATE} (DEFLATE) and ${COMPRESSION_STORED} (STORED) are supported`
+        `xlsx-read: entry ${name} in ${filePath} uses compression method ${method}; only ${COMPRESSION_DEFLATE} (DEFLATE) and ${COMPRESSION_STORED} (STORED) are supported`,
+        'zip_compression_method',
+        offset,
+        method
       );
     }
 
@@ -892,7 +1468,10 @@ function walkPackageEntries(buffer, filePath) {
     if (dataStart > buffer.length || dataEnd > buffer.length) {
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: entry ${name} in ${filePath} declares ${compressedSize} byte(s) at offset ${dataStart} but the file is ${buffer.length} byte(s)`
+        `xlsx-read: entry ${name} in ${filePath} declares ${compressedSize} byte(s) at offset ${dataStart} but the file is ${buffer.length} byte(s)`,
+        'zip_entry_out_of_range',
+        dataStart,
+        compressedSize
       );
     }
 
@@ -903,7 +1482,8 @@ function walkPackageEntries(buffer, filePath) {
   if (entries.length === 0) {
     throw refuse(
       CODE_TRUNCATED,
-      `xlsx-read: ${filePath} does not begin with a ZIP local file header and is not a readable OOXML package`
+      `xlsx-read: ${filePath} does not begin with a ZIP local file header and is not a readable OOXML package`,
+      'package_not_a_zip'
     );
   }
   return entries;
@@ -928,38 +1508,153 @@ function describeFlag(flag) {
 }
 
 /**
- * Reads a package into memory, refusing one too large to be a workbook.
+ * Reads a package into memory, refusing one too large to be a workbook and one
+ * whose source cannot be bounded at all.
  *
- * The size is taken from the open descriptor rather than from a separate
- * `statSync` on the path, so the file that is measured is exactly the file
- * that is then read — and it is measured BEFORE the allocation, which is the
- * only point at which refusing a 2 GB file still costs nothing.
+ * Three controls, and the order they run in is the point:
+ *
+ *   1. The source must be a REGULAR FILE. A directory, a FIFO, a socket or a
+ *      device has no length to measure — several of them report a size of zero
+ *      and then produce bytes until something closes them — so a ceiling
+ *      checked against such a descriptor's metadata is not a ceiling at all.
+ *   2. The size is taken from the OPEN DESCRIPTOR rather than from a separate
+ *      `statSync` on the path, so the file that is measured is the file that is
+ *      then read, and it is measured BEFORE the allocation: refusing a 2 GB
+ *      file has to cost nothing, which it only does while nothing has been
+ *      allocated for it.
+ *   3. The read itself is bounded independently of that measurement. This is
+ *      the control step 2 cannot provide: `fstat` and the read are two separate
+ *      operations on a filesystem other processes can write to, so a file may
+ *      grow between them, and a source that misreports its size defeats step 2
+ *      outright. `readDescriptorBounded` therefore treats the reported size as
+ *      a hint for how much to allocate and the CEILING as the only limit it
+ *      trusts — it stops one byte past the ceiling and refuses that byte.
  *
  * @param {string} filePath Path to the package, used exactly as given.
  * @returns {Buffer} The whole package.
- * @throws {Error} E_XLSX_LIMIT_EXCEEDED when the file is past the ceiling.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE when the source is not a regular
+ *   file, or E_XLSX_LIMIT_EXCEEDED when its bytes are past the ceiling —
+ *   whether that is what the descriptor reported or what the read found.
  */
 function readPackageBuffer(filePath) {
   const descriptor = fs.openSync(filePath, 'r');
   try {
-    const { size } = fs.fstatSync(descriptor);
-    if (size > MAX_PACKAGE_BYTES) {
+    const stats = fs.fstatSync(descriptor);
+    if (!stats.isFile()) {
       throw refuse(
-        CODE_LIMIT_EXCEEDED,
-        `xlsx-read: ${filePath} is ${size} byte(s), past the ${MAX_PACKAGE_BYTES}-byte ceiling for a workbook package`
+        CODE_UNSUPPORTED_SOURCE,
+        `xlsx-read: ${filePath} is ${describeSourceKind(stats)} rather than a regular file, so the bytes it would yield cannot be bounded before they are read`,
+        'source_not_regular_file'
       );
     }
-    return fs.readFileSync(descriptor);
+    if (stats.size > MAX_PACKAGE_BYTES) {
+      throw refuse(
+        CODE_LIMIT_EXCEEDED,
+        `xlsx-read: ${filePath} is ${stats.size} byte(s), past the ${MAX_PACKAGE_BYTES}-byte ceiling for a workbook package`,
+        'package_too_large',
+        null,
+        stats.size
+      );
+    }
+    return readDescriptorBounded(descriptor, filePath, stats.size);
   } finally {
     fs.closeSync(descriptor);
   }
 }
 
 /**
+ * Names the kind of a rejected source, so the refusal says what was opened
+ * rather than only that it was wrong.
+ *
+ * @param {import('node:fs').Stats} stats The descriptor's metadata.
+ * @returns {string} A short description, with an article.
+ */
+function describeSourceKind(stats) {
+  if (stats.isDirectory()) {
+    return 'a directory';
+  }
+  if (stats.isFIFO()) {
+    return 'a pipe';
+  }
+  if (stats.isSocket()) {
+    return 'a socket';
+  }
+  if (stats.isCharacterDevice()) {
+    return 'a character device';
+  }
+  if (stats.isBlockDevice()) {
+    return 'a block device';
+  }
+  if (stats.isSymbolicLink()) {
+    return 'a symbolic link';
+  }
+  return 'not a regular file';
+}
+
+/**
+ * Reads an open descriptor to its end, under the package ceiling.
+ *
+ * The buffer starts at the size the descriptor reported and DOUBLES while
+ * bytes keep arriving, which is what makes the ceiling enforceable without
+ * allocating it: a six-kilobyte workbook costs six kilobytes, and a source
+ * that claims to be empty and then streams is still stopped at the ceiling
+ * rather than at `buffer.kMaxLength`.
+ *
+ * Capacity always leaves room for ONE BYTE PAST the ceiling. That byte is the
+ * whole mechanism: it can only be filled by a source holding more than the
+ * ceiling allows, so seeing it is proof rather than inference, and a source
+ * holding exactly `MAX_PACKAGE_BYTES` bytes still reads — the ceiling is
+ * inclusive here exactly as it is in the size check above.
+ *
+ * Only the bytes actually read are ever exposed: the buffer is allocated
+ * uninitialized for speed, and the slack at its end is either copied away or,
+ * when the read filled it exactly, absent.
+ *
+ * @param {number} descriptor An open, readable descriptor positioned at 0.
+ * @param {string} filePath Package path, for the refusal message.
+ * @param {number} declaredSize The size the descriptor reported, used only to
+ *   size the first allocation.
+ * @returns {Buffer} Exactly the bytes read.
+ * @throws {Error} E_XLSX_LIMIT_EXCEEDED when the source holds more than
+ *   MAX_PACKAGE_BYTES bytes, whatever its metadata said.
+ */
+function readDescriptorBounded(descriptor, filePath, declaredSize) {
+  const ceiling = MAX_PACKAGE_BYTES;
+  let capacity = Math.min(Math.max(declaredSize, 1), ceiling) + 1;
+  let buffer = Buffer.allocUnsafe(capacity);
+  let filled = 0;
+
+  for (;;) {
+    if (filled === capacity) {
+      if (capacity > ceiling) {
+        // The reserved byte past the ceiling has been filled, so the source
+        // holds at least ceiling + 1 bytes. Nothing further is read.
+        throw refuse(
+          CODE_LIMIT_EXCEEDED,
+          `xlsx-read: ${filePath} yielded more than the ${ceiling}-byte ceiling for a workbook package (its descriptor reported ${declaredSize} byte(s) before the read)`,
+          'package_grew_past_ceiling'
+        );
+      }
+      capacity = Math.min(capacity * 2, ceiling + 1);
+      const grown = Buffer.allocUnsafe(capacity);
+      buffer.copy(grown, 0, 0, filled);
+      buffer = grown;
+    }
+    const read = fs.readSync(descriptor, buffer, filled, capacity - filled, null);
+    if (read === 0) {
+      break;
+    }
+    filled += read;
+  }
+
+  return filled === buffer.length ? buffer : Buffer.from(buffer.subarray(0, filled));
+}
+
+/**
  * Decompresses one walked entry, under the documented ceilings.
  *
- * Three controls, and each of them guards a failure the defaults permit:
- * the declared compressed size is refused before a byte is inflated;
+ * Each control here guards a failure the defaults permit: an over-large
+ * declared compressed size is refused before a byte is inflated;
  * `maxOutputLength` stops an expansion that would otherwise run to
  * `buffer.kMaxLength`; and `rejectGarbageAfterEnd` refuses an entry whose
  * declared size overshoots its DEFLATE stream, which the default silently
@@ -977,7 +1672,10 @@ function decompressEntry(buffer, entry, filePath) {
   if (entry.compressedSize > MAX_ENTRY_COMPRESSED_BYTES) {
     throw refuse(
       CODE_LIMIT_EXCEEDED,
-      `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s), past the ${MAX_ENTRY_COMPRESSED_BYTES}-byte ceiling for one entry`
+      `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s), past the ${MAX_ENTRY_COMPRESSED_BYTES}-byte ceiling for one entry`,
+      'zip_entry_too_large',
+      null,
+      entry.compressedSize
     );
   }
   const compressed = buffer.subarray(entry.dataStart, entry.dataStart + entry.compressedSize);
@@ -993,18 +1691,25 @@ function decompressEntry(buffer, entry, filePath) {
       if (cause.code === RUNTIME_OUTPUT_TOO_LARGE) {
         throw refuse(
           CODE_LIMIT_EXCEEDED,
-          `xlsx-read: entry ${entry.name} in ${filePath} expands past the ${MAX_PART_BYTES}-byte ceiling for one part`
+          `xlsx-read: entry ${entry.name} in ${filePath} expands past the ${MAX_PART_BYTES}-byte ceiling for one part`,
+          'part_too_large'
         );
       }
       if (cause.code === RUNTIME_TRAILING_JUNK) {
         throw refuse(
           CODE_TRUNCATED,
-          `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s) but its DEFLATE stream ends before that, leaving trailing bytes the header does not account for`
+          `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s) but its DEFLATE stream ends before that, leaving trailing bytes the header does not account for`,
+          'zip_entry_stream_short',
+          null,
+          entry.compressedSize
         );
       }
       throw refuse(
         CODE_TRUNCATED,
-        `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s) that could not be inflated (${cause.code || cause.message})`
+        `xlsx-read: entry ${entry.name} in ${filePath} declares ${entry.compressedSize} compressed byte(s) that could not be inflated (${cause.code || cause.message})`,
+        'zip_entry_inflate_failed',
+        null,
+        entry.compressedSize
       );
     }
   }
@@ -1028,19 +1733,31 @@ function decompressEntry(buffer, entry, filePath) {
  *     one `<t>` is REQUIRED: a cell declaring itself an inline string and
  *     carrying none is malformed, and returning `''` for it would put an
  *     empty label or an empty key where a real one was expected.
- *   - `t="n"` — the text of `<v>`, returned verbatim as a string so a float
- *     such as 8.199999999999999 keeps every digit it was written with.
- *   - `t="s"` — refused by `parseRow` before this function is reached, since
- *     the type is known there and the refusal must hold for every cell in the
- *     worksheet rather than only for a cell whose value is being read.
- *   - no `t` at all — implicitly numeric per ECMA-376, so the text of `<v>`.
- *   - any other `t` (`b`, `d`, `e`, `str`) — the text of `<v>` verbatim. That
- *     is the literal the package stored, so it is faithful rather than lossy;
- *     no interpretation and no date-serial conversion is applied.
- *   - empty, self-closing, or holding no `<v>` — the empty string, without
- *     throwing. An untyped empty cell is ordinary in a worksheet; an inline
+ *   - `t="n"`, or no `t` at all, which ECMA-376 makes implicitly numeric — the
+ *     text of `<v>`, returned verbatim as a string so a float such as
+ *     8.199999999999999 keeps every digit it was written with. The text must
+ *     actually be a number: a numeric cell holding `S999` is refused with
+ *     E_XLSX_UNSUPPORTED_CELL_TYPE rather than handed back, because verbatim
+ *     return is exactly what would make that string indistinguishable from a
+ *     Student ID read out of the key column.
+ *   - `t="s"`, and every type outside the subset — refused by `parseRow`
+ *     before this function is reached, since the type is known there and the
+ *     refusal must hold for every cell in the worksheet rather than only for a
+ *     cell whose value is being read.
+ *   - empty, self-closing, holding no `<v>`, or holding an empty `<v></v>` —
+ *     the empty string, without throwing. A blank cell is ordinary in a
+ *     worksheet and states no value to disagree with its type; an inline
  *     string with no text is not, which is why only the former is tolerated.
  * A cell's `s` style index is read by nothing here: no style parsing.
+ *
+ * WHY THE LEXICAL CHECK LIVES HERE, while the TYPE check lives in `parseRow`:
+ * a declared type is a property of the package and is checked for every cell,
+ * selected or not. A value's content can only be checked by reading the value,
+ * and reading the value of a column the caller did not ask for is precisely
+ * what this module promises not to do — the name, date of birth, email, phone
+ * and city beside a Student ID must not be materialised to find out whether
+ * they are numbers. The attack the check exists for runs through a value that
+ * IS read: the key column, which every submission is validated against.
  *
  * @param {string} xml The document being scanned.
  * @param {number} contentStart Where the cell's content starts, or -1 when the
@@ -1051,7 +1768,9 @@ function decompressEntry(buffer, entry, filePath) {
  * @param {string} partName Part name, for the refusal messages.
  * @param {string} filePath Package path, for the refusal messages.
  * @returns {string} The cell's value.
- * @throws {Error} E_XLSX_MALFORMED_XML for an inline string with no `<t>`.
+ * @throws {Error} E_XLSX_MALFORMED_XML for an inline string with no `<t>`, or
+ *   E_XLSX_UNSUPPORTED_CELL_TYPE for a numeric cell whose value is not a
+ *   number.
  */
 function cellValue(xml, contentStart, contentEnd, reference, attributes, partName, filePath) {
   const type = attributes.t;
@@ -1087,7 +1806,35 @@ function cellValue(xml, contentStart, contentEnd, reference, attributes, partNam
     partName,
     filePath
   );
-  return decodeXmlText(xml.slice(valueTag.contentStart, valueClose.contentEnd));
+  const value = decodeXmlText(xml.slice(valueTag.contentStart, valueClose.contentEnd));
+  if (value.length === 0) {
+    return '';
+  }
+  if (!NUMERIC_VALUE_PATTERN.test(value)) {
+    throw refuse(
+      CODE_UNSUPPORTED_CELL_TYPE,
+      `xlsx-read: cell ${reference} in part ${partName} of ${filePath} declares ${type === undefined ? 'no cell type, which ECMA-376 makes numeric,' : `t="${type}"`} but its <${ELEMENT_VALUE}> element holds ${JSON.stringify(truncateForMessage(value))}, which is not a number`,
+      'cell_value_not_numeric'
+    );
+  }
+  return value;
+}
+
+/**
+ * Shortens a value for a refusal message.
+ *
+ * A refusal names the offending detail, and a cell's text is bounded by
+ * nothing, so the message takes a prefix rather than whatever the package
+ * chose to put there. Short enough to read in a test failure, long enough to
+ * identify what was wrong.
+ *
+ * @param {string} value The offending text.
+ * @returns {string} The text, or a prefix of it with an ellipsis.
+ */
+function truncateForMessage(value) {
+  return value.length <= MAX_MESSAGE_VALUE_LENGTH
+    ? value
+    : `${value.slice(0, MAX_MESSAGE_VALUE_LENGTH)}…`;
 }
 
 /**
@@ -1103,11 +1850,12 @@ function cellValue(xml, contentStart, contentEnd, reference, attributes, partNam
  * as the first puts the value in whichever column happens to come next.
  *
  * Every cell is walked and structurally validated whether or not its column
- * was asked for — the start tag, the reference, the cell type and the presence
- * of an inline string's `<t>` element are all checked. Only the VALUE is
- * conditional: outside the selection the cell's text is never sliced, decoded
- * or stored, which is what keeps a Student ID read from materialising the
- * personal data in the columns beside it.
+ * was asked for — the start tag, the reference, the uniqueness of its column
+ * within the row, the cell type and the presence of an inline string's `<t>`
+ * element are all checked. Only the VALUE is conditional: outside the
+ * selection the cell's text is never sliced, decoded or stored, which is what
+ * keeps a Student ID read from materialising the personal data in the columns
+ * beside it.
  *
  * The object is a plain `{}` with the ordinary prototype, so a caller can
  * compare it against an object literal with a strict deep-equality assertion.
@@ -1122,12 +1870,19 @@ function cellValue(xml, contentStart, contentEnd, reference, attributes, partNam
  * @param {Set<string>|null} selection Columns whose values may be read, or
  *   null for every column.
  * @returns {Object<string, string>} Cell values keyed by column letter.
- * @throws {Error} E_XLSX_MALFORMED_XML for a malformed reference, a row
- *   running past the grid or an inline string with no `<t>`, or
- *   E_XLSX_SHARED_STRINGS_UNSUPPORTED for a `t="s"` cell anywhere in the row.
+ * @throws {Error} E_XLSX_MALFORMED_XML for a malformed reference, two cells in
+ *   one column, a row running past the grid or an inline string with no `<t>`;
+ *   E_XLSX_SHARED_STRINGS_UNSUPPORTED for a `t="s"` cell anywhere in the row;
+ *   or E_XLSX_UNSUPPORTED_CELL_TYPE for any other unsupported cell type
+ *   anywhere in the row, and for a numeric cell in the selection whose value
+ *   is not a number.
  */
 function parseRow(xml, rowStart, rowEnd, partName, filePath, selection) {
   const cells = {};
+  /* Every column this row has already placed a cell in, selected or not. The
+   * returned object cannot serve as that record: outside a selection a cell
+   * contributes no key, so two unselected duplicates would go unnoticed. */
+  const seenColumns = new Set();
   let cursor = rowStart;
   let nextImplicitColumn = 0;
 
@@ -1162,7 +1917,8 @@ function parseRow(xml, rowStart, rowEnd, partName, filePath, selection) {
       if (nextImplicitColumn > MAX_COLUMN_INDEX) {
         throw refuse(
           CODE_MALFORMED_XML,
-          `xlsx-read: part ${partName} of ${filePath} holds a row with more cells than the A to ${LAST_COLUMN_LETTERS} grid has columns`
+          `xlsx-read: part ${partName} of ${filePath} holds a row with more cells than the A to ${LAST_COLUMN_LETTERS} grid has columns`,
+          'row_wider_than_grid'
         );
       }
       columnLetters = lettersFromColumnIndex(nextImplicitColumn);
@@ -1171,31 +1927,70 @@ function parseRow(xml, rowStart, rowEnd, partName, filePath, selection) {
       if (columnLetters === null) {
         throw refuse(
           CODE_MALFORMED_XML,
-          `xlsx-read: part ${partName} of ${filePath} has cell reference ${JSON.stringify(reference)}, which is not a well-formed reference within the A to ${LAST_COLUMN_LETTERS} grid`
+          `xlsx-read: part ${partName} of ${filePath} has cell reference ${JSON.stringify(reference)}, which is not a well-formed reference within the A to ${LAST_COLUMN_LETTERS} grid`,
+          'cell_reference_malformed'
         );
       }
     }
     nextImplicitColumn = columnIndexFromLetters(columnLetters) + 1;
 
-    // The shared-string refusal belongs here rather than in `cellValue`: the
-    // type is already in hand, and a package carrying a string table this
-    // reader cannot resolve is not one it should report on — including when
-    // the `t="s"` cell sits in a column the caller did not ask for.
-    if (tag.attributes.t === CELL_TYPE_SHARED_STRING) {
+    const describedAs = reference === undefined ? columnLetters : reference;
+
+    // Two cells landing in one column is the row saying two different things
+    // about the same cell. Silently keeping the last one is how an injected
+    // duplicate overwrites a real Student ID or activity label, so the row is
+    // refused instead — and the check covers EVERY cell, including one whose
+    // column the caller did not ask for, because it is a property of the
+    // package rather than of the request.
+    if (seenColumns.has(columnLetters)) {
+      throw refuse(
+        CODE_MALFORMED_XML,
+        `xlsx-read: part ${partName} of ${filePath} holds two cells in column ${columnLetters} of one row (the second is ${describedAs}), so which value that cell holds is undefined`,
+        'cell_column_repeated'
+      );
+    }
+    seenColumns.add(columnLetters);
+
+    // The type refusals belong here rather than in `cellValue`: the type is
+    // already in hand, and a package whose cells this reader cannot honour is
+    // not one it should report on — including when the offending cell sits in
+    // a column the caller did not ask for.
+    //
+    // The shared-string case keeps its own code because it names a specific,
+    // resolvable-in-principle construct this reader chooses not to resolve.
+    const declaredType = tag.attributes.t;
+    if (declaredType === CELL_TYPE_SHARED_STRING) {
       throw refuse(
         CODE_SHARED_STRINGS_UNSUPPORTED,
-        `xlsx-read: cell ${reference === undefined ? columnLetters : reference} in part ${partName} of ${filePath} is a shared-string reference (t="${CELL_TYPE_SHARED_STRING}"), which this reader does not resolve because the package has no xl/sharedStrings.xml part`
+        `xlsx-read: cell ${describedAs} in part ${partName} of ${filePath} is a shared-string reference (t="${CELL_TYPE_SHARED_STRING}"), which this reader does not resolve because the package has no xl/sharedStrings.xml part`,
+        'cell_shared_string'
       );
     }
 
-
-    const describedAs = reference === undefined ? columnLetters : reference;
+    // Everything else outside the subset. `b`, `d`, `e` and `str` are real
+    // ECMA-376 types this reader does not interpret, and a `t` holding
+    // anything at all is a type it has never heard of; in both cases the old
+    // behaviour was to hand back the text of `<v>` verbatim. That is how a
+    // substituted workbook states `S999` as `t="str"` and has it accepted as a
+    // member of the authoritative key set, so the cell is refused before any
+    // value is produced from it.
+    if (
+      declaredType !== undefined &&
+      declaredType !== CELL_TYPE_INLINE_STRING &&
+      declaredType !== CELL_TYPE_NUMBER
+    ) {
+      throw refuse(
+        CODE_UNSUPPORTED_CELL_TYPE,
+        `xlsx-read: cell ${describedAs} in part ${partName} of ${filePath} declares t=${JSON.stringify(truncateForMessage(declaredType))}, which is outside the supported subset: t="${CELL_TYPE_INLINE_STRING}", t="${CELL_TYPE_NUMBER}", or no t attribute at all`,
+        'cell_type_unsupported'
+      );
+    }
 
     if (selection !== null && !selection.has(columnLetters)) {
       // Skipped for its VALUE only. An inline string still has to carry the
       // element it declares, and that is settled by looking for the element
       // rather than by reading what is inside it.
-      if (tag.attributes.t === CELL_TYPE_INLINE_STRING) {
+      if (declaredType === CELL_TYPE_INLINE_STRING) {
         requireInlineStringElement(xml, contentStart, contentEnd, describedAs, partName, filePath);
       }
       continue;
@@ -1238,33 +2033,31 @@ function decodePartText(bytes, partName, filePath) {
   } catch {
     throw refuse(
       CODE_MALFORMED_XML,
-      `xlsx-read: part ${partName} of ${filePath} is not valid UTF-8, so its text cannot be read without altering it`
+      `xlsx-read: part ${partName} of ${filePath} is not valid UTF-8, so its text cannot be read without altering it`,
+      'part_not_utf8'
     );
   }
 }
 
 /* ------------------------------------------------------------------------- *
- * Public API — exactly these four functions, per `Ajit_AddNewFeature_Rule`
+ * Public API
  * ------------------------------------------------------------------------- */
 
 /**
  * Lists the part names in a package, in the order the entries physically
  * appear.
  *
- * This is what proves a part is ABSENT — that there is no `vbaProject` and no
- * `externalLink` part, which no amount of rows and columns could express.
- *
- * Each workbook in this repository holds nine parts, beginning with
- * `docProps/app.xml` and ending with `[Content_Types].xml`; the worksheet is
- * the fourth. Nothing here assumes that order — the whole entry chain is
- * walked — but it is why the last entry has to be reachable.
+ * The listing is how a caller establishes which parts a package holds and,
+ * equally, that a given part is ABSENT — something no reading of rows and
+ * columns could express. The whole entry chain is walked, so a part's position
+ * in the package does not affect whether it appears here.
  *
  * @param {string} filePath Path to the .xlsx package, used exactly as given.
  * @returns {string[]} The part names, in package order.
  * @throws {TypeError} When `filePath` is not a non-empty string.
- * @throws {Error} E_XLSX_UNSUPPORTED_FLAGS, E_XLSX_UNSUPPORTED_COMPRESSION,
- *   E_XLSX_LIMIT_EXCEEDED or E_XLSX_TRUNCATED when the package falls outside
- *   the supported subset.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE, E_XLSX_UNSUPPORTED_FLAGS,
+ *   E_XLSX_UNSUPPORTED_COMPRESSION, E_XLSX_LIMIT_EXCEEDED or E_XLSX_TRUNCATED
+ *   when the source or the package falls outside the supported subset.
  */
 function listEntries(filePath) {
   requireNonEmptyString(filePath, 'filePath');
@@ -1275,10 +2068,10 @@ function listEntries(filePath) {
 /**
  * Reads one part of a package and returns its decompressed bytes.
  *
- * The primitive the other three functions are built on, and public because
- * the inertness assertions need a part's raw text — keeping ZIP parsing in
- * this one place rather than reimplemented in a test, where the second
- * implementation would drift from this one.
+ * Public because a caller may need the raw bytes of any part, not only the
+ * cell values of a worksheet — reading the package's own XML, for instance.
+ * Offering it keeps ZIP parsing in this one place, rather than reimplemented
+ * by a caller in a second implementation that would drift from this one.
  *
  * @param {string} filePath Path to the .xlsx package, used exactly as given.
  * @param {string} partName The part to read, for example
@@ -1299,7 +2092,8 @@ function readEntry(filePath, partName) {
   if (entry === undefined) {
     throw refuse(
       CODE_PART_NOT_FOUND,
-      `xlsx-read: ${filePath} has no part named ${partName}; it holds ${entries.length} part(s): ${entries.map((candidate) => candidate.name).join(', ')}`
+      `xlsx-read: ${filePath} has no part named ${partName}; it holds ${entries.length} part(s): ${entries.map((candidate) => candidate.name).join(', ')}`,
+      'package_part_missing'
     );
   }
   return decompressEntry(buffer, entry, filePath);
@@ -1309,20 +2103,21 @@ function readEntry(filePath, partName) {
  * Reads a worksheet part into rows of cell values keyed by column letter.
  *
  * One object per `<row>` element, in document order, so the first object is
- * the header row of these workbooks. Gaps in row numbering are not padded —
- * a row absent from the part produces no object — and a column absent from a
- * row produces no key on that row's object.
+ * the part's first row — the header row of a worksheet that carries one. Gaps
+ * in row numbering are not padded — a row absent from the part produces no
+ * object — and a column absent from a row produces no key on that row's
+ * object.
  *
  * A part with no `<sheetData>` element yields an empty array rather than an
  * error, so asking a non-worksheet part for rows is answered with "no rows"
  * instead of a throw.
  *
  * `columnLetters` narrows WHICH VALUES are read, and nothing else. Omit it, or
- * pass null, and every column is returned as before. Pass `['A', 'C']` and
- * each row object carries at most those two keys, while every cell in the
- * worksheet is still structurally validated — that is the difference between
- * not reading a student's email and not noticing that the worksheet is
- * malformed. Reading two columns this way costs one file read, one inflate
+ * pass null, and every populated column of each row is returned. Pass
+ * `['A', 'C']` and each row object carries at most those two keys, while every
+ * cell in the worksheet is still structurally validated — that is the
+ * difference between not reading a value and not noticing that the worksheet
+ * is malformed. Reading two columns this way costs one file read, one inflate
  * and one parse; two `readColumn` calls would cost two of each, because this
  * module holds no cache.
  *
@@ -1332,22 +2127,29 @@ function readEntry(filePath, partName) {
  * @param {string[]|null} [columnLetters] Columns whose values to read, or null
  *   for every column.
  * @returns {Array<Object<string, string>>} One object per `<row>` element, in
- *   document order. For column A of `student_details.xlsx` the first object is
- *   `{ A: 'Student ID' }` and the second is `{ A: 'S001' }`. With no selection
- *   each object instead carries every populated column of its row, which for
- *   that workbook means ten keys, A through J, holding the ten header cells on
- *   the first object and one student's row on each of the ten after it.
+ *   document order, keyed by uppercase column letter. With a selection each
+ *   object carries at most the selected columns; with no selection it carries
+ *   every populated column of its row.
  * @throws {TypeError} When an argument is not a non-empty string, or
  *   `columnLetters` is neither null nor a non-empty array of column letters.
  * @throws {Error} E_XLSX_SHARED_STRINGS_UNSUPPORTED for a `t="s"` cell,
- *   E_XLSX_MALFORMED_XML for undecodable or malformed worksheet XML, or any of
- *   the refusals listed on `readEntry`.
+ *   E_XLSX_UNSUPPORTED_CELL_TYPE for any other unsupported cell type or a
+ *   numeric cell whose value is not a number, E_XLSX_MALFORMED_XML for
+ *   undecodable or malformed worksheet XML — including a comment, a CDATA
+ *   section, a processing instruction or a markup declaration, none of which
+ *   this reader interprets or skips — or any of the refusals listed on
+ *   `readEntry`.
  */
 function readSheetRows(filePath, partName, columnLetters = null) {
   const selection = normalizeColumnSelection(columnLetters);
   const xml = decodePartText(readEntry(filePath, partName), partName, filePath);
+  /* Before a single element is matched: the scanning below is only sound on a
+   * part whose markup-looking text is markup, and whose tags balance. The
+   * offset it returns is where interpreted content begins, so the search below
+   * never re-enters the XML declaration the pass consumed as a whole. */
+  const contentStart = validateInterpretedStructure(xml, partName, filePath);
 
-  const sheetDataStart = findElementStart(xml, ELEMENT_SHEET_DATA, 0, xml.length);
+  const sheetDataStart = findElementStart(xml, ELEMENT_SHEET_DATA, contentStart, xml.length);
   if (sheetDataStart === -1) {
     return [];
   }
@@ -1409,27 +2211,26 @@ function readSheetRows(filePath, partName, columnLetters = null) {
 }
 
 /**
- * Reads one column of a worksheet, header first.
+ * Reads one column of a worksheet, one value per row.
  *
  * Exactly one value is returned per `<row>` element, in document order, so
- * index 0 is the header row and index i stays aligned with the i-th row. A
- * row that has no cell in the requested column contributes the empty string
- * rather than being skipped, because skipping it would shift every later
- * value and quietly misalign the caller's rows.
+ * index 0 holds the part's first row — the header row of a worksheet that
+ * carries one — and index i stays aligned with the i-th row. A row that has no
+ * cell in the requested column contributes the empty string rather than being
+ * skipped, because skipping it would shift every later value and quietly
+ * misalign the caller's rows.
  *
- * Only the requested column is decoded. Reading the Student ID column of
- * `student_details.xlsx` therefore does not materialise the name, date of
- * birth, email, phone or city held in the same rows, which is the data
- * boundary the feature is documented to keep.
+ * Only the requested column is decoded, so the values held in the other
+ * columns of the same rows are never materialised.
  *
  * @param {string} filePath Path to the .xlsx package, used exactly as given.
  * @param {string} partName The worksheet part, normally
  *   `'xl/worksheets/sheet1.xml'`.
  * @param {string} columnLetter The column, case-insensitive, for example `'A'`
  *   or `'C'`.
- * @returns {string[]} Eleven values for column A of `student_details.xlsx`:
- *   the header `'Student ID'` at index 0, then `'S001'` through `'S010'` at
- *   indexes 1 to 10.
+ * @returns {string[]} One value per `<row>` element in the part, in document
+ *   order — the cell's value, or the empty string for a row with no cell in
+ *   that column.
  * @throws {TypeError} When an argument is not a non-empty string, or
  *   `columnLetter` does not name a column from A to XFD.
  * @throws {Error} Any of the refusals listed on `readSheetRows`.

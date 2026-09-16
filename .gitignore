@@ -1,11 +1,6 @@
-# Ignore policy - the repository's first. Governing rule:
-# Ajit_AddNewFeature_Rule, minimal-change area: every pattern below names
-# something this feature or its tests actually produce, and nothing more.
-# These rules prevent the accident, not the act: `git add -f` overrides them,
-# and a path's absence from `git status` says nothing about the index or history.
-# Stanzas are separated by bare `#` lines rather than blank lines - that is the
-# style this file uses, not a constraint: Git matches nothing on a blank line.
-#
+# Untracked by design: runtime output of the service and its tests, installed
+# dependencies, and local environment files.
+
 # Runtime activity store and its atomic-write staging sibling: submitted data
 # linked to Student IDs, written by the service, never committed, never
 # pre-created. Exact names, never an `activities*` glob: such a glob could not
@@ -16,17 +11,13 @@
 # ACTIVITY_STORE can move both outside the checkout.
 activities.json
 activities.json.tmp
-#
-# npm install output: zero dependencies are declared, but a manifest now exists.
+
+# Dependency-install output.
 node_modules/
-#
-# Test evidence: --experimental-test-coverage output and captured server logs.
-# Deliberately no pattern for the JUnit report the evidence command writes: that
-# artifact belongs outside this worktree entirely, and the command in README.md
-# enforces it by resolving EVIDENCE_ROOT and refusing to run unless it lands
-# outside the worktree, rather than relying on a pattern here to hide it.
+
+# Test-coverage output and captured log files.
 coverage/
 *.log
-#
-# Local environment files; the feature's only variable is ACTIVITY_STORE.
+
+# Local environment files.
 .env*

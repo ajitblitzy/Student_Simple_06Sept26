@@ -8,18 +8,6 @@
  * invariant assertions, because proving a workbook was not touched needs the
  * reader and the repository, not a socket.
  *
- * WHY THIS FILE EXISTS
- * --------------------
- * The governing rule `Ajit_AddNewFeature_Rule` — summarized here, never
- * reproduced — mandates testing requirements as a deliverable of adding a
- * feature; the one-sentence user request never asked for a test. The
- * consequence is that every case below is real executable evidence that can
- * fail: no `t.todo`, no `t.skip`, and no assertion that holds trivially. The
- * same rule's minimal-change area is why the runner is the runtime's own
- * `node:test` with `node:assert`, why no dependency is added, and why every
- * helper this suite needs is local to this file rather than a fourth file in
- * `test/`.
- *
  * WHAT THIS FILE DELIBERATELY DOES NOT DO
  * ---------------------------------------
  * It binds no network port, which is what makes it safely parallel with the
@@ -71,7 +59,10 @@ const { execFileSync } = require('node:child_process');
  * `ACTIVITY_STORE` pointing into it with nothing left able to clean either up.
  * ------------------------------------------------------------------------- */
 
-/** The two modules this file loads, and re-loads through `freshStore`. */
+/**
+ * The identifiers `freshStore` evicts, so a re-require binds a new store path
+ * and empty per-process caches.
+ */
 const STORE_MODULE_ID = require.resolve('../activity-store');
 const READER_MODULE_ID = require.resolve('../xlsx-read');
 
@@ -196,8 +187,7 @@ const EXPECTED_PART_NAMES = [
 
 /**
  * The `[Content_Types].xml` part, measured. It is byte-identical in all three
- * packages — they were produced by one generator in one run — so a single
- * length and digest pin the part in every workbook.
+ * packages, so a single length and digest pin the part in every workbook.
  *
  * The digest is here because the alternative is a loose assertion. Checking
  * that the text starts with `<Types` and ends with `</Types>` would hold for a
@@ -282,20 +272,36 @@ const SOURCE_SUBMISSION = 'submission';
 const SOURCE_WORKBOOK = 'workbook';
 const MAX_LABEL_LENGTH = 60;
 
+/**
+ * The store's two documented ceilings on the document itself: the bytes the
+ * loader will read, and the records it will hold. Restated here rather than
+ * imported for the same reason the reader's limits below are — the store
+ * exports five functions and no constants, so a case that read its own limits
+ * out of the module under test would pass whatever that module happened to
+ * say, including a ceiling somebody had quietly raised.
+ *
+ * The two are mutually consistent by design, and a case asserts that rather
+ * than assuming it: a worst-case record serializes to roughly 200 bytes, so
+ * `MAX_ACTIVITY_RECORDS` records fit inside `MAX_STORE_BYTES` with room to
+ * spare, and the writer therefore cannot produce a document its own loader
+ * refuses on size.
+ */
+const MAX_STORE_BYTES = 2 * 1024 * 1024;
+const MAX_ACTIVITY_RECORDS = 5000;
+
 /** The suffix the store derives its staging path from. */
 const TEMPORARY_SUFFIX = '.tmp';
 
 /**
- * All four refusal codes `activity-store.js` raises, and all seven the reader
- * raises. Every one of the eleven is exercised somewhere below — the four store
- * codes because they are the whole vocabulary `activities.js` maps to a
- * status, so a code with no case behind it is a status nobody has proven the
- * service can return.
+ * The refusal codes `activity-store.js` raises, and those the reader raises,
+ * restated here so an expectation is independent of the modules under test.
+ * The store's codes are the vocabulary `activities.js` maps onto a status, so
+ * a code with no case behind it is a status nobody has proven the service can
+ * return.
  *
- * `E_REFERENCE_DATA` is the one that needs a seam to reach: it fires only
- * when a workbook cannot be read or cannot serve as reference data, and the
- * workbooks in this repository are valid and read-only. `storeWithScriptedReader`
- * is that seam.
+ * `E_REFERENCE_DATA` needs a seam to reach: it fires only when a workbook
+ * cannot be read or cannot serve as reference data, and the workbooks in this
+ * repository are valid and read-only. `storeWithScriptedReader` is that seam.
  */
 const E_REFERENCE_DATA = 'E_REFERENCE_DATA';
 const E_LABEL_INVALID = 'E_LABEL_INVALID';
@@ -303,24 +309,26 @@ const E_STORE_UNREADABLE = 'E_STORE_UNREADABLE';
 const E_STORE_WRITE_FAILED = 'E_STORE_WRITE_FAILED';
 const E_XLSX_UNSUPPORTED_COMPRESSION = 'E_XLSX_UNSUPPORTED_COMPRESSION';
 const E_XLSX_UNSUPPORTED_FLAGS = 'E_XLSX_UNSUPPORTED_FLAGS';
+const E_XLSX_UNSUPPORTED_SOURCE = 'E_XLSX_UNSUPPORTED_SOURCE';
 const E_XLSX_PART_NOT_FOUND = 'E_XLSX_PART_NOT_FOUND';
 const E_XLSX_SHARED_STRINGS_UNSUPPORTED = 'E_XLSX_SHARED_STRINGS_UNSUPPORTED';
+const E_XLSX_UNSUPPORTED_CELL_TYPE = 'E_XLSX_UNSUPPORTED_CELL_TYPE';
 const E_XLSX_TRUNCATED = 'E_XLSX_TRUNCATED';
 const E_XLSX_MALFORMED_XML = 'E_XLSX_MALFORMED_XML';
 const E_XLSX_LIMIT_EXCEEDED = 'E_XLSX_LIMIT_EXCEEDED';
 
 /**
  * The reader's documented resource ceilings, and the last column of the
- * ECMA-376 grid. Restated here rather than imported because the reader exports
- * exactly four functions and no constants: a test that read its own limits out
- * of the module under test would pass whatever the module happened to say.
+ * ECMA-376 grid. Restated here rather than imported: a test that read its own
+ * limits out of the module under test would pass whatever the module happened
+ * to say.
  */
 const MAX_PACKAGE_BYTES = 4 * 1024 * 1024;
 const MAX_ENTRY_COMPRESSED_BYTES = 1024 * 1024;
 const MAX_PART_BYTES = 4 * 1024 * 1024;
 const LAST_COLUMN_LETTERS = 'XFD';
 
-/** The reader's whole refusal vocabulary, as a set a case can test membership of. */
+/** The reader refusal codes this suite scripts, and tests membership against. */
 const READER_REFUSAL_CODES = [
   E_XLSX_UNSUPPORTED_COMPRESSION,
   E_XLSX_UNSUPPORTED_FLAGS,
@@ -332,9 +340,8 @@ const READER_REFUSAL_CODES = [
 /* ========================================================================= *
  * Local harness
  *
- * Everything this suite needs, in this file. The rule's minimal-change area
- * caps `test/` at three files, so a shared helper module is not available and
- * a small amount of duplication between the three is the accepted cost.
+ * Everything this suite needs, in this file: the helpers below are local and
+ * self-contained, so a case reads without leaving it.
  * ========================================================================= */
 
 /**
@@ -395,8 +402,7 @@ async function makeIsolatedStore(t, fileName = 'activities.json') {
 /* ------------------------------------------------------------------------- *
  * The reference-data seam
  *
- * `E_REFERENCE_DATA` is one of the four codes `activity-store.js` declares,
- * and the only one that cannot be provoked from outside the process: it fires
+ * `E_REFERENCE_DATA` cannot be provoked from outside the process: it fires
  * when a workbook cannot be read or cannot serve as reference data, and the
  * three workbooks here are valid, committed and read-only. Corrupting one to
  * reach the path is out of the question — they are fixtures this very file
@@ -431,7 +437,10 @@ function columnKey(workbookName, columnLetter) {
   return `${workbookName}!${columnLetter}`;
 }
 
-/** The shape a column selection's entries must have to address a script. */
+/**
+ * Checked here rather than deferred to the reader: a selection it would refuse
+ * as an argument fault must record no read.
+ */
 const COLUMN_LETTERS_PATTERN = /^[A-Za-z]{1,3}$/u;
 
 /**
@@ -505,9 +514,8 @@ function scriptedReaderRefusal(code) {
  * in a single pass. A script addresses either by column key, and every read is
  * recorded in `script.calls` as one key per column the call asked for, in the
  * order the selection names them: the seed read therefore records
- * `student_other_info.xlsx!A` and then `student_other_info.xlsx!C`, where the
- * two `readColumn` calls it replaced recorded the same two keys one per call.
- * A call with no selection reads every column and records nothing, per
+ * `student_other_info.xlsx!A` and then `student_other_info.xlsx!C`. A call
+ * with no selection reads every column and records nothing, per
  * `requestedColumnKeys`.
  *
  * Diversion is decided per column, over the columns a call names. An armed
@@ -522,8 +530,8 @@ function scriptedReaderRefusal(code) {
  * Substituted rows carry one value per row for each requested column, which is
  * how the store consumes a selective read, and the row count is the SHORTEST
  * of the requested columns' value arrays. That reproduces the length the seed
- * snapshot got from `Math.min` over two independently sized `readColumn`
- * results, so a case that scripts one column as a two-element array while the
+ * snapshot gets from `Math.min` over the two columns it projects out of that
+ * one read, so a case that scripts one column as a two-element array while the
  * other comes from the eleven-row workbook still describes a two-row
  * worksheet.
  *
@@ -558,9 +566,9 @@ function storeWithScriptedReader(t, storePath) {
       const keys = requestedColumnKeys(filePath, columnLetters);
       script.calls.push(...keys);
 
-      /* One unreadable column makes the whole pass unusable, so an armed
-       * failure on any requested column refuses the call, which is how this
-       * seam refused the seed read when it was two separate column reads. */
+      /* An armed failure on any requested column refuses the whole call,
+       * because one unreadable column makes the store's single selective read
+       * unusable. */
       for (const key of keys) {
         const failure = script.failures.get(key);
         if (failure !== undefined) {
@@ -577,8 +585,7 @@ function storeWithScriptedReader(t, storePath) {
 
       /* A requested column with no script still comes from the real workbook,
        * so the real single pass runs unless every requested column is
-       * scripted, which is the case that used to touch the file not at all
-       * because both `readColumn` calls were substituted. */
+       * scripted — in which case the workbook is not read at all. */
       const realRows =
         scriptedCount < keys.length
           ? xlsxRead.readSheetRows(filePath, partName, columnLetters)
@@ -596,8 +603,8 @@ function storeWithScriptedReader(t, storePath) {
       });
 
       /* The shortest requested column decides how many rows the worksheet is
-       * described as having, exactly as `Math.min(studentIds.length,
-       * labels.length)` in the store did over two independent column reads. */
+       * described as having, exactly as the store's `Math.min` does over the
+       * two columns it projects out of that one read. */
       const rowCount = Math.min(...columns.map((values) => values.length));
       const rows = [];
       for (let index = 0; index < rowCount; index += 1) {
@@ -803,8 +810,8 @@ function assertMessageMentions(error, pattern, explanation) {
 /**
  * Asserts an internal error message does NOT contain something.
  *
- * The mirror of `assertMessageMentions`, for the one case that proves a
- * refusal does not carry the rejected payload back to the caller.
+ * The mirror of `assertMessageMentions`, for a case that proves a refusal
+ * does not carry the rejected payload back to the caller.
  * `assert.doesNotMatch` would print the whole subject string on failure —
  * that is, it would disclose the very payload the case exists to keep out.
  *
@@ -877,14 +884,14 @@ async function captureRejection(promise, context) {
  * rephrased, while the code is what callers and tests are entitled to.
  *
  * The failure message reports the expected code, the arrived code and the
- * error's name, and deliberately stops there. It used to append
- * `error.message`, which is the one field of a refusal guaranteed to be
- * specific about what provoked it: a reader refusal names the package path
- * and the part, and a store refusal names a Student ID and an activity label.
- * That is right for a log and wrong for a retained spec and JUnit artifact,
- * so the detail stays in the process and out of the report. `code` and `name`
- * are fixed vocabulary — neither is derived from the data — and the
- * assertion's own `actual`/`expected` fields hold only those two codes.
+ * error's name, and deliberately stops there. `error.message` is the one
+ * field of a refusal guaranteed to be specific about what provoked it: a
+ * reader refusal names the package path and the part, and a store refusal
+ * names a Student ID and an activity label. That is right for a log and wrong
+ * for a retained spec and JUnit artifact, so the detail stays in the process
+ * and out of the report. `code` and `name` are fixed vocabulary — neither is
+ * derived from the data — and the assertion's own `actual`/`expected` fields
+ * hold only those two codes.
  *
  * @param {unknown} error The thrown value.
  * @param {string} expectedCode The expected `code` property.
@@ -1121,14 +1128,13 @@ function inlineStringCell(reference, text) {
 /**
  * Reads a synthetic worksheet, reporting either its rows or a declared refusal.
  *
- * Two of the cases below sit on parsing decisions that are genuinely open:
- * what a reader does with an entity it does not recognize or a numeric
- * reference that names no character, and what it does with a cell that omits
- * its `r` attribute. The reader here resolves all of them leniently and
- * documents that it does — an unknown entity is left verbatim so nothing
- * disappears without a trace, and an unreferenced cell takes the next column
- * per ECMA-376 — and refusing them instead would be an equally defensible
- * reading of the same specification.
+ * Two of the cases below sit on different parsing decisions. An undeclared
+ * entity reference, or a numeric reference that names no character, is a fatal
+ * well-formedness error under XML 1.0, so refusing the part is the conformant
+ * answer; this reader instead preserves the raw sequence verbatim — a
+ * deliberate leniency of this project, so that nothing disappears without a
+ * trace. What a cell that omits its `r` attribute means is genuinely open —
+ * ECMA-376 implies the position — and this reader gives it the next column.
  *
  * What is NOT open is the failure those branches must never have: a value
  * silently dropped, or a value placed in a column it does not belong to. The
@@ -1136,7 +1142,7 @@ function inlineStringCell(reference, text) {
  * another, so a shifted label credits one student with another's activity,
  * and a dropped one loses a record with no error anywhere. These cases
  * therefore assert exactly that pair of outcomes — a refusal carrying one of
- * the reader's five declared codes, or the precise documented result — which
+ * the reader's declared codes, or the precise documented result — which
  * holds whichever way the parsing is tightened later.
  *
  * @param {string} filePath The synthetic package.
@@ -1153,7 +1159,7 @@ function readSheetRowsOutcome(filePath, context) {
     );
     assert.ok(
       READER_REFUSAL_CODES.includes(error.code),
-      `${context}: a refusal must carry one of the reader's five declared codes, so a caller can ` +
+      `${context}: a refusal must carry one of the reader's declared codes, so a caller can ` +
         `act on it rather than guess; received ${describeErrorSafely(error)}`
     );
     return { refused: true, code: error.code };
@@ -1470,8 +1476,12 @@ describe('seeding and the three initial store states', () => {
  *      unhandled fault instead of a documented response.
  *   2. Neither cache is populated from a failed read. That is the difference
  *      between a transient workbook fault costing one request and it poisoning
- *      the key set — the single referential-integrity check the feature has —
- *      for the whole remaining life of the process.
+ *      the key set for the whole remaining life of the process. The key set is
+ *      what every referential-integrity check consults — the request-time
+ *      lookup through `isKnownStudent`, the write guard inside `addActivity`,
+ *      and the load check over every record read back — so a cache populated
+ *      from a failed read would not weaken one of them, it would weaken all
+ *      three at once.
  *   3. Reference data that reads cleanly but cannot serve as a key authority
  *      is refused, rather than quietly shrinking the set every submission is
  *      validated against.
@@ -1482,7 +1492,6 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
   const SEED_ID_COLUMN = columnKey(OTHER_INFO_WORKBOOK_NAME, 'A');
   const SEED_LABEL_COLUMN = columnKey(OTHER_INFO_WORKBOOK_NAME, 'C');
 
-  /** Counts how many times a script recorded a read of one column. */
   const readsOf = (script, key) => script.calls.filter((candidate) => candidate === key).length;
 
   it('translates a failed key-set read into E_REFERENCE_DATA on all three public paths', async (t) => {
@@ -1492,8 +1501,8 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     const { store, script } = storeWithScriptedReader(t, storeFile);
     script.failures.set(KEY_COLUMN, () => scriptedReaderRefusal(E_XLSX_TRUNCATED));
 
-    /* `isKnownStudent` is synchronous and is where a submission's Student ID
-     * is checked, so this is the exact call `activities.js` makes first. */
+    /* `isKnownStudent` is the synchronous membership check a submission's
+     * Student ID goes through, which is what forces a key-set read here. */
     const thrown = captureThrow(() => store.isKnownStudent('S001'), `${context} (isKnownStudent)`);
     assertCode(thrown, E_REFERENCE_DATA, `${context} (isKnownStudent)`);
     assert.strictEqual(
@@ -1530,13 +1539,13 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     );
   });
 
-  it('translates every one of the reader five refusals, not merely one of them', async (t) => {
+  it('translates each reader refusal code it is driven with, not merely one', async (t) => {
     const directory = await makeTemporaryDirectory(t);
     const { store, script } = storeWithScriptedReader(t, path.join(directory, 'activities.json'));
 
     /* The store documents that it translates the reader's codes rather than
-     * re-exposing them, because all five mean the same thing here — the
-     * reference data cannot be trusted — and a caller acting on
+     * re-exposing them, because every one of them means the same thing here —
+     * the reference data cannot be trusted — and a caller acting on
      * E_XLSX_TRUNCATED would be reaching past this module's contract. */
     for (const readerCode of READER_REFUSAL_CODES) {
       const context = `a key-set read refused with ${readerCode}`;
@@ -1561,7 +1570,7 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     assert.strictEqual(
       store.isKnownStudent('S001'),
       true,
-      'five refused reads in a row must still leave the instance able to answer'
+      'a run of refused reads must still leave the instance able to answer'
     );
   });
 
@@ -1587,8 +1596,8 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
       'the workbook must have been read AGAIN: a cache populated from the failed read would have answered without one'
     );
 
-    /* And now it IS cached, which is the other half of the documented
-     * behaviour — the key set is read once per process on success. */
+    /* A successful read is cached for the lifetime of the process, so the
+     * answers below cost no further read. */
     assert.strictEqual(store.isKnownStudent('S010'), true);
     assert.strictEqual(store.isKnownStudent('S999'), false);
     assert.strictEqual(
@@ -1678,6 +1687,36 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
         [SEED_LABEL_COLUMN]: ['Extracurricular Activity', 'Robotics Club', 'robotics   club'],
       },
     },
+    /* The three rows below exist because a `.trim()` applied to a cell BEFORE
+     * it is validated launders malformed authoritative data into well-formed
+     * data: `String.prototype.trim` strips `\t`, `\n`, `\v`, `\f` and `\r`,
+     * every one of which is a C0 control character. So a padded Student ID
+     * became a valid Student ID, and a control-only label tested as blank and
+     * had its row skipped before the control-character rule could see it.
+     *
+     * Each row is built so that the LAUNDERED reading would SUCCEED — the key
+     * column carries all ten IDs, the seed ID names a student who exists, the
+     * seed label belongs to a row whose ID is known — which is what makes the
+     * case falsifiable rather than passing on some other refusal. */
+    {
+      name: 'a key column holding a control-padded Student ID',
+      values: {
+        [KEY_COLUMN]: ['Student ID', ...EXPECTED_KEY_SET.slice(0, -1), 'S010\n'],
+      },
+    },
+    {
+      name: 'a seed ID column holding a control-padded Student ID',
+      values: {
+        [SEED_ID_COLUMN]: ['Student ID', 'S001\t'],
+        [SEED_LABEL_COLUMN]: ['Extracurricular Activity', 'Robotics Club'],
+      },
+    },
+    {
+      name: 'a seed row whose label is a control character only',
+      values: {
+        [SEED_LABEL_COLUMN]: ['Extracurricular Activity', '\t'],
+      },
+    },
   ];
 
   for (const scenario of UNUSABLE_REFERENCE_DATA) {
@@ -1707,6 +1746,53 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
       );
     });
   }
+
+  it('still skips a genuinely empty cell and a space-separator-only label, rather than refusing them', async (t) => {
+    /* The mirror of the three control-character rows above, and the reason
+     * validating as read is not the same as refusing everything unusual. Two
+     * kinds of leniency are deliberate and must survive:
+     *
+     *   1. A GENUINELY EMPTY cell — the empty string the reader yields for a
+     *      cell absent from a row inside the declared dimension — is skipped,
+     *      because a worksheet may carry empty rows.
+     *   2. A label of SPACE SEPARATORS ONLY is blank, so its row contributes
+     *      no record. That is the same class `normalizeLabel` trims, which is
+     *      what keeps the blank rule and the normalization rule from
+     *      disagreeing about one value.
+     *
+     * A trailing empty row is scripted into all three columns at once, so the
+     * key authority and the seed pass both meet it. */
+    const context = 'reference data with an empty trailing row and a space-only label';
+    const directory = await makeTemporaryDirectory(t);
+    const storeFile = path.join(directory, 'activities.json');
+    const { store, script } = storeWithScriptedReader(t, storeFile);
+    script.values.set(KEY_COLUMN, ['Student ID', 'S001', 'S002', '']);
+    script.values.set(SEED_ID_COLUMN, ['Student ID', 'S001', 'S002', '']);
+    /* U+00A0 NO-BREAK SPACE and U+0020 SPACE: both space separators, neither a
+     * control character, so this is blank rather than malformed. */
+    script.values.set(SEED_LABEL_COLUMN, ['Extracurricular Activity', 'Robotics Club', '\u00a0 ', '']);
+
+    assert.strictEqual(
+      store.isKnownStudent('S002'),
+      true,
+      `${context}: the empty trailing cell must be skipped, not refused — the key set must still hold both IDs`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S001'),
+      [seededRecord('S001', 'Robotics Club')],
+      `${context}: the one row carrying a real label must still seed its record`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S002'),
+      [],
+      `${context}: a space-separator-only label records nothing, and must not refuse the whole read`
+    );
+    assert.deepStrictEqual(
+      await fs.readdir(directory),
+      [],
+      `${context}: a read still writes nothing`
+    );
+  });
 
   it('passes every read through when nothing is scripted, so the seam cannot mask a fault', async (t) => {
     const directory = await makeTemporaryDirectory(t);
@@ -2215,20 +2301,16 @@ describe('the composite primary key and idempotent submission', () => {
  * it, and "it threw" is not evidence that it did not.
  * ========================================================================= */
 
-/** A timestamp in the exact form the store writes. */
 const VALID_STAMP = '2026-09-16T06:14:22.481Z';
 
-/** Serializes a document body the way a person or the store would write one. */
 function bodyOf(activities) {
   return `${JSON.stringify(documentOf(activities), null, 2)}\n`;
 }
 
-/** Serializes any value as the whole store document. */
 function rawBody(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-/** A well-formed submission record, for mutating one field at a time. */
 function baseSubmission(overrides = {}) {
   return {
     studentId: 'S001',
@@ -2239,7 +2321,6 @@ function baseSubmission(overrides = {}) {
   };
 }
 
-/** A well-formed imported record, for mutating one field at a time. */
 function baseImport(overrides = {}) {
   return { studentId: 'S001', activity: 'Robotics Club', source: SOURCE_WORKBOOK, ...overrides };
 }
@@ -2580,6 +2661,432 @@ describe('load validation of a hand-edited store', () => {
 
 
 /* ========================================================================= *
+ * The two ceilings on the document
+ *
+ * The store is a hand-editable file that grows by one record per distinct
+ * submission, and the load path reads the whole of it, decodes it, parses it,
+ * allocates one canonical record per element, and — on a write — stringifies
+ * the result again. An unbounded document therefore exhausts memory BEFORE any
+ * shape validation can report anything, which is a failure no later check can
+ * catch because the process is already gone.
+ *
+ * So two ceilings exist, and each is asserted on BOTH sides of its boundary,
+ * because a ceiling only tested from above is indistinguishable from a module
+ * that refuses everything:
+ *
+ *   - bytes, on load, as `E_STORE_UNREADABLE`;
+ *   - records, on load as `E_STORE_UNREADABLE` and before an append as
+ *     `E_STORE_WRITE_FAILED` — which is the code that exists because the
+ *     module's vocabulary is exactly four codes and a fifth would reach a
+ *     client as `500 internal_error` rather than as the write failure it is.
+ *
+ * Each fixture here is VALID in every other respect — the byte-ceiling
+ * documents differ from a loadable one only by legal JSON whitespace, and the
+ * record-ceiling documents hold nothing but well-formed records with distinct
+ * composite keys — so a refusal can only be the ceiling under test and not
+ * some other rule the fixture tripped on the way past.
+ * ========================================================================= */
+
+describe('the byte and record ceilings on the store document', () => {
+  /**
+   * Pads a document with trailing spaces to an exact byte length.
+   *
+   * Whitespace after a top-level JSON value is legal, so the padded text
+   * parses to exactly the same document: the ONLY thing that changes is its
+   * size, which is what isolates the byte ceiling from every other rule.
+   *
+   * @param {string} text A complete document body.
+   * @param {number} byteLength The exact length to pad to.
+   * @returns {string} The padded body.
+   */
+  const padToBytes = (text, byteLength) => {
+    const baseLength = Buffer.byteLength(text, 'utf8');
+    assert.ok(
+      baseLength <= byteLength,
+      'the padding helper cannot shrink a document, so the fixture would not describe the boundary'
+    );
+    return text + ' '.repeat(byteLength - baseLength);
+  };
+
+  /**
+   * Builds `count` valid workbook-sourced records with distinct composite
+   * keys, spread across the ten known Student IDs.
+   *
+   * Minified rather than indented, because the point of the record-ceiling
+   * cases is a document that holds many records while staying well inside the
+   * byte ceiling — which is what proves the two limits are independent.
+   *
+   * @param {number} count How many records to build.
+   * @returns {Array<{studentId: string, activity: string, source: string}>} The records.
+   */
+  const recordsNumbering = (count) =>
+    Array.from({ length: count }, (unused, index) =>
+      seededRecord(EXPECTED_KEY_SET[index % EXPECTED_KEY_SET.length], `Club ${index}`)
+    );
+
+  /** How many of `recordsNumbering(MAX_ACTIVITY_RECORDS)` belong to one student. */
+  const RECORDS_PER_STUDENT = MAX_ACTIVITY_RECORDS / EXPECTED_KEY_SET.length;
+
+  it('loads a document padded to exactly the byte ceiling', async (t) => {
+    const context = 'a store padded to exactly the byte ceiling';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'at-byte-ceiling.json');
+    const bytes = await writeBytes(storeFile, padToBytes(bodyOf([baseImport()]), MAX_STORE_BYTES));
+
+    assert.strictEqual(
+      bytes.length,
+      MAX_STORE_BYTES,
+      `${context}: the fixture must sit exactly ON the boundary, or the case describes a different document`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S001'),
+      [baseImport()],
+      `${context}: a document at the ceiling is inside it, so it must load`
+    );
+
+    /* And the ceiling is a bound on reading, not a freeze: a submission
+     * against a document at the ceiling still persists, and the rewrite is
+     * canonical, so the padding is gone and the document shrinks. */
+    assert.strictEqual((await store.addActivity('S002', 'Quiz Club')).created, true, context);
+    const rewritten = await fs.readFile(storeFile);
+    assert.ok(
+      rewritten.length < MAX_STORE_BYTES,
+      `${context}: the canonical rewrite must be smaller than the padded document it replaced`
+    );
+    assert.strictEqual(await exists(temporaryFile), false, `${context}: nothing staged may survive`);
+  });
+
+  it('refuses a document one byte past the byte ceiling, on both paths, without touching it', async (t) => {
+    const context = 'a store one byte past the byte ceiling';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'over-byte-ceiling.json');
+    const bytes = await writeBytes(
+      storeFile,
+      padToBytes(bodyOf([baseImport()]), MAX_STORE_BYTES + 1)
+    );
+
+    assert.strictEqual(
+      bytes.length,
+      MAX_STORE_BYTES + 1,
+      `${context}: the fixture must sit exactly ONE byte past the boundary`
+    );
+
+    const readError = await captureRejection(store.listActivities('S001'), `${context} (read)`);
+    assertCode(readError, E_STORE_UNREADABLE, `${context} (read)`);
+    assertMessageMentions(
+      readError,
+      /ceiling/,
+      'the refusal must name the ceiling it enforced, so an operator can tell a size refusal from a shape refusal'
+    );
+    assertMessageOmits(
+      readError,
+      /[\\/]/u,
+      'and it must still name no filesystem path, since this message is what a log receives'
+    );
+    await assertBytesUnchanged(storeFile, bytes, `${context} (read)`);
+
+    const writeError = await captureRejection(
+      store.addActivity('S002', 'Quiz Club'),
+      `${context} (write)`
+    );
+    assertCode(writeError, E_STORE_UNREADABLE, `${context} (write)`);
+    await assertBytesUnchanged(storeFile, bytes, `${context} (write)`);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: an oversized document must be refused before anything is staged`
+    );
+  });
+
+  it('refuses a store path that is not a regular file, instead of reading it as absent', async (t) => {
+    /* ABSENCE IS THE DANGEROUS MISREADING, which is why this is a case of its
+     * own. The store's answer to an absent file is to seed from the workbook
+     * and, on a submission, to WRITE — so a path that exists but is not a
+     * regular file must refuse rather than fall into that branch. A directory
+     * is the portable way to be non-regular, and it is also the one that
+     * cannot be relied on to fail at read time: opening a directory for
+     * reading SUCCEEDS on Windows, so the refusal has to come from inspecting
+     * the opened descriptor. */
+    const context = 'a directory occupying the store path';
+    const directory = await makeTemporaryDirectory(t);
+    const storeFile = path.join(directory, 'activities.json');
+    await fs.mkdir(storeFile);
+    const store = freshStore(storeFile);
+
+    const readError = await captureRejection(store.listActivities('S001'), `${context} (read)`);
+    assertCode(readError, E_STORE_UNREADABLE, `${context} (read)`);
+    assertMessageMentions(
+      readError,
+      /not a regular file/,
+      'the refusal must say what was wrong with the path rather than reporting a generic read fault'
+    );
+
+    const writeError = await captureRejection(
+      store.addActivity('S001', 'Chess Club'),
+      `${context} (write)`
+    );
+    assertCode(
+      writeError,
+      E_STORE_UNREADABLE,
+      `${context} (write): the load refuses first, so this is not a write failure`
+    );
+
+    assert.deepStrictEqual(
+      await fs.readdir(storeFile),
+      [],
+      `${context}: nothing may be seeded or written inside it`
+    );
+    assert.deepStrictEqual(
+      (await fs.readdir(directory)).sort(),
+      ['activities.json'],
+      `${context}: and no staging sibling may be left beside it`
+    );
+  });
+
+  it('loads a document holding exactly the record ceiling and refuses one record more', async (t) => {
+    const atContext = 'a store holding exactly the record ceiling';
+    const atCase = await makeIsolatedStore(t, 'at-record-ceiling.json');
+    const atBytes = await writeBytes(
+      atCase.storeFile,
+      `${JSON.stringify(documentOf(recordsNumbering(MAX_ACTIVITY_RECORDS)))}\n`
+    );
+
+    /* THE ASSERTION THAT MAKES THIS CASE ABOUT THE RECORD CEILING. Both
+     * fixtures are far inside the byte ceiling, so neither refusal below can
+     * be the size rule wearing the record rule's clothes. */
+    assert.ok(
+      atBytes.length < MAX_STORE_BYTES,
+      `${atContext}: the fixture must stay inside the byte ceiling, or this case proves the wrong limit`
+    );
+    assert.strictEqual(
+      (await atCase.store.listActivities('S001')).length,
+      RECORDS_PER_STUDENT,
+      `${atContext}: a document at the record ceiling is inside it, so it must load and answer`
+    );
+
+    const overContext = 'a store holding one record more than the ceiling';
+    const overCase = await makeIsolatedStore(t, 'over-record-ceiling.json');
+    const overBytes = await writeBytes(
+      overCase.storeFile,
+      `${JSON.stringify(documentOf(recordsNumbering(MAX_ACTIVITY_RECORDS + 1)))}\n`
+    );
+
+    assert.ok(
+      overBytes.length < MAX_STORE_BYTES,
+      `${overContext}: the fixture must stay inside the byte ceiling, or this case proves the wrong limit`
+    );
+
+    const readError = await captureRejection(
+      overCase.store.listActivities('S001'),
+      `${overContext} (read)`
+    );
+    assertCode(readError, E_STORE_UNREADABLE, `${overContext} (read)`);
+    assertMessageMentions(
+      readError,
+      /ceiling/,
+      'the refusal must name the ceiling it enforced, so an operator knows which limit was hit'
+    );
+    await assertBytesUnchanged(overCase.storeFile, overBytes, `${overContext} (read)`);
+
+    const writeError = await captureRejection(
+      overCase.store.addActivity('S002', 'Quiz Club'),
+      `${overContext} (write)`
+    );
+    assertCode(writeError, E_STORE_UNREADABLE, `${overContext} (write)`);
+    await assertBytesUnchanged(overCase.storeFile, overBytes, `${overContext} (write)`);
+    assert.strictEqual(
+      await exists(overCase.temporaryFile),
+      false,
+      `${overContext}: an over-full document must be refused before anything is staged`
+    );
+  });
+
+  it('refuses an append at the record ceiling while a repeat and a read still succeed', async (t) => {
+    /* The append ceiling exists because appending past it would write a
+     * document this module's own loader then refuses FOREVER — one submission
+     * turning the store unreadable. Refusing the append instead leaves the
+     * previous document intact, and leaves everything that does not grow the
+     * document working: an idempotent repeat appends nothing, so it must still
+     * be answered, and a read never appends at all. */
+    const context = 'a submission against a store already at the record ceiling';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'full.json');
+    const bytes = await writeBytes(
+      storeFile,
+      `${JSON.stringify(documentOf(recordsNumbering(MAX_ACTIVITY_RECORDS)))}\n`
+    );
+
+    const error = await captureRejection(store.addActivity('S001', 'Brand New Club'), context);
+
+    assertCode(error, E_STORE_WRITE_FAILED, context);
+    assertMessageMentions(
+      error,
+      /ceiling/,
+      'the refusal must name the ceiling rather than reporting a generic disk failure'
+    );
+    assertMessageOmits(
+      error,
+      /[\\/]/u,
+      'and it must carry no filesystem path, since this message is what a log receives'
+    );
+    await assertBytesUnchanged(storeFile, bytes, context);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: the refusal must come before anything is staged`
+    );
+
+    /* `club 0` is the case variant of a record already in the document, so
+     * the composite-key lookup finds it BEFORE the capacity check can fire —
+     * which is why the ceiling is enforced after the lookup and not before. */
+    const repeat = await store.addActivity('S001', 'club 0');
+    assert.strictEqual(
+      repeat.created,
+      false,
+      `${context}: an idempotent repeat appends nothing, so capacity cannot refuse it`
+    );
+    assert.deepStrictEqual(
+      repeat.record,
+      seededRecord('S001', 'Club 0'),
+      `${context}: and it must answer with the record that was already there`
+    );
+    await assertBytesUnchanged(storeFile, bytes, `${context} (idempotent repeat)`);
+
+    assert.strictEqual(
+      (await store.listActivities('S001')).length,
+      RECORDS_PER_STUDENT,
+      `${context}: a full store must still answer every read it could answer before`
+    );
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: and neither the repeat nor the read may stage anything`
+    );
+  });
+
+  /**
+   * A label of the maximum accepted length whose SERIALIZED form is as large as
+   * the rules allow — 60 UTF-16 code units of unpaired surrogates, each of
+   * which `JSON.stringify` escapes to a six-byte `\\uD800` sequence, so the
+   * label costs 360 bytes on disk rather than 60.
+   *
+   * Every rule accepts it, which is the point: `inspectLabel` counts code
+   * units, refuses control characters and line separators, and trims and
+   * collapses space separators — an unpaired surrogate is none of those, so
+   * the label is valid, already normalized, and round-trips through
+   * `JSON.parse` unchanged. It is the shape that proves the record ceiling
+   * cannot stand in for the byte ceiling.
+   *
+   * @param {number} ordinal Distinguishes one label from another, so the
+   *   composite keys stay distinct.
+   * @returns {string} A valid 60-code-unit label.
+   */
+  const widestLabel = (ordinal) =>
+    '\ud800'.repeat(59) + String.fromCharCode(0xdc00 + (ordinal % 1024));
+
+  it('refuses a submission that would serialize past the byte ceiling, keeping the store readable', async (t) => {
+    /* THE INTERACTION BETWEEN THE TWO CEILINGS, which neither of them catches
+     * alone. A document can sit inside the record ceiling and still serialize
+     * past the byte ceiling, because the label bound counts UTF-16 code units
+     * while the byte ceiling counts UTF-8 bytes. Measured before this case
+     * existed: a valid 4,755-record document of 2,097,002 bytes accepted one
+     * more valid label, published 2,097,502 bytes, and the very next read
+     * failed with E_STORE_UNREADABLE — a submission turning the store
+     * unreadable, recoverable only by a hand edit.
+     *
+     * So the writer measures the bytes it is about to persist and refuses
+     * before staging anything. This case fills a store to just under the
+     * ceiling with the widest valid records and submits one more. */
+    const context = 'a submission that would serialize past the byte ceiling';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'near-byte-ceiling.json');
+
+    /* The document is built by arithmetic rather than by re-serializing after
+     * every record: one record's cost is measured once, and the count that
+     * fits follows from it. The loop below then corrects for the array's own
+     * punctuation, so the fixture lands inside the ceiling by construction
+     * rather than by luck. */
+    const recordAt = (ordinal) =>
+      seededRecord(EXPECTED_KEY_SET[ordinal % EXPECTED_KEY_SET.length], widestLabel(ordinal));
+    const oneRecordCost =
+      Buffer.byteLength(bodyOf([recordAt(0), recordAt(1)]), 'utf8') -
+      Buffer.byteLength(bodyOf([recordAt(0)]), 'utf8');
+    const records = Array.from(
+      { length: Math.floor((MAX_STORE_BYTES - Buffer.byteLength(bodyOf([]), 'utf8')) / oneRecordCost) },
+      (unused, ordinal) => recordAt(ordinal)
+    );
+    while (Buffer.byteLength(bodyOf(records), 'utf8') > MAX_STORE_BYTES) {
+      records.pop();
+    }
+
+    const bytes = await writeBytes(storeFile, bodyOf(records));
+    assert.ok(
+      bytes.length <= MAX_STORE_BYTES,
+      `${context}: the fixture must be a store the loader accepts, or the case proves nothing about writing`
+    );
+    assert.ok(
+      records.length < MAX_ACTIVITY_RECORDS,
+      `${context}: the fixture must be inside the RECORD ceiling too, so the refusal can only be the byte ceiling`
+    );
+    assert.ok(
+      bytes.length + oneRecordCost > MAX_STORE_BYTES,
+      `${context}: and one more record must not fit, or the submission below would legitimately succeed`
+    );
+    assert.strictEqual(
+      (await store.listActivities(EXPECTED_KEY_SET[0])).length,
+      Math.ceil(records.length / EXPECTED_KEY_SET.length),
+      `${context}: the fixture must load before the submission, so the refusal is about the write`
+    );
+
+    /* A label no record in the fixture carries, so this is a genuinely new
+     * composite key and the capacity lookup cannot answer it idempotently. */
+    const error = await captureRejection(
+      store.addActivity('S002', '\ud801'.repeat(60)),
+      context
+    );
+
+    assertCode(error, E_STORE_WRITE_FAILED, context);
+    assertMessageMentions(
+      error,
+      /ceiling/,
+      'the refusal must name the ceiling it enforced rather than reporting a generic disk failure'
+    );
+    assertMessageOmits(
+      error,
+      /[\\/]/u,
+      'and it must carry no filesystem path, since this message is what a log receives'
+    );
+    await assertBytesUnchanged(storeFile, bytes, context);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: the refusal must come before anything is staged — a staged oversized document would be adopted by the rename`
+    );
+
+    /* THE PROPERTY THE REFUSAL EXISTS FOR: the store is still readable. A
+     * write that had gone through would have left every later read and write
+     * refusing E_STORE_UNREADABLE. */
+    assert.strictEqual(
+      (await store.listActivities(EXPECTED_KEY_SET[0])).length,
+      Math.ceil(records.length / EXPECTED_KEY_SET.length),
+      `${context}: the store must still load after the refusal — that is the whole point of refusing`
+    );
+
+    /* And a repeat of a record already present still succeeds: it appends
+     * nothing, so it serializes to the document that is already on disk. */
+    const repeat = await store.addActivity(records[0].studentId, records[0].activity);
+    assert.strictEqual(
+      repeat.created,
+      false,
+      `${context}: an idempotent repeat writes nothing, so the byte ceiling cannot refuse it`
+    );
+    await assertBytesUnchanged(storeFile, bytes, `${context} (idempotent repeat)`);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: and the repeat may stage nothing either`
+    );
+  });
+});
+
+
+/* ========================================================================= *
  * The reader's supported format subset
  *
  * A bespoke reader has to declare its limits, and a declared limit is only
@@ -2791,12 +3298,12 @@ describe('the reader refuses packages outside its supported subset', () => {
  * rows are fully populated and none of its labels contains a character that
  * needs escaping.
  *
- * ALIGNMENT is the first. The seed read takes Student IDs from column A and
- * activity labels from column C as two separate calls, and pairs them by
- * position. That pairing is only sound because the reader returns one value
- * per row for each column — a row with no cell in the requested column
- * contributing an empty placeholder rather than being skipped. A reader that
- * skipped it would shift every later label up by one and credit students with
+ * ALIGNMENT is the first. The seed read asks for columns A and C in ONE
+ * selective `readSheetRows` call, whose rows are keyed by column letter; the
+ * store projects each column out of them — an empty placeholder where a row
+ * carries no cell for it — and pairs the two by position. That is only sound
+ * because the reader yields one entry per worksheet row: a reader that
+ * skipped one would shift every later label up and credit students with
  * activities that belong to somebody else, silently, with no error anywhere.
  * One blank cell in a spreadsheet is all that takes, which is why the fixture
  * below is shaped like the workbook it stands in for.
@@ -2865,10 +3372,12 @@ describe('the reader against sparse rows and escaped cell text', () => {
       'the two columns must be the same length, or the seed read could not pair them at all'
     );
 
-    /* The alignment claim, stated the way the store consumes it. A reader that
-     * skipped the absent cells would produce S002/Football Team here — one
-     * student credited with another student's activity, and S003 credited with
-     * nothing — from two blank cells and no error. */
+    /* The alignment claim over arrays, which mirrors `readColumn`'s one value
+     * per row — the shape the key-set read consumes, while the row objects
+     * above are the shape the seed read consumes. A reader that skipped the
+     * absent cells would produce S002/Football Team here — one student
+     * credited with another's activity, S003 with nothing — from two blank
+     * cells and no error. */
     assert.deepStrictEqual(
       studentIds.slice(1).map((studentId, index) => [studentId, labels[index + 1]]),
       [
@@ -2917,7 +3426,7 @@ describe('the reader against sparse rows and escaped cell text', () => {
     assert.deepStrictEqual(
       xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'),
       ['Arts & Crafts'],
-      'decoding applies to a column read, which is the call the store actually makes'
+      'decoding applies to a column read, which is the call the key-set read makes'
     );
   });
 
@@ -2985,9 +3494,9 @@ describe('the reader against sparse rows and escaped cell text', () => {
 
     const outcome = readSheetRowsOutcome(filePath, context);
     if (outcome.refused) {
-      /* Refusing the part is the other acceptable answer, and the helper has
-       * already established the refusal carries a declared code. What matters
-       * is that the reader did not answer with a value it had quietly edited. */
+      /* Refusing the part is the conformant answer and preservation is this
+       * project's leniency. Either way — the helper has already checked the
+       * code — the reader did not answer with a value it had quietly edited. */
       return;
     }
 
@@ -3349,14 +3858,14 @@ describe('store path resolution and per-call document reads', () => {
 /* ========================================================================= *
  * The reader fails closed on malformed worksheet XML
  *
- * Every case here was previously SALVAGED rather than refused, and salvage is
- * the dangerous outcome: a valueless attribute became an empty string, a
- * stray delimiter was stepped over, a present-but-unparseable `r` reference
- * was treated as absent and given whatever column came next, and an inline
- * string with no `<t>` became `''`. Each of those silently erases, shifts or
- * fabricates a value in the one column the whole feature validates against.
- * So the assertion is never "it threw" — it is the named refusal code, plus
- * evidence that the salvaged value did not reach the caller.
+ * Malformed markup is refused, never salvaged, because salvage is the
+ * dangerous outcome: a valueless attribute becoming an empty string, a stray
+ * delimiter stepped over, a present-but-unparseable `r` reference treated as
+ * absent and given whatever column comes next, an inline string with no `<t>`
+ * becoming `''`. Each of those silently erases, shifts or fabricates a value
+ * in the one column the whole feature validates against. So the assertion is
+ * never "it threw" — it is the named refusal code, plus evidence that no
+ * salvaged value reached the caller.
  * ========================================================================= */
 
 describe('the reader refuses malformed worksheet XML instead of salvaging it', () => {
@@ -3537,6 +4046,747 @@ describe('the reader refuses malformed worksheet XML instead of salvaging it', (
 
 
 /* ========================================================================= *
+ * The cell-type subset, and the numbers that have to be numbers
+ *
+ * The reader's declared subset is `t="inlineStr"`, `t="n"`, and a cell with no
+ * `t` at all, which ECMA-376 makes implicitly numeric. Everything else is
+ * refused — and the refusal matters far more than a format nicety, because a
+ * cell's text is returned VERBATIM. A type this reader does not interpret used
+ * to yield the text of `<v>` unchanged, so `<c r="A2" t="str"><v>S999</v></c>`
+ * in a substituted `student_details.xlsx` handed `S999` to the key-set read as
+ * faithfully as the real workbook hands it `S001` — and that key set is the
+ * whole of the referential integrity a submission is checked against.
+ *
+ * The same reasoning covers a numeric cell whose value is not a number: the
+ * type is inside the subset, so only the content can give it away.
+ * ========================================================================= */
+
+describe('the reader refuses a cell whose declared type it cannot honour', () => {
+  /**
+   * Writes a package whose worksheet holds a real header row and one row of
+   * cells beneath it.
+   *
+   * The header row is not decoration: a key-set read returns the header first
+   * and the keys after it, so a fixture with only one row cannot show whether
+   * an injected value would have arrived as a key.
+   *
+   * @param {string} directory The case's temporary directory.
+   * @param {string} fileName The package file name.
+   * @param {string} cellsXml The `<c>` elements of the second row.
+   * @returns {Promise<string>} The package path.
+   */
+  async function packageOfSecondRow(directory, fileName, cellsXml) {
+    return writePackage(directory, fileName, [
+      zipLocalEntry(
+        WORKSHEET_PART,
+        worksheetXmlOfRows(
+          [rowXml(1, inlineStringCell('A1', 'Student ID')), rowXml(2, cellsXml)],
+          'A1:B2'
+        )
+      ),
+    ]);
+  }
+
+  it('refuses every cell type outside the subset, wherever in the row the cell sits', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* `b`, `d`, `e` and `str` are real ECMA-376 types this reader does not
+     * interpret; `inlineString`, `N` and `S` are near-misses of the two it
+     * does, which is exactly what a substituted package would reach for; and
+     * an empty `t` is a type attribute that names nothing. */
+    for (const [index, declaredType] of [
+      'str',
+      'b',
+      'd',
+      'e',
+      'inlineString',
+      'N',
+      'S',
+      '',
+    ].entries()) {
+      const context = `a cell declaring t=${JSON.stringify(declaredType)}`;
+      const inSelection = await packageOfSecondRow(
+        directory,
+        `cell-type-${index}.xlsx`,
+        `<c r="A2" t="${declaredType}"><v>S999</v></c>`
+      );
+
+      const error = assertCode(
+        captureThrow(() => xlsxRead.readColumn(inSelection, WORKSHEET_PART, 'A'), context),
+        E_XLSX_UNSUPPORTED_CELL_TYPE,
+        context
+      );
+      assertMessageMentions(
+        error,
+        /A2/u,
+        'the refusal must name the cell whose type it declined, so a substituted workbook can be found'
+      );
+      assertMessageOmits(
+        error,
+        /S999/u,
+        'the refusal must not carry the value the cell tried to state back to its caller'
+      );
+
+      /* And again for a cell in a column nobody asked for. A declared type is
+       * a property of the package rather than of the request, so a package
+       * holding a cell this reader cannot honour is not one it reports on —
+       * the same rule the shared-string refusal already followed. */
+      const outsideSelection = await packageOfSecondRow(
+        directory,
+        `cell-type-outside-${index}.xlsx`,
+        `${inlineStringCell('A2', 'S001')}<c r="B2" t="${declaredType}"><v>S999</v></c>`
+      );
+      const outsideContext = `${context}, in a column that was not requested`;
+      assertCode(
+        captureThrow(
+          () => xlsxRead.readColumn(outsideSelection, WORKSHEET_PART, 'A'),
+          outsideContext
+        ),
+        E_XLSX_UNSUPPORTED_CELL_TYPE,
+        outsideContext
+      );
+    }
+  });
+
+  it('keeps the shared-string refusal on its own code, so the two faults stay tellable apart', async (t) => {
+    const context = 'a t="s" cell once every other type is refused too';
+    const directory = await makeTemporaryDirectory(t);
+    /* `t="s"` names a construct that IS resolvable in principle and that this
+     * reader chooses not to resolve, because no package here carries the
+     * string table it would need. That is a different statement from "this
+     * type is outside the subset", and a caller that wants to tell a missing
+     * string table from an unreadable cell needs the two codes separate. */
+    const filePath = await packageOfSecondRow(
+      directory,
+      'shared-string-still-distinct.xlsx',
+      '<c r="A2" t="s"><v>0</v></c>'
+    );
+
+    assertCode(
+      captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), context),
+      E_XLSX_SHARED_STRINGS_UNSUPPORTED,
+      context
+    );
+    assert.notStrictEqual(
+      E_XLSX_SHARED_STRINGS_UNSUPPORTED,
+      E_XLSX_UNSUPPORTED_CELL_TYPE,
+      'the two refusals must not collapse into one code'
+    );
+  });
+
+  it('refuses a numeric cell holding text, which is how a key would be smuggled through t="n"', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    for (const [index, [description, cellsXml]] of [
+      ['an explicit t="n" cell', '<c r="A2" t="n"><v>S999</v></c>'],
+      ['an untyped cell, which ECMA-376 makes numeric', '<c r="A2"><v>S999</v></c>'],
+    ].entries()) {
+      const context = `${description} holding text`;
+      const filePath = await packageOfSecondRow(directory, `numeric-text-${index}.xlsx`, cellsXml);
+
+      const error = assertCode(
+        captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), context),
+        E_XLSX_UNSUPPORTED_CELL_TYPE,
+        context
+      );
+      assertMessageMentions(
+        error,
+        /A2/u,
+        'the refusal must name the cell whose value disagreed with its type'
+      );
+    }
+
+    /* The contrast that makes those two refusals meaningful: the identical
+     * fixture with a number in the cell reads straight through, so the cases
+     * above are refusing the CONTENT rather than the shape of the fixture. */
+    const numeric = await packageOfSecondRow(
+      directory,
+      'numeric-number.xlsx',
+      '<c r="A2" t="n"><v>999</v></c>'
+    );
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(numeric, WORKSHEET_PART, 'A'),
+      ['Student ID', '999'],
+      'a numeric cell holding a number still reads, and still arrives as the string the package stored'
+    );
+  });
+
+  it('reads every numeric form a writer produces, and refuses text that only looks numeric', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* All of these are in the lexical space of a numeric cell. The two long
+     * floats are the exact values `student_academics.xlsx` stores for GPA, and
+     * they must survive digit for digit: the value contract is a verbatim
+     * string precisely so no float round-trip can alter one. */
+    for (const [index, value] of [
+      '20',
+      '0',
+      '-3',
+      '+7',
+      '7.9',
+      '8.199999999999999',
+      '8.800000000000001',
+      '.5',
+      '92.',
+      '1e3',
+      '1.5E-7',
+    ].entries()) {
+      const filePath = await packageOfSecondRow(
+        directory,
+        `numeric-ok-${index}.xlsx`,
+        `<c r="A2" t="n"><v>${value}</v></c>`
+      );
+      assert.deepStrictEqual(
+        xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'),
+        ['Student ID', value],
+        `the numeric literal ${JSON.stringify(value)} must read back exactly as written`
+      );
+    }
+
+    /* And none of these is a number, however much the first two resemble one.
+     * A tolerant reader that trimmed them would be inventing a value, and one
+     * that returned them unchanged is the defect this group exists for. */
+    for (const [index, value] of [
+      ' 20',
+      '20 ',
+      'NaN',
+      'INF',
+      '-INF',
+      '0x10',
+      '1,5',
+      '--3',
+      '1e',
+      '1.2.3',
+      'S001',
+    ].entries()) {
+      const context = `a numeric cell holding ${JSON.stringify(value)}`;
+      const filePath = await packageOfSecondRow(
+        directory,
+        `numeric-bad-${index}.xlsx`,
+        `<c r="A2" t="n"><v>${value}</v></c>`
+      );
+      assertCode(
+        captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), context),
+        E_XLSX_UNSUPPORTED_CELL_TYPE,
+        context
+      );
+    }
+  });
+
+  it('tolerates a blank numeric cell, which states no value to disagree with its type', async (t) => {
+    const context = 'a worksheet of blank numeric cells';
+    const directory = await makeTemporaryDirectory(t);
+    /* A blank cell is ordinary in a worksheet — a row inside the declared
+     * dimension with nothing in that column — and it asserts no value at all,
+     * so there is nothing for the lexical check to disagree with. Refusing it
+     * would refuse a legitimate workbook, which is the opposite failure to the
+     * one this group guards against. */
+    const filePath = await writePackage(directory, 'blank-numeric.xlsx', [
+      zipLocalEntry(
+        WORKSHEET_PART,
+        worksheetXml(
+          '<c r="A1" t="n"/><c r="B1" t="n"></c><c r="C1" t="n"><v/></c><c r="D1"><v></v></c>',
+          'A1:D1'
+        )
+      ),
+    ]);
+
+    assert.deepStrictEqual(
+      xlsxRead.readSheetRows(filePath, WORKSHEET_PART),
+      [{ A: '', B: '', C: '', D: '' }],
+      context
+    );
+  });
+});
+
+/* ========================================================================= *
+ * Markup that only looks like markup
+ *
+ * The reader finds elements by scanning text, which is sound for exactly one
+ * class of document: one whose markup-looking text IS markup. XML offers three
+ * ways to write text that is not — a comment, a CDATA section and a processing
+ * instruction — and a fourth arrives through a raw `<` inside a tag. In every
+ * one of them a crafted `<row>` carrying `S999` stays well-formed XML that
+ * every conforming parser treats as inert, while a scanning reader walks
+ * straight into it. One fabricated row in the key column is one fabricated
+ * member of the key set, so the part is now validated as XML before a single
+ * element is matched, and refused rather than salvaged.
+ *
+ * The first case below is the one that keeps the rest honest: it reads the
+ * injected row with nothing hiding it, proving the payload every later fixture
+ * conceals is a payload this reader would otherwise have returned.
+ * ========================================================================= */
+
+describe('the reader refuses markup it does not interpret rather than reading through it', () => {
+  /** A real header row, so an injected value would arrive as a key. */
+  const HEADER_ROW = rowXml(1, inlineStringCell('A1', 'Student ID'));
+
+  /** The row every fixture in this group tries to smuggle past the reader. */
+  const INJECTED_ROW = rowXml(2, inlineStringCell('A2', 'S999'));
+
+  /** What the reader must never return for column A in this group. */
+  const INJECTED_COLUMN = ['Student ID', 'S999'];
+
+  /**
+   * Writes a package around one worksheet part given verbatim.
+   *
+   * @param {string} directory The case's temporary directory.
+   * @param {string} fileName The package file name.
+   * @param {string} xml The worksheet part.
+   * @returns {Promise<string>} The package path.
+   */
+  async function packageOfPart(directory, fileName, xml) {
+    return writePackage(directory, fileName, [zipLocalEntry(WORKSHEET_PART, xml)]);
+  }
+
+  /**
+   * Asserts a worksheet is refused with a code, and that the injected key did
+   * not reach the caller by any of the three interpreted entry points.
+   *
+   * @param {string} filePath The synthetic package.
+   * @param {string} expectedCode The refusal the case expects.
+   * @param {string} context Names the case in the failure message.
+   * @returns {Error} The refusal from the column read.
+   */
+  function assertRefusedEverywhere(filePath, expectedCode, context) {
+    const refusal = assertCode(
+      captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), `${context} (readColumn)`),
+      expectedCode,
+      `${context} (readColumn)`
+    );
+    assertCode(
+      captureThrow(
+        () => xlsxRead.readSheetRows(filePath, WORKSHEET_PART),
+        `${context} (readSheetRows)`
+      ),
+      expectedCode,
+      `${context} (readSheetRows)`
+    );
+    assertCode(
+      captureThrow(
+        () => xlsxRead.readSheetRows(filePath, WORKSHEET_PART, ['A']),
+        `${context} (readSheetRows with a selection)`
+      ),
+      expectedCode,
+      `${context} (readSheetRows with a selection)`
+    );
+    return refusal;
+  }
+
+  it('would read the injected row if nothing hid it, so every refusal below is a real one', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+    const filePath = await packageOfPart(
+      directory,
+      'injection-unhidden.xlsx',
+      worksheetXmlOfRows([HEADER_ROW, INJECTED_ROW], 'A1:A2')
+    );
+
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'),
+      INJECTED_COLUMN,
+      'the payload the rest of this group hides must be one the reader really would return, or those cases prove nothing'
+    );
+  });
+
+  it('refuses an XML comment rather than reading the row hiding inside it', async (t) => {
+    const context = 'a worksheet with a commented-out row after the header';
+    const directory = await makeTemporaryDirectory(t);
+    const filePath = await packageOfPart(
+      directory,
+      'injection-comment.xlsx',
+      worksheetXmlOfRows([HEADER_ROW, `<!-- ${INJECTED_ROW} -->`], 'A1:A2')
+    );
+
+    const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+    assertMessageMentions(
+      error,
+      /comment/u,
+      'the refusal must say which construct it declined, so a substituted package can be diagnosed'
+    );
+    assertMessageOmits(
+      error,
+      /S999/u,
+      'the refusal must not carry the commented payload back to its caller'
+    );
+  });
+
+  it('refuses a CDATA section, whether it hides a row or only a value', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    for (const [index, [description, rowsXml]] of [
+      ['a CDATA section hiding a whole row', [HEADER_ROW, `<![CDATA[${INJECTED_ROW}]]>`]],
+      [
+        'a CDATA section inside a cell value',
+        [HEADER_ROW, '<row r="2"><c r="A2" t="inlineStr"><is><t><![CDATA[S999]]></t></is></c></row>'],
+      ],
+    ].entries()) {
+      const context = `a worksheet with ${description}`;
+      const filePath = await packageOfPart(
+        directory,
+        `injection-cdata-${index}.xlsx`,
+        worksheetXmlOfRows(rowsXml, 'A1:A2')
+      );
+
+      const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+      assertMessageMentions(error, /CDATA/u, 'the refusal must say which construct it declined');
+    }
+  });
+
+  it('refuses a processing instruction, while still accepting a leading XML declaration', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    for (const [index, [description, rowsXml]] of [
+      ['a processing instruction hiding a row', [HEADER_ROW, `<?hidden ${INJECTED_ROW} ?>`]],
+      ['a stylesheet instruction, whose name only begins like a declaration', [
+        '<?xml-stylesheet href="x.xsl"?>',
+        HEADER_ROW,
+      ]],
+    ].entries()) {
+      const context = `a worksheet with ${description}`;
+      const filePath = await packageOfPart(
+        directory,
+        `injection-pi-${index}.xlsx`,
+        worksheetXmlOfRows(rowsXml, 'A1:A2')
+      );
+
+      const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+      assertMessageMentions(
+        error,
+        /processing instruction/u,
+        'the refusal must say which construct it declined'
+      );
+    }
+
+    /* The leading declaration every part is entitled to — `worksheetXmlOfRows`
+     * writes one, and `xl/theme/theme1.xml` in each workbook carries one — must
+     * still be accepted, or this rule would refuse the packages it protects. */
+    const declared = await packageOfPart(
+      directory,
+      'declaration-accepted.xlsx',
+      worksheetXmlOfRows([HEADER_ROW], 'A1:A1')
+    );
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(declared, WORKSHEET_PART, 'A'),
+      ['Student ID'],
+      'a part beginning with an XML declaration must still read'
+    );
+  });
+
+  it('refuses markup hidden inside the XML declaration, and holds the declaration to its grammar', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* The declaration is the one region the validation consumes whole instead
+     * of walking element by element, which makes it the one place markup could
+     * hide from it. A pseudo-attribute carrying a complete `<sheetData>` is
+     * read by the element matching as the worksheet's rows — and because the
+     * matching takes the FIRST `<sheetData>`, the injected rows win outright
+     * rather than merely being appended. So the declaration is matched against
+     * the grammar XML 1.0 fixes for it, which admits only version, encoding
+     * and standalone with quoted values and therefore cannot contain `<`. */
+    const hidden = `<sheetData>${INJECTED_ROW}</sheetData>`;
+    const injected = await packageOfPart(
+      directory,
+      'injection-declaration.xlsx',
+      `<?xml version="1.0" hidden="${hidden}"?>` +
+        `<worksheet><sheetData>${HEADER_ROW}${rowXml(2, inlineStringCell('A2', 'S001'))}` +
+        '</sheetData></worksheet>'
+    );
+
+    const error = assertRefusedEverywhere(
+      injected,
+      E_XLSX_MALFORMED_XML,
+      'a declaration whose pseudo-attribute holds a whole sheetData element'
+    );
+    assertMessageMentions(
+      error,
+      /XML declaration/u,
+      'the refusal must say that the declaration itself was not well formed'
+    );
+
+    /* Every other way a declaration can be wrong, each of which a skip to the
+     * first `?>` would have accepted. The last one hides the terminating `?>`
+     * inside a quoted value, so the region up to the first `?>` is not a
+     * declaration at all. */
+    for (const [index, [description, declaration]] of [
+      ['a pseudo-attribute that is not part of the grammar', '<?xml version="1.0" hidden="x"?>'],
+      ['no version at all', '<?xml encoding="UTF-8"?>'],
+      ['the pseudo-attributes out of order', '<?xml encoding="UTF-8" version="1.0"?>'],
+      ['an unquoted version', '<?xml version=1.0?>'],
+      ['a standalone value outside yes and no', '<?xml version="1.0" standalone="maybe"?>'],
+      ['a terminating ?> hidden inside a value', '<?xml version="1.0" encoding="?>"?>'],
+    ].entries()) {
+      const context = `a declaration with ${description}`;
+      const filePath = await packageOfPart(
+        directory,
+        `declaration-bad-${index}.xlsx`,
+        `${declaration}<worksheet><sheetData>${HEADER_ROW}</sheetData></worksheet>`
+      );
+
+      assertCode(
+        captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), context),
+        E_XLSX_MALFORMED_XML,
+        context
+      );
+    }
+
+    /* And every form the grammar does permit must still read, or this rule
+     * would refuse the packages it exists to protect: `xl/theme/theme1.xml` in
+     * each of the three workbooks carries the version-only form, and
+     * `xl/worksheets/sheet1.xml` carries no declaration at all. */
+    for (const [index, [description, declaration]] of [
+      ['version only, as every theme part in this repository writes it', '<?xml version="1.0"?>'],
+      ['version and encoding', '<?xml version="1.0" encoding="UTF-8"?>'],
+      [
+        'version, encoding and standalone',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+      ],
+      ['single-quoted values', "<?xml version='1.0' encoding='UTF-8'?>"],
+      ['whitespace around every equals sign', '<?xml  version = "1.0"  encoding = "UTF-8" ?>'],
+      ['no declaration at all, as every worksheet part in this repository', ''],
+    ].entries()) {
+      const filePath = await packageOfPart(
+        directory,
+        `declaration-ok-${index}.xlsx`,
+        `${declaration}<worksheet><sheetData>${HEADER_ROW}</sheetData></worksheet>`
+      );
+
+      assert.deepStrictEqual(
+        xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'),
+        ['Student ID'],
+        `a part declaring ${description} must still read`
+      );
+    }
+  });
+
+  it('refuses a markup declaration, including a DOCTYPE that defines an entity', async (t) => {
+    const context = 'a worksheet preceded by a DOCTYPE defining an entity';
+    const directory = await makeTemporaryDirectory(t);
+    /* A DOCTYPE is refused for the same reason as a comment — this reader does
+     * not interpret it and will not skip it — and refusing it also keeps
+     * entity definitions of every kind outside the door, which is the surface
+     * an XML parser has to be configured against. */
+    const filePath = await packageOfPart(
+      directory,
+      'injection-doctype.xlsx',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<!DOCTYPE worksheet [<!ENTITY injected "S999">]>' +
+        `<worksheet><sheetData>${HEADER_ROW}</sheetData></worksheet>`
+    );
+
+    const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+    assertMessageMentions(
+      error,
+      /markup declaration/u,
+      'the refusal must say which construct it declined'
+    );
+  });
+
+  it('refuses a raw < inside an attribute value, where a row would otherwise hide from the scan', async (t) => {
+    const context = 'a row whose attribute value holds a complete cell element';
+    const directory = await makeTemporaryDirectory(t);
+    /* XML forbids a raw `<` in an attribute value, so nothing legitimate is
+     * lost. What is gained: the value below ends with `>` and holds a whole
+     * `<c>` element, which a scan for the next cell inside this row would find
+     * and read as real. The single quotes keep it inside the double-quoted
+     * attribute, so the document is otherwise shaped exactly like a real row. */
+    const filePath = await packageOfPart(
+      directory,
+      'injection-attribute.xlsx',
+      worksheetXmlOfRows(
+        [
+          HEADER_ROW,
+          '<row r="2" customFormat="' +
+            "<c r='A2' t='inlineStr'><is><t>S999</t></is></c>" +
+            `">${inlineStringCell('A2', 'S001')}</row>`,
+        ],
+        'A1:A2'
+      )
+    );
+
+    const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+    assertMessageMentions(
+      error,
+      /attribute value/u,
+      'the refusal must say where the stray delimiter was found'
+    );
+  });
+
+  it('refuses two cells of one row landing in the same column, rather than keeping the last', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* Keeping the last silently is how an appended duplicate overwrites a real
+     * Student ID or activity label with no error anywhere. The third case
+     * pairs an unreferenced cell with an explicit one, because the implicit
+     * "next column" rule is the other way two cells reach one column. */
+    for (const [index, [description, cellsXml, column]] of [
+      [
+        'two cells with the same reference',
+        `${inlineStringCell('A2', 'S001')}${inlineStringCell('A2', 'S999')}`,
+        'A',
+      ],
+      [
+        'two cells with the same reference in a column nobody asked for',
+        `${inlineStringCell('A2', 'S001')}${inlineStringCell('B2', 'x')}${inlineStringCell('B2', 'y')}`,
+        'A',
+      ],
+      [
+        'an unreferenced cell colliding with an explicit one',
+        `<c t="inlineStr"><is><t>S001</t></is></c>${inlineStringCell('A2', 'S999')}`,
+        'A',
+      ],
+    ].entries()) {
+      const context = `a row holding ${description}`;
+      const filePath = await packageOfPart(
+        directory,
+        `duplicate-cell-${index}.xlsx`,
+        worksheetXmlOfRows([HEADER_ROW, `<row r="2">${cellsXml}</row>`], 'A1:B2')
+      );
+
+      const error = assertCode(
+        captureThrow(
+          () => xlsxRead.readColumn(filePath, WORKSHEET_PART, column),
+          context
+        ),
+        E_XLSX_MALFORMED_XML,
+        context
+      );
+      assertMessageMentions(
+        error,
+        /two cells/u,
+        'the refusal must say that one cell of the row was stated twice'
+      );
+    }
+  });
+
+  it('refuses an interpreted element sitting somewhere the reader does not read it', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* Each of these is well-formed XML whose elements are in the wrong place,
+     * and each puts a value where one of the reader's span searches would find
+     * it: a row outside `<sheetData>`, a cell inside another cell — where the
+     * first `</c>` would end the outer cell and both texts would run together
+     * — and a `<t>` under `<v>`, which an inline-string read would pick up. */
+    for (const [index, [description, xml]] of [
+      [
+        'a row outside sheetData',
+        `<worksheet><sheetPr>${INJECTED_ROW}</sheetPr><sheetData>${HEADER_ROW}</sheetData></worksheet>`,
+      ],
+      [
+        'a cell nested inside another cell',
+        `<worksheet><sheetData>${HEADER_ROW}<row r="2"><c r="A2" t="inlineStr"><is><t>S001</t></is>` +
+          '<c r="A2" t="inlineStr"><is><t>S999</t></is></c></c></row></sheetData></worksheet>',
+      ],
+      [
+        'a text element under a value element',
+        `<worksheet><sheetData>${HEADER_ROW}` +
+          '<row r="2"><c r="A2" t="inlineStr"><v><t>S999</t></v></c></row></sheetData></worksheet>',
+      ],
+    ].entries()) {
+      const context = `a worksheet with ${description}`;
+      const filePath = await packageOfPart(directory, `misplaced-${index}.xlsx`, xml);
+
+      const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+      assertMessageMentions(
+        error,
+        /only inside/u,
+        'the refusal must name the parent the element was expected in'
+      );
+    }
+  });
+
+  it('refuses a second sheetData element, whose rows would shadow the real ones', async (t) => {
+    const context = 'a worksheet holding two sheetData elements';
+    const directory = await makeTemporaryDirectory(t);
+    /* The descent takes the FIRST `<sheetData>`, so a second set of rows either
+     * shadows the real one or is ignored depending on document order — which
+     * is not something a reader may decide silently. Here the injected rows
+     * come first, which is the order that wins. */
+    const filePath = await packageOfPart(
+      directory,
+      'two-sheetdata.xlsx',
+      '<worksheet>' +
+        `<sheetData>${HEADER_ROW}${INJECTED_ROW}</sheetData>` +
+        `<sheetData>${HEADER_ROW}</sheetData>` +
+        '</worksheet>'
+    );
+
+    const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+    assertMessageMentions(
+      error,
+      /more than one/u,
+      'the refusal must say that the part held more than one of the element it reads rows from'
+    );
+  });
+
+  it('refuses character data outside the root element and an end tag that closes nothing', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+    const body = worksheetXmlOfRows([HEADER_ROW], 'A1:A1');
+
+    for (const [index, [description, xml]] of [
+      ['text after the root element', `${body}S999`],
+      ['text before the root element', body.replace('<worksheet', 'S999<worksheet')],
+      ['an end tag with nothing open', `${body}</worksheet>`],
+    ].entries()) {
+      const context = `a worksheet with ${description}`;
+      const filePath = await packageOfPart(directory, `epilog-${index}.xlsx`, xml);
+
+      assertCode(
+        captureThrow(() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), context),
+        E_XLSX_MALFORMED_XML,
+        context
+      );
+    }
+
+    /* Whitespace around the root is legal and has to stay legal: every
+     * `xl/theme/theme1.xml` in this repository ends with a newline. */
+    const padded = await packageOfPart(directory, 'padded.xlsx', `${body}\n  \n`);
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(padded, WORKSHEET_PART, 'A'),
+      ['Student ID'],
+      'whitespace after the root element must not be mistaken for character data'
+    );
+  });
+
+  it('still reads the forms a real worksheet writes', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* The group would be worthless if it passed by refusing everything, and
+     * each of these is a shape the reader must keep reading: the rich-text
+     * form of an inline string, whose runs make up one logical value; an
+     * attribute value holding a raw `>`, which XML permits and a scan for the
+     * next `>` would mistake for the end of the tag; and a self-closing
+     * element among elements the reader does not interpret at all. */
+    const richText = await packageOfPart(
+      directory,
+      'rich-text.xlsx',
+      worksheetXmlOfRows(
+        ['<row r="1"><c r="A1" t="inlineStr"><is><r><t>Robotics</t></r><r><t> Club</t></r></is></c></row>'],
+        'A1:A1'
+      )
+    );
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(richText, WORKSHEET_PART, 'A'),
+      ['Robotics Club'],
+      'the runs of a rich-text inline string make up one value'
+    );
+
+    const awkwardAttribute = await packageOfPart(
+      directory,
+      'attribute-with-gt.xlsx',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<worksheet><sheetPr><outlinePr summaryBelow="1"/></sheetPr><cols><col min="1" max="1"/></cols>' +
+        `<sheetData><row r="1" customFormat="a>b">${inlineStringCell('A1', 'S001')}</row></sheetData>` +
+        '<pageMargins left="0.7"/></worksheet>'
+    );
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(awkwardAttribute, WORKSHEET_PART, 'A'),
+      ['S001'],
+      'a raw > inside an attribute value is legal XML and must not end the tag'
+    );
+  });
+});
+
+/* ========================================================================= *
  * The reader bounds what it reads, inflates and expands
  *
  * `inflateRawSync` left to its defaults will produce output up to
@@ -3646,6 +4896,221 @@ describe('the reader bounds the resources one package may consume', () => {
       );
     }
   });
+
+  it('validates a tag carrying many attributes in linear time, so a part inside the ceilings cannot block it', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* The lexical validation must find the end of every tag, which means
+     * walking its attribute values. Doing that by searching BACKWARDS for a
+     * stray `<` from the end of each value rescans the whole tag once per
+     * attribute: quadratic in the length of one tag, and this reader is
+     * synchronous and runs inside the request process, so a part of a few
+     * hundred kilobytes — well inside the four-megabyte package and part
+     * ceilings, and accepted rather than refused — would block the service for
+     * as long as the scan took. Measured on the quadratic form: 291 KiB of
+     * attributes took 731ms, and each doubling of the input quadrupled it.
+     *
+     * The assertion is a RATIO against this machine's own measurement of the
+     * small fixture rather than a fixed millisecond budget, because a budget
+     * either fails on a loaded host or passes a regression on a fast one.
+     * Sixteen times the input costs sixteen times the work when the scan is
+     * linear and two hundred and fifty-six when it is quadratic, so the
+     * threshold sits far from both. Two guards keep it from firing on noise
+     * alone: the baseline is floored, and a run fast in absolute terms passes
+     * whatever its ratio — the quadratic form could not be fast in absolute
+     * terms at this size. */
+    const SMALL_ATTRIBUTE_COUNT = 1000;
+    const LARGE_ATTRIBUTE_COUNT = 16000;
+    const GROWTH_ALLOWANCE = 60;
+    const BASELINE_FLOOR_MS = 2;
+    const ABSOLUTE_ALLOWANCE_MS = 25;
+    const REPEATS = 3;
+
+    /**
+     * Builds a worksheet whose ROOT element carries many well-formed, unique
+     * attributes. The root is deliberate: the reader interprets no attribute
+     * of `<worksheet>`, so the only code that walks them is the validation
+     * under test.
+     *
+     * @param {number} count How many attributes to write.
+     * @returns {string} The part's XML.
+     */
+    function partWithAttributes(count) {
+      const attributes = [];
+      for (let index = 0; index < count; index += 1) {
+        attributes.push(` a${index}="value${index}"`);
+      }
+      return (
+        `<worksheet${attributes.join('')}>` +
+        `<sheetData>${rowXml(1, inlineStringCell('A1', 'Student ID'))}</sheetData></worksheet>`
+      );
+    }
+
+    /**
+     * Reads a package repeatedly and returns the fastest run, which is the
+     * measurement least disturbed by anything else on the host.
+     *
+     * @param {string} filePath The package to read.
+     * @returns {number} Milliseconds.
+     */
+    function fastestReadMs(filePath) {
+      let fastest = Number.POSITIVE_INFINITY;
+      for (let attempt = 0; attempt < REPEATS; attempt += 1) {
+        const started = process.hrtime.bigint();
+        const column = xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A');
+        const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+        assert.deepStrictEqual(
+          column,
+          ['Student ID'],
+          'the fixture must be ACCEPTED and read, so the time measured is validation work rather than an early refusal'
+        );
+        fastest = Math.min(fastest, elapsed);
+      }
+      return fastest;
+    }
+
+    const small = await writePackage(directory, 'attributes-small.xlsx', [
+      zipLocalEntry(WORKSHEET_PART, partWithAttributes(SMALL_ATTRIBUTE_COUNT)),
+    ]);
+    const large = await writePackage(directory, 'attributes-large.xlsx', [
+      zipLocalEntry(WORKSHEET_PART, partWithAttributes(LARGE_ATTRIBUTE_COUNT)),
+    ]);
+
+    const baselineMs = Math.max(fastestReadMs(small), BASELINE_FLOOR_MS);
+    const largeMs = fastestReadMs(large);
+
+    assert.ok(
+      largeMs <= ABSOLUTE_ALLOWANCE_MS || largeMs <= baselineMs * GROWTH_ALLOWANCE,
+      `${LARGE_ATTRIBUTE_COUNT} attributes took ${largeMs.toFixed(1)}ms against a ${baselineMs.toFixed(1)}ms ` +
+        `baseline for ${SMALL_ATTRIBUTE_COUNT}: ${(largeMs / baselineMs).toFixed(1)} times the time for ` +
+        `${LARGE_ATTRIBUTE_COUNT / SMALL_ATTRIBUTE_COUNT} times the input, which is superlinear rather than linear`
+    );
+  });
+
+  it('refuses a source whose bytes cannot be bounded before they are read', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+    /* A ceiling checked against a descriptor's reported size is only a ceiling
+     * while that size describes a finite run of bytes. A directory, a device or
+     * a pipe either reports nothing useful or yields bytes until something
+     * closes it, so the source is refused before anything is read at all.
+     *
+     * Which of these can even be opened differs by platform — a directory
+     * opens on Windows and fails with EISDIR elsewhere — so a candidate the
+     * platform refuses to open is passed over, and the case asserts that at
+     * least one was really exercised rather than passing by skipping them all. */
+    const candidates = [[directory, 'a directory']];
+    candidates.push(
+      process.platform === 'win32'
+        ? ['\\\\.\\NUL', 'the NUL device']
+        : ['/dev/zero', 'the zero device']
+    );
+
+    let exercised = 0;
+    for (const [candidate, description] of candidates) {
+      let descriptor;
+      try {
+        descriptor = fsSync.openSync(candidate, 'r');
+      } catch {
+        continue;
+      }
+      fsSync.closeSync(descriptor);
+      exercised += 1;
+
+      const context = `${description} offered as a package`;
+      const error = assertCode(
+        captureThrow(() => xlsxRead.listEntries(candidate), context),
+        E_XLSX_UNSUPPORTED_SOURCE,
+        context
+      );
+      assertMessageMentions(
+        error,
+        /regular file/u,
+        'the refusal must say that the source was not a regular file'
+      );
+      assertCode(
+        captureThrow(() => xlsxRead.readEntry(candidate, WORKSHEET_PART), `${context} (readEntry)`),
+        E_XLSX_UNSUPPORTED_SOURCE,
+        `${context} (readEntry)`
+      );
+    }
+
+    assert.ok(
+      exercised > 0,
+      'no non-regular source could be opened on this platform, so this case proved nothing'
+    );
+  });
+
+  it('bounds the read itself, so a descriptor under-reporting its size cannot lift the ceiling', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+    const oversized = path.join(directory, 'grown.xlsx');
+    await fs.writeFile(oversized, Buffer.alloc(MAX_PACKAGE_BYTES + 64, 0x41));
+    const honest = await writePackage(directory, 'honest.xlsx', [
+      zipLocalEntry(WORKSHEET_PART, worksheetXml(inlineStringCell('A1', 'Student ID'), 'A1:A1')),
+    ]);
+
+    /* The ceiling used to be enforced once, against `fstat`, and the read that
+     * followed was unbounded. Those are two operations on a filesystem other
+     * processes can write to, so the size can be stale by the time the bytes
+     * are read — and a source that misreports its size defeats the check
+     * outright. Reproducing either for real from one synchronous thread is not
+     * possible, so the descriptor is made to report the stale number directly:
+     * zero, which is what several non-regular sources report, and a small
+     * value, which is what a file that has since grown reports. The file on
+     * disk is past the ceiling in both.
+     *
+     * One mock, whose reported size the loop moves, because two overlapping
+     * mocks of one method do not unwind in a defined order. `t.mock` restores
+     * it when the case ends whatever happens, and the restore below makes the
+     * final assertion run against the real `fstatSync`. */
+    const realFstatSync = fsSync.fstatSync;
+    let reportedSize = 0;
+    t.mock.method(fsSync, 'fstatSync', (...args) => {
+      const stats = realFstatSync(...args);
+      return Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, {
+        size: reportedSize,
+      });
+    });
+
+    for (const [size, description] of [
+      [0, 'a descriptor reporting no bytes at all'],
+      [64, 'a descriptor reporting the size the file had before it grew'],
+    ]) {
+      reportedSize = size;
+      const context = `${description} for a file past the package ceiling`;
+
+      const error = assertCode(
+        captureThrow(() => xlsxRead.listEntries(oversized), context),
+        E_XLSX_LIMIT_EXCEEDED,
+        context
+      );
+      assertMessageMentions(
+        error,
+        /yielded more than/u,
+        'the refusal must say the ceiling was reached while reading, not merely that the metadata claimed too much'
+      );
+    }
+
+    /* And the bound is on the bytes rather than on the claim in both
+     * directions: with the descriptor still reporting nothing, a package well
+     * inside the ceiling reads exactly as it always did. */
+    reportedSize = 0;
+    assert.deepStrictEqual(
+      xlsxRead.readColumn(honest, WORKSHEET_PART, 'A'),
+      ['Student ID'],
+      'a package inside the ceiling must still read when its descriptor under-reports its size'
+    );
+
+    t.mock.restoreAll();
+
+    assertCode(
+      captureThrow(
+        () => xlsxRead.listEntries(oversized),
+        'the same oversized file with honest metadata'
+      ),
+      E_XLSX_LIMIT_EXCEEDED,
+      'the same oversized file with honest metadata'
+    );
+  });
 });
 
 
@@ -3709,8 +5174,8 @@ describe('the reader accepts exactly the columns its contract promises', () => {
       assert.strictEqual(error.code, undefined, `${context} must carry no refusal code`);
     }
 
-    /* Omitting the argument, and passing null explicitly, both mean "every
-     * column" — the behaviour every caller had before the selection existed. */
+    /* Omitting the argument and passing null explicitly both mean "every
+     * column". */
     assert.deepStrictEqual(
       xlsxRead.readSheetRows(DETAILS_WORKBOOK, WORKSHEET_PART, null),
       xlsxRead.readSheetRows(DETAILS_WORKBOOK, WORKSHEET_PART)
@@ -3786,20 +5251,31 @@ describe('a column read decodes only the columns it was asked for', () => {
 
   it('does not extract the value of a column it was not asked for', async (t) => {
     const directory = await makeTemporaryDirectory(t);
-    /* Column A is sound. Column B's `<v>` is never closed, which is only
-     * discoverable by extracting that cell's value — the cell's own start and
-     * end tags are well formed, so the structural walk passes straight over
-     * it. A read of column A therefore succeeds, and that success is the
-     * evidence that column B's text was never turned into a value.
+    /* Column A is sound. Column B declares itself numeric and holds text,
+     * which is a fault in the cell's VALUE and in nothing else: its start tag,
+     * its reference, its type attribute and its `<v>` element are all well
+     * formed, so every check the reader makes on structure passes over it
+     * without complaint. Only extracting that value can discover it. A read of
+     * column A therefore succeeds, and that success is the evidence that
+     * column B's text was never turned into a value — the reason the reader
+     * can read a Student ID without materialising the name, date of birth,
+     * email, phone and city sitting beside it.
      *
-     * What this does NOT claim: the worksheet part as a whole is decoded and
-     * validated, because refusing mis-encoded or malformed XML requires
-     * reading it. The guarantee is about extraction, not about the bytes
-     * never being in the process. */
+     * The fixture is deliberately a value-level fault rather than a structural
+     * one. A structural fault — an unclosed `<v>`, say — is refused for every
+     * caller by the lexical validation the part passes through before any
+     * element is matched, so it could no longer distinguish "not extracted"
+     * from "not reached".
+     *
+     * What this does NOT claim: that the part's bytes are never in the
+     * process. Refusing mis-encoded or malformed XML requires reading it. The
+     * guarantee is about extraction. */
     const filePath = await writePackage(directory, 'unread-column.xlsx', [
       zipLocalEntry(
         WORKSHEET_PART,
-        worksheetXml('<c r="A1" t="inlineStr"><is><t>S001</t></is></c><c r="B1"><v>7</c>')
+        worksheetXml(
+          '<c r="A1" t="inlineStr"><is><t>S001</t></is></c><c r="B1" t="n"><v>Robotics Club</v></c>'
+        )
       ),
     ]);
 
@@ -3810,7 +5286,7 @@ describe('a column read decodes only the columns it was asked for', () => {
       ['readColumn on the faulty column', () => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'B')],
       ['readSheetRows with no selection', () => xlsxRead.readSheetRows(filePath, WORKSHEET_PART)],
     ]) {
-      assertCode(captureThrow(call, description), E_XLSX_TRUNCATED, description);
+      assertCode(captureThrow(call, description), E_XLSX_UNSUPPORTED_CELL_TYPE, description);
     }
   });
 
@@ -4026,12 +5502,28 @@ describe('atomic replacement and the write mutex', () => {
     );
   });
 
-  it('overwrites a stale staging file rather than ever reading it', async (t) => {
+  it('replaces a stale staging file rather than ever reading it, and never inherits its mode', async (t) => {
     const { store, storeFile, temporaryFile } = await makeIsolatedStore(t);
     /* What a dead process might have left: a truncated document, or bytes
-     * that are not a document at all. Either way the next write truncates and
-     * replaces it, so its contents can never be mistaken for the store. */
+     * that are not a document at all. Either way the next write replaces it,
+     * so its contents can never be mistaken for the store. */
     await writeBytes(temporaryFile, '{"schemaVersion":1,"activities":[{"studentId":"S9');
+
+    /* And planted PERMISSIVE, which is the second half of what a stale file
+     * can donate. A writer that truncated this file in place would keep its
+     * mode, and the rename would then publish the store with it — so the
+     * store's own mode is what proves the staging file was recreated rather
+     * than reused. Windows honours only the write bit through `chmod`, hence
+     * the gate: the platform cannot express the fixture. */
+    const posix = typeof process.getuid === 'function';
+    await fs.chmod(temporaryFile, 0o666);
+    if (posix) {
+      assert.strictEqual(
+        (await fs.stat(temporaryFile)).mode & 0o777,
+        0o666,
+        'the fixture must actually be permissive, or this case proves nothing about inheritance'
+      );
+    }
 
     const outcome = await store.addActivity('S001', 'Chess Club');
 
@@ -4047,6 +5539,213 @@ describe('atomic replacement and the write mutex', () => {
       false,
       'the stale staging file must have been consumed by the rename'
     );
+
+    const stored = await fs.stat(storeFile);
+    assert.strictEqual(stored.nlink, 1, 'the published store must carry exactly one name');
+    if (posix) {
+      assert.strictEqual(
+        stored.mode & 0o777,
+        0o600,
+        'the store must be owner-only: a stale staging file truncated in place would have donated its permissive mode to it'
+      );
+    }
+  });
+
+  /* ----------------------------------------------------------------------- *
+   * The staging path as an attack surface, and the mode of what it becomes
+   *
+   * The staging name is derived and therefore PREDICTABLE, which is exactly
+   * what another local process needs in order to occupy it first. Opening it
+   * by pathname for writing implies `O_TRUNC`, so a symbolic or hard LINK
+   * planted there would have its TARGET truncated — a file the store was
+   * never configured to touch — and the truncation would happen before the
+   * rename, so nothing later could undo it.
+   *
+   * The two cases below plant a link at that name and assert the property
+   * that matters: the SENTINEL the link points at is byte-identical
+   * afterwards. "It threw" would not establish that, and neither would a
+   * successful submission on its own — a write that followed the link would
+   * also succeed, and the damage would be to a file no assertion was looking
+   * at.
+   *
+   * `fs.link` needs no privilege on NTFS or on POSIX. `fs.symlink` does need
+   * one on Windows, so that case degrades to a hard link rather than passing
+   * with nothing asserted — an unprivileged host still gets a real
+   * measurement instead of a green tick.
+   * ----------------------------------------------------------------------- */
+
+  /**
+   * Plants a second NAME for `targetPath` at `linkPath`, preferring a
+   * symbolic link and falling back to a hard link where the platform refuses
+   * one without privilege.
+   *
+   * @param {string} targetPath The file the link points at.
+   * @param {string} linkPath The staging path to occupy.
+   * @returns {Promise<'symbolic'|'hard'>} Which kind was actually planted.
+   */
+  const plantLinkAt = async (targetPath, linkPath) => {
+    try {
+      await fs.symlink(targetPath, linkPath);
+      return 'symbolic';
+    } catch (error) {
+      if (!['EPERM', 'EACCES', 'ENOSYS', 'ENOTSUP'].includes(error.code)) {
+        throw error;
+      }
+      /* No symlink privilege on this host. A hard link needs none and proves
+       * the stronger half of the property: it is not a link object at all,
+       * just a second name for the file, so no no-follow flag can describe
+       * it and only exclusive creation refuses it. */
+      await fs.link(targetPath, linkPath);
+      return 'hard';
+    }
+  };
+
+  /**
+   * Submits one activity against a store whose staging path is occupied by a
+   * link to a sentinel, and asserts the sentinel survived it.
+   *
+   * @param {import('node:test').TestContext} t The running case.
+   * @param {string} fileName The store's file name.
+   * @param {'hard'|'either'} kind `hard` plants a hard link; `either` prefers
+   *   a symbolic link and falls back to a hard one.
+   * @returns {Promise<void>}
+   */
+  const assertStagingLinkIsNotFollowed = async (t, fileName, kind) => {
+    const context = 'a link occupying the derived staging path';
+    const { store, storeFile, temporaryFile, directory } = await makeIsolatedStore(t, fileName);
+    const sentinelPath = path.join(directory, 'sentinel.txt');
+    const sentinelBytes = await writeBytes(
+      sentinelPath,
+      'bytes belonging to a file the store was never configured to write\n'
+    );
+
+    const planted =
+      kind === 'hard'
+        ? ((await fs.link(sentinelPath, temporaryFile)), 'hard')
+        : await plantLinkAt(sentinelPath, temporaryFile);
+    if (planted === 'hard') {
+      assert.strictEqual(
+        (await fs.stat(temporaryFile)).nlink,
+        2,
+        `${context}: the fixture must really be a second name for the sentinel, or the case proves nothing`
+      );
+    } else {
+      assert.strictEqual(
+        (await fs.lstat(temporaryFile)).isSymbolicLink(),
+        true,
+        `${context}: the fixture must really be a symbolic link, or the case proves nothing`
+      );
+    }
+
+    const outcome = await store.addActivity('S001', 'Chess Club');
+
+    /* THE ASSERTION THE CASE EXISTS FOR. A writer that opened the staging
+     * path by name would have truncated the sentinel through the link and
+     * then succeeded, so success alone says nothing. */
+    const sentinelAfter = await fs.readFile(sentinelPath);
+    assert.ok(
+      sentinelAfter.equals(sentinelBytes),
+      `${context}: the link target's bytes changed, so the write followed the planted link and truncated a file it was never pointed at`
+    );
+
+    assert.strictEqual(
+      outcome.created,
+      true,
+      `${context}: the submission must still be persisted — a planted link is cleared, not a denial of service`
+    );
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: the planted name must be gone, consumed by the rename of the file that replaced it`
+    );
+    const document = await readDocument(storeFile);
+    assert.ok(
+      document.activities.some(
+        (record) => record.studentId === 'S001' && record.activity === 'Chess Club'
+      ),
+      `${context}: the store must hold the new record`
+    );
+    const stored = await fs.stat(storeFile);
+    assert.strictEqual(
+      stored.nlink,
+      1,
+      `${context}: the staged file that became the store had exactly one name, so nothing else could observe or truncate it`
+    );
+    assert.ok(
+      (await fs.readFile(sentinelPath)).equals(sentinelBytes),
+      `${context}: and the sentinel is still intact after the rename as well`
+    );
+  };
+
+  it('never writes through a hard link planted at the staging path', async (t) => {
+    await assertStagingLinkIsNotFollowed(t, 'hard-linked.json', 'hard');
+  });
+
+  it('never writes through a symbolic link planted at the staging path', async (t) => {
+    await assertStagingLinkIsNotFollowed(t, 'sym-linked.json', 'either');
+  });
+
+  it('publishes the store as a private regular file, and stages it as one too', async (t) => {
+    /* The store holds submitted student data, and loopback-only reachability
+     * protects it from the network and not from another local principal. So
+     * the staging file is created `0600` and the rename carries that mode
+     * onto the store.
+     *
+     * Both platforms get a real assertion. POSIX can state the mode exactly.
+     * Windows honours only the write bit and inherits the directory's ACLs,
+     * so what is assertable there is that the published file is a regular
+     * file with exactly one name — which is the property a planted link or an
+     * adopted directory would break. */
+    const context = 'a store published by a successful write';
+    const posix = typeof process.getuid === 'function';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'private.json');
+
+    await store.addActivity('S001', 'Chess Club');
+
+    const stored = await fs.stat(storeFile);
+    assert.strictEqual(stored.isFile(), true, `${context}: the store must be a regular file`);
+    assert.strictEqual(stored.nlink, 1, `${context}: with exactly one name`);
+    if (posix) {
+      assert.strictEqual(
+        stored.mode & 0o777,
+        0o600,
+        `${context}: the store must be readable and writable by its owner alone, whatever the umask`
+      );
+      assert.strictEqual(
+        stored.uid,
+        process.getuid(),
+        `${context}: and owned by the process that wrote it`
+      );
+    }
+
+    /* The STAGED file's own mode, which is only observable while a staged
+     * file exists — so the rename is refused to keep one. This is the file
+     * that becomes the store, so a permissive mode here would be published by
+     * the next successful rename. */
+    t.mock.method(fs, 'rename', async () => {
+      const refusal = new Error('scripted rename refusal, raised by the test harness');
+      refusal.code = 'EPERM';
+      throw refusal;
+    });
+
+    assertCode(
+      await captureRejection(store.addActivity('S001', 'Quiz Club'), context),
+      E_STORE_WRITE_FAILED,
+      context
+    );
+
+    const staged = await fs.stat(temporaryFile);
+    assert.strictEqual(staged.isFile(), true, `${context}: the staged file must be a regular file`);
+    assert.strictEqual(staged.nlink, 1, `${context}: with exactly one name`);
+    if (posix) {
+      assert.strictEqual(
+        staged.mode & 0o777,
+        0o600,
+        `${context}: the staged file must be owner-only before it ever becomes the store`
+      );
+    }
+
+    t.mock.restoreAll();
   });
 
   it('serializes twenty-five concurrent submissions with no lost update and no duplicate key', async (t) => {
@@ -4121,14 +5820,11 @@ describe('atomic replacement and the write mutex', () => {
     assert.strictEqual(first.created, true);
     const intactBytes = await fs.readFile(storeFile);
 
-    /* THE FAULT MECHANISM, chosen because it genuinely fails on every
-     * platform this project runs on: a DIRECTORY is planted at the staging
-     * path, so `writeFile` cannot open it (EISDIR) and the rename is never
-     * reached. `fs.chmod` was rejected as the mechanism — it is effectively
-     * inert on Windows, where this suite also has to fail for the right
-     * reason. Pointing the store at a missing parent directory fails too, but
-     * it leaves no previous document to prove intact, which is half of what
-     * this case exists to assert. */
+    /* THE FAULT MECHANISM, deterministic on every platform this project runs
+     * on: a DIRECTORY is planted at the staging path, so `writeFile` cannot
+     * open it (EISDIR) and the rename is never reached. The fault also has to
+     * leave a previous document on disk, because proving that document intact
+     * is half of what this case asserts. */
     await fs.mkdir(temporaryFile);
 
     const error = await captureRejection(store.addActivity('S005', 'Quiz Club'), context);
@@ -4164,22 +5860,17 @@ describe('atomic replacement and the write mutex', () => {
     assert.strictEqual(first.created, true);
     const intactBytes = await fs.readFile(storeFile);
 
-    /* THE OTHER HALF OF THE WRITE. Every other fault in this group blocks the
-     * staging `writeFile` — a directory planted at the staging path, a store
-     * under a parent that does not exist — so the rename that follows is never
-     * reached and its own failure handling is never exercised. Yet the rename
-     * is the step that makes the replacement atomic, and it is the step that
+    /* THE RENAME, which only a runtime mock reaches after a SUCCESSFUL write.
+     * The rename is what makes the replacement atomic, and it is the step that
      * fails in the field: a destination held open, a permission on the
      * destination rather than the directory, a store path that has become a
-     * directory.
-     *
-     * The runtime's own mocker is used instead of a filesystem trick because
-     * no filesystem state makes `writeFile` succeed and `rename` fail for the
-     * same reason on every platform this project runs on, and a fixture that
-     * fails differently on Windows than on Linux has proven nothing on either.
-     * The mock is installed on the `node:fs/promises` namespace object that
-     * `activity-store.js` itself holds, so the call site under test is the
-     * real one, and `t.mock` restores it when the case ends whatever happens. */
+     * directory. No filesystem state makes `writeFile` succeed and `rename`
+     * fail for the same reason on every platform this project runs on, and a
+     * fixture that fails differently on Windows than on Linux has proven
+     * nothing on either. The mock is installed on the `node:fs/promises`
+     * namespace object that `activity-store.js` itself holds, so the call site
+     * under test is the real one, and `t.mock` restores it when the case ends
+     * whatever happens. */
     let renameCalls = 0;
     t.mock.method(fs, 'rename', async () => {
       renameCalls += 1;
@@ -4400,7 +6091,7 @@ describe('atomic replacement and the write mutex', () => {
  * no later case in this file inherits a protected value.
  * ========================================================================= */
 
-/** The refusal code for a protected destination. Not one of the four. */
+/** The refusal a protected destination raises at load, before a read or write. */
 const E_STORE_PATH_PROTECTED = 'E_STORE_PATH_PROTECTED';
 
 /** The safe value every case in the group below restores. */
@@ -4458,10 +6149,9 @@ function deriveShortNameCandidates(longName) {
  * which name that is.
  *
  * A textual alias — `./x`, `a/../x` — is collapsed by `path.resolve` and is
- * covered above. This finds the other kind, which no amount of string
- * normalization reaches: on a Windows volume with 8.3 generation enabled —
- * this checkout's included — `STUDEN~2.XLS` and `student_details.xlsx` are
- * one file under two names.
+ * covered above. This finds the other kind, which no string normalization
+ * reaches: a volume with 8.3 name generation gives a file a second real name,
+ * so one file answers to two names.
  *
  * The alias is DISCOVERED rather than assumed. `dir /x` is asked first,
  * because it is the authority on which short names a directory holds, and
@@ -4612,8 +6302,8 @@ describe('the store refuses a protected destination', () => {
       const error = captureProtectedRefusal(filePath, context);
 
       assertProtectedRefusal(error, relativeName, context);
-      /* The whole point of the finding: not merely that it threw, but that
-       * nothing was staged and renamed over the file first. */
+      /* The refusal must land before anything is staged or renamed over the
+       * file, so the bytes on disk must be unchanged. */
       await assertBytesUnchanged(filePath, bytesBefore, context);
       assert.strictEqual(
         await exists(`${filePath}${TEMPORARY_SUFFIX}`),
@@ -4662,12 +6352,13 @@ describe('the store refuses a protected destination', () => {
   });
 
   it('refuses a filesystem alias of a protected workbook: a short name is the same file under another name', async () => {
-    /* The kind of alias `path.resolve` cannot reach. A Windows volume with
-     * 8.3 generation enabled gives `student_details.xlsx` a second real name
-     * — `STUDEN~2.XLS` on this checkout — and a guard that canonicalized only
-     * the PARENT directory and rejoined the configured basename compared that
-     * second name against nothing, loaded happily, and would have renamed a
-     * store document over the workbook on the first submission.
+    /* The kind of alias `path.resolve` cannot reach. A volume with 8.3 name
+     * generation gives `student_details.xlsx` a second real name for the same
+     * file, so only canonicalizing the WHOLE configured candidate detects it:
+     * a guard that canonicalizes the parent directory and rejoins the
+     * configured basename has nothing to compare that second name against,
+     * loads happily, and renames a store document over the workbook on the
+     * first submission.
      *
      * The alias is discovered at runtime rather than written down: it is a
      * property of the volume and of the order the directory's names were
@@ -4719,17 +6410,15 @@ describe('the store refuses a protected destination', () => {
   });
 
   it('refuses a protected file reached through a directory link, on every platform', async (t) => {
-    /* The portable half of the same finding: a junction on Windows, a
-     * directory symlink elsewhere, pointing at the repository root. The
-     * configured value then contains no `..`, no `.` and no short name — it
-     * is a perfectly ordinary path that happens to arrive at `LICENSE`, which
-     * only `realpath` of the whole candidate can tell.
+    /* A junction on Windows, a directory symlink elsewhere, pointing at the
+     * repository root. The configured value then contains no `..`, no `.` and
+     * no short name — it is a perfectly ordinary path that happens to arrive
+     * at `LICENSE`, which only `realpath` of the whole candidate can tell.
      *
      * The link lives in a per-case temporary directory and is removed by this
      * case's own cleanup. A recursive removal of that directory does not
-     * follow the link (measured on this host: the target's contents survive),
-     * so neither the cleanup nor the runner can reach into the checkout
-     * through it. */
+     * follow the link, so neither the cleanup nor the runner can reach into
+     * the checkout through it. */
     const directory = await makeTemporaryDirectory(t);
     const link = path.join(directory, 'repository-link');
     t.after(async () => {
@@ -4908,10 +6597,10 @@ describe('the store refuses a protected destination', () => {
 
   it('still accepts a store outside the checkout and the default store name inside it', async (t) => {
     /* The guard must refuse protected files and nothing else, so both
-     * legitimate destinations are asserted: the temporary-directory store
-     * every other case in this file uses, exercised through a real write, and
-     * the default `activities.json` beside the source — which is the store
-     * this module exists to write and is deliberately NOT protected. */
+     * legitimate destinations are asserted: a store in a temporary directory
+     * outside the checkout, exercised through a real write, and the default
+     * `activities.json` beside the source — the store this module exists to
+     * write, and deliberately NOT protected. */
     const { store, storeFile } = await makeIsolatedStore(t, 'accepted.json');
     assert.strictEqual(store.storePath(), storeFile);
 
@@ -4944,16 +6633,16 @@ describe('the store refuses a protected destination', () => {
 
 
 /* ========================================================================= *
- * The four workbook invariants
+ * The workbook invariants
  *
  * These are the properties the feature must not break. It writes no workbook,
  * so they hold by construction rather than by care — which is exactly why
  * they are asserted: the checks catch a workbook replaced by hand, or a
- * future change that starts writing one, rather than a fault in today's code.
+ * future change that starts writing one.
  *
- * The group runs after the submission groups above, so the byte-identity
- * check below is taken after real submissions have been exercised. It also
- * performs its own submission, so it does not depend on that ordering.
+ * The byte-identity check below performs its own submission, so it is taken
+ * after the store has really read the workbooks and written its document, and
+ * depends on no ordering between groups.
  * ========================================================================= */
 
 describe('the workbook invariants the feature must not break', () => {
@@ -5095,7 +6784,7 @@ describe('the workbook invariants the feature must not break', () => {
      * This is the one place in the file where captured output is reproduced in
      * a failure message, and it is deliberate rather than overlooked. The
      * pathspec confines what git can report to the three committed workbook
-     * names — already constants a few hundred lines above — so it carries no
+     * names this file already holds in `WORKBOOK_SHAPES`, so it carries no
      * personal data, no record value and no absolute path, and it is the only
      * thing that tells a reader WHICH workbook changed. */
     const status = git(['status', '--porcelain', '--', '*.xlsx']);
@@ -5136,16 +6825,16 @@ describe('the workbook invariants the feature must not break', () => {
      * workbook were ever repopulated with real records this case fails, and
      * the whole suite's treatment of that data would have to be reconsidered.
      *
-     * WHICH IS WHY THE SHAPE OF ITS OUTPUT MATTERS AS MUCH AS THE CHECK. This
-     * is the one assertion in the suite whose failure means real personal data
-     * is present, so it has to report WHERE without reporting WHAT. A message
-     * naming the offending email, or a collection assertion that renders the
-     * whole actual list, would take the moment the guard detects real student
-     * records and turn it into the disclosure of those records — into a spec
-     * stream, and into the JUnit file the documented evidence command retains.
-     * A worksheet row number is all anyone needs in order to open the workbook
-     * and look. So every assertion below compares an aggregate — a count, or a
-     * list of row numbers — and never a value. */
+     * WHICH IS WHY THE SHAPE OF ITS OUTPUT MATTERS AS MUCH AS THE CHECK. A
+     * failure here means real personal data is present, so it has to report
+     * WHERE without reporting WHAT. A message naming the offending email, or
+     * a collection assertion that renders the whole actual list, would take
+     * the moment the guard detects real student records and turn it into the
+     * disclosure of those records — into a spec stream, and into the JUnit
+     * file the documented evidence command retains. A worksheet row number is
+     * all anyone needs in order to open the workbook and look. So every
+     * assertion below compares an aggregate — a count, or a list of row
+     * numbers — and never a value. */
     const rows = xlsxRead.readSheetRows(DETAILS_WORKBOOK, WORKSHEET_PART);
     const dataRows = rows.slice(1);
 

@@ -1,53 +1,44 @@
 'use strict';
 
 /**
- * test/lifecycle.test.js — the PROCESS-level suite for Student_Simple_06Sept26.
+ * test/lifecycle.test.js — the PROCESS-level suite.
  *
- * WHAT THIS FILE IS FOR
- * ---------------------
- * The other two suites reason about the service from the inside: one drives
- * the store and the workbook reader directly, the other creates a server on an
- * ephemeral port inside the test process. Neither can see what a process does.
- * This file spawns `node server.js` exactly as an operator runs it — same
- * runtime, same entry point, the literal port 3000 — and asserts the four
- * things only a real process can demonstrate:
+ * SCOPE
+ * -----
+ * This file spawns `node server.js` as a child process, the way an operator
+ * runs it: the same runtime, the same entry point, the literal port 3000. That
+ * is what lets it assert the process-level facts — what the service actually
+ * writes to stdout and stderr, how many times, the exit disposition of a
+ * refused bind, and that the process carries on serving after a refused store
+ * write — and it asserts the preserved response and the `/activities`
+ * namespace boundary against that spawned instance, end to end over a real
+ * socket.
  *
- *   1. It starts, binds, and says so exactly once.
- *   2. The pre-feature response is still there, byte for byte.
- *   3. The `/activities` namespace boundary falls exactly where it was drawn,
- *      so every path outside it behaves as it always did.
- *   4. It fails the way it is documented to fail — a refused bind exits
- *      non-zero naming the code, and a refused store write answers 500 and
- *      keeps serving.
- *
- * WHY IT IS SERIAL-ONLY
- * ---------------------
+ * SERIAL ONLY
+ * -----------
  * `port = 3000` is a bare literal in `server.js` with no environment override,
- * and the feature deliberately did not externalize it. Port 3000 cannot be
- * partitioned, so this file must be the only thing binding it while it runs.
- * The runner uses a separate process per test file, which is why the project's
- * test script is `node --test --test-concurrency=1` with NO positional
- * argument — a bare `test/` directory argument makes Node treat the directory
- * as a module to load, which fails and runs no tests at all.
+ * so this file must be the only thing binding it while it runs. The runner uses
+ * a separate process per test file, which is why the project's test script is
+ * `node --test --test-concurrency=1` with NO positional argument — a bare
+ * `test/` directory argument makes Node treat the directory as a module to
+ * load, which fails and runs no tests at all.
  *
- * SIX DISCIPLINES THIS FILE HOLDS ITSELF TO
- * -----------------------------------------
+ * CONSTRAINTS THE CASES BELOW DEPEND ON
+ * -------------------------------------
  *   - NO ORPHANS. Every child is tracked, killed, and awaited to its `'close'`
  *     event, and the port is polled until it is actually released before the
  *     next child binds it. An orphan would hold port 3000 and make every later
  *     case fail for a reason that has nothing to do with the code under test.
- *   - EVERY WAIT IS BOUNDED, AND EVERY BOUND IS ENFORCED. Not one wait in this
- *     file is open-ended — not the readiness gate, not the kill, not the
- *     `SIGKILL` escalation, not an HTTP exchange. A deadline that expires is a
- *     reported failure carrying its diagnosis, never a wait that continues,
- *     because an unbounded wait in a test turns a legible product defect into
- *     a runner that never finishes and explains nothing.
- *   - THE PORT IS ACQUIRED FAIL-FAST, AND RELEASED PATIENTLY. A held port is
- *     reported immediately, naming the port and the code, exactly as the
- *     README and the plan state — it is an environment condition this file
- *     cannot fix and must not sit on. Waiting is confined to the other
+ *   - EVERY WAIT IS BOUNDED, AND EVERY BOUND IS ENFORCED — the readiness gate,
+ *     the kill, the `SIGKILL` escalation, an HTTP exchange. A deadline that
+ *     expires is a reported failure carrying its diagnosis, never a wait that
+ *     continues, because an unbounded wait in a test turns a legible product
+ *     defect into a runner that never finishes and explains nothing.
+ *   - THE PORT IS ACQUIRED FAIL-FAST, AND RELEASED PATIENTLY. A held port is an
+ *     environment condition this file cannot fix, so it is reported at once,
+ *     naming the port and the code. Waiting is confined to the other
  *     direction: after this file's own child is reaped, it polls until the
- *     socket it owned is actually free.
+ *     socket that child owned is actually free.
  *   - A FAILURE MESSAGE SAYS WHAT IS NEEDED AND NO MORE. These messages
  *     outlive the run in logs and JUnit artifacts, read by people who were not
  *     there, so a child's raw output is never reproduced: diagnostics carry
@@ -62,28 +53,10 @@
  *     with `agent: false` and `Connection: close` so no keep-alive socket
  *     outlives its response. If the runner ever hangs on this file, that is a
  *     defect in this file.
- *
- * GOVERNING RULE: `Ajit_AddNewFeature_Rule`
- * -----------------------------------------
- * Summarized, never reproduced. Its TESTING REQUIREMENTS area is the sole
- * reason this file exists — the request that produced the feature never asked
- * for tests — so every case here is executable evidence that can genuinely
- * fail: there is no `todo`, and the only conditional skip is the one case whose
- * precondition is about the HOST rather than about the code.
- *
- * Its SYSTEM BOUNDARIES area is why the boundary cases below are nine
- * separately named tests rather than one loop over a table: a loop stops at its
- * first failure and hides the rest, and these are precisely the cases a
- * careless route predicate breaks.
- *
- * Its MINIMAL CHANGE AND DISCIPLINE area is why the only imports are Node
- * built-ins — no test framework, no assertion library, no HTTP client, no
- * process helper — and why `test/` holds exactly three files with no shared
- * helper module between them. It is also why the assertions below describe the
- * response AS IT SHIPS rather than as it might be improved: the `Content-Type`
- * is asserted to be exactly `text/plain`, with no charset parameter, because
- * that absence is preserved behaviour and this suite exists to notice if
- * someone "corrects" it.
+ *   - THE ASSERTIONS DESCRIBE THE RESPONSE AS IT SHIPS. The `Content-Type` of
+ *     the preserved response is asserted to be exactly `text/plain`, with no
+ *     charset parameter, because that absence is preserved behaviour and this
+ *     suite exists to notice if someone "corrects" it.
  */
 
 const { test, describe, before, after } = require('node:test');
@@ -109,17 +82,17 @@ const path = require('node:path');
 const REPOSITORY_ROOT = path.join(__dirname, '..');
 const SERVER_ENTRY_POINT = path.join(REPOSITORY_ROOT, 'server.js');
 
-/** The bind, unchanged by the feature and deliberately loopback-only. */
+/** The loopback address and the literal port the service binds. */
 const HOST = '127.0.0.1';
 const PORT = 3000;
 
 /* ========================================================================= *
- * Gold values — measured against the working tree, written as literals
+ * Gold values
  *
- * These are copied from the specification's verified measurements and
- * re-measured against this checkout. They are literals rather than values
- * derived at run time from the service's own output, because a value the
- * service computes cannot be evidence about the service.
+ * Written as independent literals rather than derived at run time from the
+ * service's own output, because a value the service computes cannot be
+ * evidence about the service. Each one therefore has to be stated here and
+ * compared.
  * ========================================================================= */
 
 /** The preserved response body: 34 bytes, trailing newline included. */
@@ -128,43 +101,50 @@ const GOLD_BODY_BYTES = 34;
 const GOLD_BODY_SHA256 = '6bdf54b2103060907f4da9765e353673aa0c0d28afaad83bfe42f139963bbb10';
 
 /**
- * The preserved `Content-Type`, asserted as an EXACT string. `text/plain` with
- * no `charset` parameter is what the pre-feature service sent and what it still
- * sends; a `startsWith` check here would silently accept
+ * The preserved `Content-Type`, asserted as an EXACT string: `text/plain` with
+ * no `charset` parameter. A `startsWith` check here would silently accept
  * `text/plain; charset=utf-8`, which is a different response.
  */
 const GOLD_CONTENT_TYPE = 'text/plain';
 const GOLD_STATUS = 200;
 
-/** The service's one and only log line, emitted once from the listen callback. */
+/**
+ * The readiness line, emitted once from the listen callback.
+ *
+ * It is the only line a CLEAN startup writes, which is not the same as the
+ * service's only log line: a refused bind, the request boundary in `server.js`
+ * and the feature's own refusal diagnostics all write to stderr when they
+ * happen. So this literal is the signal that startup succeeded, and the
+ * stdout-line count asserted alongside it is a claim about a process that has
+ * started and failed at nothing — never a claim that the service is silent
+ * under failure.
+ */
 const READINESS_LINE = 'Server running at http://127.0.0.1:3000/';
 
 /**
- * The HANDLED bind failure, as `server.js`'s `'error'` listener writes it:
- * `console.error(\`server error: ${err.code ?? err.message}\`)` followed by
- * `process.exitCode = 1`. Measured against this checkout with the port held —
- * one stderr line, exit code 1, and nothing on stdout at all.
+ * The HANDLED bind failure, as `server.js`'s `'error'` listener reports it: one
+ * stderr line naming the code, `process.exitCode = 1`, and nothing on stdout at
+ * all.
  *
- * This literal is the whole point of the EADDRINUSE group. Before the feature a
- * refused bind was an UNHANDLED `'error'` event, and that crash also exits
- * non-zero, also writes nothing to stdout, and also contains the string
- * `EADDRINUSE` — so a substring test cannot tell the two apart, and a case
- * built on one would pass against the very regression it is named for.
+ * This literal is what makes the EADDRINUSE group load-bearing. An UNHANDLED
+ * `'error'` event also exits non-zero, also writes nothing to stdout, and also
+ * contains the string `EADDRINUSE` inside its crash report — so a substring
+ * test cannot tell the two dispositions apart, and a case built on one would
+ * pass against the very regression it is named for.
  */
 const HANDLED_BIND_ERROR_LINE = 'server error: EADDRINUSE';
 const HANDLED_BIND_EXIT_CODE = 1;
 
 /**
- * Fragments that appear in the pre-feature unhandled-crash output and in no
- * handled disposition. Measured verbatim from a listener with no `'error'`
- * handler on this runtime: the `throw er; // Unhandled 'error' event`
- * re-throw, the `Emitted 'error' event on Server instance at:` report, the
- * `node:events:` / `node:net:` internal frames, the decorated error's `errno:`
- * and `syscall:` properties, and the trailing `Node.js v…` footer.
+ * Fragments that belong to Node's unhandled-`'error'`-event report and to no
+ * handled disposition: the `throw er;` re-throw, the `Emitted 'error' event`
+ * report, the `node:events:` / `node:net:` internal frames, the decorated
+ * error's `errno:` and `syscall:` properties, and the trailing `Node.js v…`
+ * footer.
  *
  * Asserting their ABSENCE is what makes the EADDRINUSE case load-bearing: it
- * fails if anyone removes the listener from `server.js`, which is exactly the
- * regression the group exists to catch.
+ * fails if anyone removes the `'error'` listener from `server.js`, which is
+ * exactly the regression the group exists to catch.
  */
 const UNHANDLED_CRASH_MARKERS = [
   "Unhandled 'error' event",
@@ -205,13 +185,11 @@ const READINESS_POLL_ATTEMPTS = 100;
  * 100 polls x 50 ms = a 5-second deadline for a socket THIS FILE owned to be
  * released after its child is gone.
  *
- * This is the only place the file waits on the port at all, and it is not a
- * retry for contention: acquiring the port is FAIL-FAST, per the documented
- * contract (a held port must be reported immediately, naming the port and the
- * code, as an environment problem). Waiting here is different in kind — the
- * child has already been reaped and the question is whether the kernel has let
- * go of the socket yet, which polling a real bind attempt is the only honest
- * way to answer.
+ * A RELEASE wait, not a retry for contention. Acquiring the port is fail-fast:
+ * a held port is an environment problem and is reported at once. What is waited
+ * on here is different in kind — the child has already been reaped and the
+ * question is whether the kernel has let go of the socket yet, which polling a
+ * real bind attempt is the only honest way to answer.
  */
 const PORT_RELEASE_POLL_ATTEMPTS = 100;
 /** How long a child is given to close after being killed, or after a failed bind. */
@@ -250,11 +228,11 @@ const SOCKET_IDLE_DEADLINE_MS = 5000;
 /**
  * How long a bare TCP connection attempt is given to settle.
  *
- * Generous on purpose: a refusal from a loopback address arrives in under a
- * millisecond, but a refusal from one of this host's routable adapter
- * addresses was measured at around two seconds — the stack retries the SYN
- * before the reset arrives. A tighter bound would turn that latency into a
- * timeout and report the wrong observation.
+ * Generous on purpose. A refusal from a loopback address is immediate, but a
+ * refusal from a routable address can take seconds to arrive, because the stack
+ * retries the SYN before the reset comes back. A tighter bound would turn that
+ * latency into a timeout, and `probeConnect` reports a timeout as its own
+ * outcome, so the case would record the wrong observation.
  */
 const CONNECT_DEADLINE_MS = 5000;
 /**
@@ -285,21 +263,16 @@ const CASE_TIMEOUT_MS = 60000;
  * frames are collapsed.
  * ========================================================================= */
 
-/** How many lines of a child's captured output a diagnostic may preview. */
+/** Enough previewed lines for a one-line disposition, or the head of a longer report. */
 const OUTPUT_PREVIEW_LINES = 6;
-/** How many characters of one previewed line a diagnostic may show. */
+/** Wide enough for a whole readiness or bind-error line, not for a dumped payload. */
 const OUTPUT_PREVIEW_LINE_CHARS = 120;
-/** How many hex characters of the output's sha256 identify it in a diagnostic. */
+/** Enough hex to compare two runs, not enough to reconstruct what was hashed. */
 const OUTPUT_DIGEST_CHARS = 12;
-/** What a redacted filesystem path is replaced with. */
 const REDACTED_PATH = '<path>';
-/** What a redacted request target is replaced with. */
 const REDACTED_TARGET = '<target>';
-/** What a collapsed stack frame is replaced with. */
 const REDACTED_STACK_FRAME = '<stack frame>';
-/** What an error code that is not a code token is replaced with. */
 const REDACTED_CODE = '<code>';
-/** What a syscall whose leading token is not an operation name is replaced with. */
 const REDACTED_SYSCALL = '<syscall>';
 
 /* ========================================================================= *
@@ -328,12 +301,10 @@ function sha256(bytes) {
 /**
  * Normalizes captured output to `\n` line endings, changing nothing else.
  *
- * `console.log` emits `\n` on every platform Node supports — measured on this
- * checkout, the child's stdout is exactly `${READINESS_LINE}\n` with no
- * carriage return — but the repository is developed on Windows with
- * `core.autocrlf=true`, so folding `\r\n` is defensive rather than decorative:
- * a stray carriage return must not turn one line into two and fail an
- * assertion that is really about how many times the service logged.
+ * `console.log` emits `\n` on every platform Node supports, so folding `\r\n`
+ * is defensive rather than corrective: a stray carriage return must not turn
+ * one line into two and fail an assertion that is really about how many times
+ * the service logged.
  *
  * Nothing else is touched. In particular, blank lines are PRESERVED, which is
  * what lets the raw comparisons below be exact.
@@ -348,11 +319,11 @@ function normalizeNewlines(output) {
 /**
  * Splits captured output into lines, BLANK LINES INCLUDED.
  *
- * Discarding blank lines is what an earlier form of this helper did, and it
- * quietly voided every assertion built on it: the contract is that a clean
- * startup writes exactly ONE line to stdout, and a service that emitted the
- * readiness line followed by three blank ones still produced `[READINESS_LINE]`
- * once the blanks were filtered out. A blank line is output. It is counted.
+ * A blank line is output, and it is counted. The contract the assertions below
+ * rest on is that a clean startup writes exactly ONE line to stdout, and a
+ * service that emitted the readiness line followed by three blank ones has
+ * written four lines, not one — filtering blanks out would silently satisfy
+ * every assertion built on this helper.
  *
  * Exactly one trailing terminator is dropped — the `\n` that ends a normal
  * `console.log` — and nothing more, so `"a\n"` is one line while `"a\n\n"` is
@@ -379,14 +350,12 @@ function outputLines(output) {
  * Races a promise against a deadline, and CLEARS THE LOSING TIMER.
  *
  * The obvious spelling of this — `Promise.race([work, sleep(ms)])` — is a
- * defect, and it was measured as one while this file was being written: the
- * race settles as soon as the work finishes, but the sleep's timer stays
- * pending and keeps the event loop alive for its full duration. With a
- * ten-second deadline that turned a suite whose assertions took under a second
- * into a runner that sat there for eleven, which is indistinguishable from a
- * hang and is the very thing this file must not do. Clearing the timer in
- * `finally` is what keeps this file honest about not needing
- * `--test-force-exit`.
+ * defect: the race settles as soon as the work finishes, but the sleep's timer
+ * stays pending and keeps the event loop alive for its full duration. A suite
+ * whose assertions take under a second then sits for as long as the longest
+ * deadline it raced, which is indistinguishable from a hang and is the very
+ * thing this file must not do. Clearing the timer in `finally` is what keeps
+ * this file honest about not needing `--test-force-exit`.
  *
  * @template T
  * @param {Promise<T>} work The promise being waited on.
@@ -431,11 +400,11 @@ function countReadinessLines(output) {
  * One path segment: at least one token, and any number of further tokens
  * separated by single spaces.
  *
- * Space tolerance is not decoration. `C:\Program Files\nodejs\node.exe` is
- * where this runtime actually lives, so a segment pattern that stopped at
- * whitespace redacted `C:\Program` and left ` Files\nodejs\node.exe` standing —
- * the layout the redaction exists to withhold, disclosed with its prefix
- * removed. Measured against a real failed spawn before this was fixed.
+ * Space tolerance is not decoration. Absolute paths routinely contain spaces,
+ * and a segment pattern that stopped at whitespace would redact the first token
+ * and leave the rest of the path standing — the layout the redaction exists to
+ * withhold, disclosed with only its prefix removed, which is worse than not
+ * redacting at all because it reads as redacted.
  *
  * Quotes, angle brackets and pipes are excluded so a quoted path ends at its
  * closing quote, and a newline can never be crossed.
@@ -449,12 +418,12 @@ const TRAILING_QUERY = '(?:\\?[^\\s"\'<>|]*)?';
  * A Windows absolute path: a drive letter, a separator, then space-tolerant
  * segments and an optional query.
  *
- * The two guards on the root are load-bearing and were both measured. The drive
+ * The two guards on the root are what keep the pattern out of URLs. The drive
  * letter may not be preceded by an alphanumeric character, and the separator
- * may not be followed by a second one — without them the pattern matches inside
- * a URL, at the `p` of `http` followed by `://`, and rendered this suite's own
- * readiness line as `Server running at htt<path>`, destroying the single most
- * informative line a startup diagnostic carries.
+ * may not be followed by a second one, so the `p://` of `http://` — a letter, a
+ * colon, two slashes — cannot be taken for a drive root. Without them a URL is
+ * redacted from its scheme onwards, which destroys the most informative line a
+ * startup diagnostic carries.
  */
 const WINDOWS_PATH = new RegExp(
   `(?<![A-Za-z0-9])[A-Za-z]:[\\\\/](?![\\\\/])(?:${PATH_SEGMENT}[\\\\/])*(?:${PATH_SEGMENT})?${TRAILING_QUERY}`,
@@ -475,11 +444,25 @@ const POSIX_PATH = new RegExp(`(?:[\\\\/]${PATH_SEGMENT}){2,}[\\\\/]?${TRAILING_
 /**
  * A request target following an HTTP method token.
  *
- * `server.js` logs a failed request as `request failed GET /activities/S001:`,
- * so the method token is a reliable anchor for the target that follows it — and
- * anchoring on it is what lets the COMPLETE target go, query string included,
- * whatever its shape. The target must begin with `/` or a scheme, so ordinary
- * prose after a method word (`DELETE failed because …`) is left alone.
+ * This rule covers the METHOD-SPACE-TARGET shape wherever it turns up in a
+ * child's captured output — a thrown value whose message quotes a request
+ * line, a runtime or client diagnostic, any line written that way. A method
+ * token is a reliable anchor for the target that follows it, and anchoring on
+ * it is what lets the COMPLETE target go, query string included, whatever its
+ * shape.
+ *
+ * `server.js` does not write that shape. Its request boundary emits one
+ * structured line — `request_handler_failed method=… path=… error=… code=…` —
+ * whose `path` field is already a bounded pathname with the query string
+ * dropped before it is logged. A multi-segment value there is redacted by the
+ * path rules above, which match a pathname wherever in a line it sits; a
+ * single-segment value such as `/activities` is left standing, and carries
+ * nothing to withhold once the query is gone. Both shapes are handled because
+ * a redaction rule written for one log format is worth nothing on the day that
+ * format changes.
+ *
+ * The target must begin with `/` or a scheme, so ordinary prose after a method
+ * word (`DELETE failed because …`) is left alone.
  */
 const REQUEST_TARGET = /\b(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|TRACE|CONNECT)(\s+)(?:https?:\/\/|\/)\S*/g;
 
@@ -496,11 +479,11 @@ const TARGET_WITH_QUERY = /(?<![A-Za-z0-9:\\/])[\\/][^\s"'<>|]*\?[^\s"'<>|]*/g;
 /**
  * Replaces absolute filesystem paths and request targets with a marker.
  *
- * Four ordered rules, each answering a disclosure that was measured rather than
- * imagined: the complete request target including its query string, a Windows
- * path whose segments contain spaces, a POSIX path of two or more segments, and
- * a one-segment target carrying a query. The target rule runs first, so a
- * target is reported as a target rather than as a path.
+ * The rules are ORDERED, and the order is part of the contract: the
+ * request-target rule runs first, so a target is reported as a target rather
+ * than as a path. The rules that follow cover a Windows path whose segments
+ * contain spaces, a POSIX path of two or more segments, and a one-segment
+ * target carrying a query.
  *
  * Over-redaction is the safe direction, and it is bounded rather than
  * unlimited: no rule crosses a newline, a quote or an angle bracket, the
@@ -548,13 +531,12 @@ function errorCode(error) {
  * Reduces an error's `syscall` to the OPERATION it names, discarding its
  * argument.
  *
- * THIS IS NOT COSMETIC, and it is the correction of a wrong assumption. A
- * failed `child_process.spawn` sets `syscall` to the operation AND its target:
- * measured on this runtime, a spawn of a missing executable produced
- * `spawn C:\Program Files\Definitely Missing\node.exe`. Treating that field as
- * a safe code — as an earlier form of this file did — retained the absolute
- * path of the executable in every diagnostic that mentioned the failure, which
- * is precisely the disclosure the store path is reduced to a basename to avoid.
+ * THIS IS NOT COSMETIC. `syscall` looks like a safe code token and is not one:
+ * a failed `child_process.spawn` sets it to the operation AND its target, so
+ * the field carries the absolute path of the executable that could not be
+ * started. Retaining it verbatim would put that path into every diagnostic
+ * mentioning the failure — precisely the disclosure the store path is reduced
+ * to a basename to avoid.
  *
  * Only the leading token is kept, and only when it looks like an operation
  * name, so no argument can survive by construction rather than by a pattern
@@ -605,9 +587,8 @@ function sanitizeLine(line) {
  * The summary is what a reader needs and no more: how many lines were written,
  * how many bytes, a short digest that identifies the output exactly enough to
  * compare two runs, and a bounded, sanitized preview. The full stream is never
- * reproduced — an earlier form of this file emitted `JSON.stringify(stderr)`
- * whole, which put every stack frame and absolute path a child had printed
- * into whatever retained the report.
+ * reproduced, because reproducing it would put every stack frame and absolute
+ * path the child printed into whatever retains the report.
  *
  * @param {string} label `'stdout'` or `'stderr'`.
  * @param {string} text The accumulated stream.
@@ -636,7 +617,7 @@ function summarizeOutput(label, text) {
 }
 
 /* ========================================================================= *
- * The port: probing, and waiting for a turn
+ * The port: fail-fast acquisition, and waiting for this file's own release
  * ========================================================================= */
 
 /**
@@ -749,13 +730,11 @@ function portUnavailableMessage(code, context) {
 /**
  * Requires the port NOW, with a single probe, and fails fast when it is held.
  *
- * Fail-fast is the documented contract, in the README and in the plan this
- * feature was built from: a held port must be reported at once, naming the
- * port and the error code, instead of being waited out. An earlier form of
- * this file retried for roughly fifty-five seconds with a growing backoff,
- * which contradicted that contract twice over — it turned a stated fail-fast
- * into a long silence, and it made a genuinely held port look like a slow
- * suite rather than an environment problem.
+ * A single probe, deliberately. A held port is an environment condition this
+ * file cannot fix, so it is reported at once, naming the port and the error
+ * code, instead of being waited out: a retry loop here would spend a minute in
+ * silence and then report a genuinely held port as though the suite were merely
+ * slow.
  *
  * @param {string} context What this file was about to do, for the message.
  * @returns {Promise<{available: boolean, code: string|null}>} The probe result.
@@ -929,34 +908,28 @@ function spawnService(storePath) {
  * instrumentation, PLUS the store path.
  *
  * `ACTIVITY_STORE` is the reason this file controls the environment at all.
- * The deletions are the reason it has to build the environment explicitly
+ * The removals are the reason it has to build the environment explicitly
  * rather than spreading `process.env` and moving on.
  *
  * WHY THE COVERAGE VARIABLE MATTERS. Under `--experimental-test-coverage` the
  * runner gives each test worker a `NODE_V8_COVERAGE` directory, and a spawned
  * child inherits it, writes its own V8 profile there, and has that profile
- * merged into the parent's report. Measured on this checkout: a lifecycle-only
- * coverage run with `--test-coverage-include=server.js` reported `server.js` at
- * 75.74% even though this file never imports that module — it only spawns it.
- * That number is not coverage in the sense the report means, and it is actively
- * misleading: the `server.js` row is supposed to come from the in-process
- * suite, which drives the module's exported server directly, so a spawned
- * child contributing to it makes the provenance of every figure in the table
- * unreadable.
+ * merged into the parent's report. `server.js` then acquires a coverage figure
+ * from a process this file only spawned and never imported. That figure is not
+ * coverage in the sense the report means, and it is actively misleading: the
+ * `server.js` row belongs to the in-process suite, which drives the module's
+ * exported server directly, so a spawned child contributing to it makes the
+ * provenance of every figure in the table unreadable.
  *
- * WHY IT IS EMPTIED RATHER THAN DELETED, which is the part that is easy to get
- * wrong and was measured wrong first. `child_process` propagates
- * `NODE_V8_COVERAGE` from the parent DELIBERATELY, so that coverage spans a
+ * WHY IT IS EMPTIED RATHER THAN DELETED. `child_process` propagates
+ * `NODE_V8_COVERAGE` from the parent DELIBERATELY, so that coverage can span a
  * process tree even when the child is given a curated environment — and the
  * check it makes is for the variable's PRESENCE as an own property of the
  * supplied `env`, not for its value. Deleting the key therefore achieves
  * nothing: the key is absent, so the runtime copies the parent's value straight
- * back in, and the child writes its profile after all. Verified: with the key
- * deleted the child still saw the runner's coverage directory and the
- * `server.js` row still appeared. Assigning an empty string keeps the key
- * present — so nothing is copied over it — while being falsy, which is what
- * disables the child's coverage hook. With that, the same command yields the
- * intentional empty file table.
+ * back in, and the child writes its profile after all. Assigning an empty
+ * string keeps the key present — so nothing is copied over it — while being
+ * falsy, which is what disables the child's coverage hook.
  *
  * `NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` are plain deletions, and they
  * work as deletions because nothing propagates them: they tell a process it IS
@@ -1122,8 +1095,8 @@ async function startService(storePath) {
     // The child is reaped before anything is thrown, so a service that failed
     // to become ready cannot survive as an orphan holding the port. A cleanup
     // fault is APPENDED to the diagnosis rather than replacing it: the startup
-    // failure is the finding, and a cleanup failure that masked it would send a
-    // reader after the wrong problem.
+    // error is the primary one, and a cleanup failure that masked it would send
+    // a reader after the wrong problem.
     let cleanupNote = '';
     try {
       await stopService(handle);
@@ -1154,16 +1127,15 @@ async function startService(storePath) {
  *
  * Killing without awaiting leaves a race in which the next child binds before
  * this one has gone, and the `SIGKILL` escalation covers a child that will not
- * leave on request — so a hung service cannot hang the suite. Both waits are
- * bounded through `awaitWithDeadline`, which clears its own timer.
+ * leave on request — so a hung service cannot hang the suite.
  *
- * EVERY WAIT IS BOUNDED, INCLUDING THE LAST ONE. An earlier form of this
- * function awaited the exit unconditionally after `SIGKILL`, which is the one
- * wait in the file that had no deadline at all — and it sat in the cleanup
- * path, where a hang produces no assertion, no diagnosis, and a runner that
- * never finishes. A child that survives `SIGKILL` is now a reported failure
- * naming its pid, which is the honest outcome: it is a condition this file
- * cannot fix and must not conceal.
+ * EVERY WAIT IS BOUNDED, INCLUDING THE LAST ONE. Both waits go through
+ * `awaitWithDeadline`, which clears its own timer, and that includes the wait
+ * after `SIGKILL`: this is the cleanup path, where an unbounded wait produces
+ * no assertion, no diagnosis and a runner that never finishes. A child that
+ * survives `SIGKILL` is therefore a reported failure naming its pid, which is
+ * the honest outcome — it is a condition this file cannot fix and must not
+ * conceal.
  *
  * It waits for `'close'` rather than `'exit'` so the diagnosis it may have to
  * print is built from complete output.
@@ -1226,11 +1198,10 @@ async function killService(handle) {
  * below — use `killService` instead, or this would wait out the whole release
  * deadline against the instance that legitimately holds it.
  *
- * The probe's RESULT is honoured. An earlier form of this function polled and
- * then discarded what it found, returning as though cleanup had succeeded even
- * when the port was still held — which made the file's promise that cleanup
- * completes only after release untrue, and handed the next child a bind
- * failure with no explanation attached to it.
+ * The final probe's RESULT is honoured rather than discarded. Cleanup is not
+ * complete until the socket is released, so a probe that still reports the port
+ * held fails here: returning as though cleanup had succeeded would hand the
+ * next child a bind failure with no explanation attached to it.
  *
  * @param {object} handle A handle from `spawnService`.
  * @returns {Promise<{available: boolean, code: string|null}>} The final probe
@@ -1262,11 +1233,24 @@ async function stopService(handle) {
 /**
  * Issues one HTTP request and reads the whole response.
  *
- * `agent: false` with an explicit `Connection: close` is deliberate. Node's
- * global agent keeps connections alive, and a keep-alive socket outliving its
- * response is exactly the kind of lingering handle that makes a test runner sit
- * there after its last assertion and look like a hang. One socket per request,
- * closed by the server when it answers.
+ * `agent: false` with an explicit `Connection: close` is deliberate, and what
+ * it buys is ISOLATION. Node's global agent keeps connections alive, so
+ * without this the socket one case finished with is the socket the next case
+ * is handed, and an exchange would be asserted over a connection whose state
+ * it did not establish — a half-consumed response or a server-side close
+ * arriving mid-flight belongs to the case that caused it, not to the case that
+ * inherits it. One connection per request, opened for it and closed by the
+ * server when it answers, keeps every observation attributable to the case
+ * that made it.
+ *
+ * Two things it is NOT for, because both were plausible and both are wrong.
+ * It is not queue avoidance: the default agent's socket limits are unbounded,
+ * so a request is given a new connection rather than made to wait behind a
+ * busy one. And it is not what keeps this file off `--test-force-exit`: a
+ * socket the agent parks in its free list is unrefed and holds no reference on
+ * the event loop. The handle that would genuinely hang this file belongs to an
+ * exchange that never settled, which is what the deadlines below and the
+ * `req.destroy()` in `fail` exist to prevent.
  *
  * The body is returned as RAW BYTES. The gold value is a byte count and a
  * hash, so decoding first would let an encoding change slip through
@@ -1401,14 +1385,13 @@ function request(options, body) {
 }
 
 /**
- * Asserts that a response is the preserved pre-feature response, exactly.
+ * Asserts that a response is the preserved response, exactly.
  *
- * Shared by the many paths that must still receive it, which is not the same
- * thing as collapsing those paths into one case: each path is still its own
- * named test that fails on its own, and this only spares the file nine copies
- * of the same four assertions. All four are asserted every time — status,
- * exact `Content-Type`, byte length, and hash — because each catches a
- * different kind of drift.
+ * Shared by the paths that must still receive it, which is not the same thing
+ * as collapsing those paths into one case: each path is still its own named
+ * test that fails on its own. Every call asserts all four properties — the
+ * status, the exact `Content-Type`, the byte length, and the sha256 of the raw
+ * body — because each catches a different kind of drift.
  *
  * @param {{status: number, headers: object, raw: Buffer}} response A response
  *   from `request`.
@@ -1499,12 +1482,17 @@ function writableStorePath(name) {
 /**
  * A store path whose PARENT DIRECTORY does not exist, and is never created.
  *
- * This is the mechanism chosen to make a write fail, and the choice is
- * deliberate: `fs.chmod` cannot make a directory unwritable on Windows, where
- * it only toggles the read-only flag on files, so a permission-based approach
- * would silently do nothing and the case would pass for the wrong reason. A
- * missing parent fails both the staging write and the rename, on every
- * platform, with `ENOENT`.
+ * An absent parent directory makes the write fail with `ENOENT` on every
+ * platform, which a permission bit does not: on Windows `fs.chmod` only
+ * toggles a FILE's read-only flag and cannot make a directory unwritable at
+ * all.
+ *
+ * What the service observes is the STAGING WRITE failing, and only that.
+ * `activity-store.js` writes the document to `<store>.tmp` and then renames it
+ * over the store, awaiting each in turn, so with the parent absent the
+ * `writeFile` rejects and the rename is never attempted. One refused step is
+ * the whole fault, and both steps surface to a client as the single code
+ * `store_write_failed`.
  *
  * @param {string} name A short name distinguishing one child's store.
  * @returns {string} An absolute path whose parent is absent.
@@ -1518,14 +1506,13 @@ before(
     temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'lifecycle-test-'));
 
     // THE PRE-FLIGHT PROBE. It runs before anything binds, it is a SINGLE
-    // bind attempt, and a held port fails the hook immediately.
+    // bind attempt, and a held port fails the hook immediately, naming the port
+    // and the code.
     //
-    // Failing fast is the contract, not a convenience: the README and the plan
-    // both state that a held port is reported at once, naming the port and the
-    // code. Its failure is phrased as an environment problem because that is
-    // what it is — every case in this file needs port 3000, and a held port
-    // would otherwise surface as an opaque assertion failure somewhere further
-    // down, sending a reader to look for a defect in code that is working.
+    // Its failure is phrased as an environment problem because that is what it
+    // is — every case in this file needs port 3000, and a held port would
+    // otherwise surface as an opaque assertion failure somewhere further down,
+    // sending a reader to look for a defect in code that is working.
     const acquisition = await probePort();
     assert.strictEqual(
       acquisition.available,
@@ -1577,7 +1564,7 @@ after(
 );
 
 /* ========================================================================= *
- * PHASE 1 — the node:net pre-flight probe
+ * The node:net pre-flight probe
  *
  * Declared first so it runs before anything binds the port. The `before` hook
  * above has already gated the suite on the probe; these cases assert that the
@@ -1648,23 +1635,19 @@ describe('the node:net pre-flight probe', () => {
 });
 
 /* ========================================================================= *
- * PHASE 1b — what a retained failure message is allowed to say
+ * What a retained failure message is allowed to say
  *
  * These cases bind no port, spawn no child and touch no file: they call the
- * redaction helpers directly and assert what comes out. That is deliberate,
- * because a sanitizer is only as good as its adversarial cases and every input
- * below was a REAL disclosure at some point in this file's history — not an
- * imagined one. They are here rather than in a comment because the diagnostics
- * these helpers produce outlive the run, in JUnit artifacts and CI logs read by
- * people who were not there, and a silent regression in a sanitizer is
- * invisible until the artifact has already been kept.
+ * redaction helpers directly and assert what comes out. A sanitizer is only as
+ * good as its adversarial cases, and the diagnostics these helpers produce
+ * outlive the run — in JUnit artifacts and CI logs read by people who were not
+ * there — so a silent regression in one of them is invisible until the artifact
+ * has already been kept.
  *
  * The cases assert in BOTH directions. A disclosure must go, and the two lines
  * a reader actually needs — the readiness line and the handled bind error —
  * must survive untouched, because over-redaction that eats them turns a useful
- * diagnostic into a useless one. That second direction is not hypothetical: an
- * earlier drive-letter pattern matched inside `http://` and rendered the
- * readiness line as `Server running at htt<path>`.
+ * diagnostic into a useless one.
  * ========================================================================= */
 
 describe('what a retained failure message is allowed to say', () => {
@@ -1672,10 +1655,11 @@ describe('what a retained failure message is allowed to say', () => {
     'a Windows path whose segments contain spaces is redacted whole',
     { timeout: CASE_TIMEOUT_MS },
     () => {
-      // Measured from a real failed spawn on this runtime. An earlier pattern
-      // stopped at whitespace and produced `spawn <path> Files\\Definitely
-      // Missing\\node.exe` — the layout disclosed with only its prefix removed,
-      // which is worse than not redacting at all because it reads as redacted.
+      // The shape a failed spawn reports: an operation followed by the absolute
+      // path of the executable, whose segments contain spaces. Every segment
+      // must go — a pattern that stopped at whitespace would leave the tail of
+      // the path standing, which is worse than not redacting at all because it
+      // reads as redacted.
       const line = 'spawn C:\\Program Files\\Definitely Missing\\node.exe';
 
       assert.strictEqual(
@@ -1718,10 +1702,10 @@ describe('what a retained failure message is allowed to say', () => {
     "a path-bearing error.syscall is reduced to its operation alone",
     { timeout: CASE_TIMEOUT_MS },
     () => {
-      // `syscall` LOOKS like a safe code and is not one. Measured on this
-      // runtime, a spawn of a missing executable sets it to the operation AND
-      // its absolute target, so retaining the field verbatim disclosed the
-      // executable's path in every diagnostic that mentioned the failure.
+      // `syscall` LOOKS like a safe code and is not one: a failed spawn sets it
+      // to the operation AND its absolute target, so retaining the field
+      // verbatim would disclose the executable's path in every diagnostic that
+      // mentions the failure.
       const error = Object.assign(new Error('spawn ENOENT'), {
         code: 'ENOENT',
         syscall: 'spawn C:\\Program Files\\Definitely Missing\\node.exe',
@@ -1734,7 +1718,6 @@ describe('what a retained failure message is allowed to say', () => {
       );
       assert.strictEqual(errorCode(error), 'ENOENT', 'a real code token is kept as-is');
 
-      // And through the renderer, which is where it would actually be retained.
       const rendered = describeService({
         child: { pid: 4242, exitCode: null, signalCode: null },
         storePath: writableStorePath('redaction-probe'),
@@ -1795,14 +1778,56 @@ describe('what a retained failure message is allowed to say', () => {
   );
 
   test(
-    "a request target logged after an HTTP method is redacted, and the method is kept",
+    'the structured request-failure line keeps its event and method, and loses everything from the path onwards',
     { timeout: CASE_TIMEOUT_MS },
     () => {
-      // This is the exact shape `server.js` writes when a request fails:
-      // `request failed ${req.method} ${req.url}:`. The method is worth
-      // keeping — it says what kind of request failed — and the target is not.
+      // The shape `server.js` writes when a request fails, field for field:
+      // `request_handler_failed method=… path=… error=… code=…`. The event code
+      // and the method are worth keeping — together they say that a request
+      // failed and what kind — while the pathname is not, because a route path
+      // names a student.
+      //
+      // The trailing `error=` and `code=` fields go WITH the pathname, and the
+      // whole line is asserted so that stays visible rather than being
+      // discovered later: path segments are space-tolerant, because a Windows
+      // path has spaces in it, so the segment that starts at `/activities`
+      // runs on through the spaces that follow it. That is the over-redaction
+      // `redactPaths` declares as its safe direction, and what it costs here
+      // is legibility on a line that was disclosing a route path anyway — the
+      // exit disposition, the line count, the byte length and the digest are
+      // all reported unredacted elsewhere in the same diagnostic.
       const redacted = redactPaths(
-        'request failed GET /activities/S001?token=top-secret: Error'
+        `request_handler_failed method=GET path=/activities/${SEEDED_STUDENT_ID}` +
+          ' error=Error code=-'
+      );
+
+      assert.strictEqual(
+        redacted,
+        `request_handler_failed method=GET path=${REDACTED_PATH}`,
+        'the event code and the method survive so the line stays greppable, and ' +
+          'the pathname and the fields after it are replaced by the marker'
+      );
+      for (const fragment of [SEEDED_STUDENT_ID, '/activities']) {
+        assert.strictEqual(
+          redacted.includes(fragment),
+          false,
+          `the redacted line must not retain ${JSON.stringify(fragment)}`
+        );
+      }
+    }
+  );
+
+  test(
+    'a request target quoted after an HTTP method is redacted, and the method is kept',
+    { timeout: CASE_TIMEOUT_MS },
+    () => {
+      // Not the server's own line — this is the method-space-target shape that
+      // can arrive from anywhere else in a child's output, a thrown value whose
+      // message quotes a request line being the likeliest source. The rule
+      // exists so a line written that way cannot carry a target, or the query
+      // hanging off it, past redaction.
+      const redacted = redactPaths(
+        'Error: handler failed for GET /activities/S001?token=top-secret'
       );
 
       assert.strictEqual(
@@ -1840,9 +1865,9 @@ describe('what a retained failure message is allowed to say', () => {
     'the two lines a reader actually needs survive redaction untouched',
     { timeout: CASE_TIMEOUT_MS },
     () => {
-      // The other direction, and a regression guard for a real defect: a
-      // looser drive-letter pattern matched the `p:` inside `http://` and
-      // rendered this line as `Server running at htt<path>`.
+      // The other direction. A drive-letter pattern loose enough to match the
+      // `p:` inside `http://` would redact this line from its scheme onwards,
+      // so leaving it untouched is the condition being asserted.
       assert.strictEqual(
         redactPaths(READINESS_LINE),
         READINESS_LINE,
@@ -1978,7 +2003,7 @@ describe('what a retained failure message is allowed to say', () => {
 });
 
 /* ========================================================================= *
- * PHASE 2 — startup and the readiness contract
+ * Startup and the readiness contract
  *
  * One child serves this whole group, and the ORDER of the cases is part of
  * their meaning: the "exactly one line" case runs while the child has served
@@ -2079,10 +2104,10 @@ describe('startup and the readiness contract', () => {
     'emits the readiness line exactly once, even after serving several requests',
     { timeout: CASE_TIMEOUT_MS },
     async () => {
-      // Three requests across both halves of the boundary: the preserved
-      // fall-through, the claimed collection, and a claimed item. A service
-      // that logged per request — or re-logged readiness — would be caught here
-      // and nowhere else.
+      // Traffic across both halves of the boundary — the preserved
+      // fall-through, the claimed collection, and a claimed item — because
+      // neither serving a request nor routing one into the namespace may add a
+      // log line or repeat the readiness line.
       await request({ path: '/' });
       await request({ path: '/activities' });
       await request({ path: `/activities/${SEEDED_STUDENT_ID}` });
@@ -2115,14 +2140,11 @@ describe('startup and the readiness contract', () => {
 
 
 /* ========================================================================= *
- * PHASES 3, 4 and 7 — the preserved response, the namespace boundary, and
+ * One running instance: the preserved response, the namespace boundary, and
  * loopback-only reachability
  *
- * One running instance serves all three groups: none of them writes anything
- * that another could observe, so sharing a child costs nothing and spares the
- * run a spawn and a port hand-off per group. The child's store lives in the
- * temporary root, so the read cases answer from the workbook seed and the
- * checkout is untouched.
+ * The instance's store lives outside the checkout and nothing below writes to
+ * it, so the read cases answer from the workbook seed.
  * ========================================================================= */
 
 describe('a running instance', () => {
@@ -2144,12 +2166,12 @@ describe('a running instance', () => {
   );
 
   /* ----------------------------------------------------------------------- *
-   * PHASE 3 — the preserved response, byte for byte
+   * The preserved response, byte for byte
    *
-   * This is the regression evidence for the promise that the feature narrowed
-   * the previously universal response rather than replacing it. Each path is
-   * its own case, so a predicate that captured one of them reports exactly
-   * which one.
+   * The compatibility contract: every method on every path outside the
+   * `/activities` namespace answers the same 200, `text/plain`, 34-byte body.
+   * Each path is its own case, so a route predicate that captured one of them
+   * reports exactly which one.
    * ----------------------------------------------------------------------- */
 
   describe('the preserved response', () => {
@@ -2219,9 +2241,9 @@ describe('a running instance', () => {
         const response = await request({ path: `/students/${SEEDED_STUDENT_ID}` });
 
         assertPreservedResponse(response, `GET /students/${SEEDED_STUDENT_ID}`);
-        // The feature added no roster route. A path that merely looks like one
-        // must not answer with anything about a student, so this also asserts
-        // the absence of the seeded label rather than only the hash.
+        // This path is outside the `/activities` namespace and names no route,
+        // so it must answer with nothing about a student — asserted on the
+        // absence of the seeded label as well as on the hash.
         assert.strictEqual(
           response.raw.toString('utf8').includes(SEEDED_ACTIVITY_LABEL),
           false,
@@ -2252,12 +2274,10 @@ describe('a running instance', () => {
   });
 
   /* ----------------------------------------------------------------------- *
-   * PHASE 4 — the namespace boundary, one named case per path
+   * The namespace boundary, one named case per path
    *
-   * This is the group that catches a loose route predicate, and it is written
-   * as nine separate cases rather than one loop over a table on purpose: a
-   * loop reports its first failure and hides every case after it, and the
-   * whole value here is knowing exactly WHICH path moved.
+   * The boundary is SEGMENT-SAFE: a path belongs to the feature only when its
+   * normalized pathname is `/activities` or begins with `/activities/`.
    *
    * The two halves assert opposite things. A path outside the namespace must
    * still receive the legacy 34-byte body — `/activities-old` and
@@ -2274,8 +2294,9 @@ describe('a running instance', () => {
       '/activities-old is NOT claimed: it still answers the legacy 34-byte body',
       { timeout: CASE_TIMEOUT_MS },
       async () => {
-        // Measured identical to `/` before the feature, and this is the single
-        // assertion that catches a `startsWith('/activities')` predicate.
+        // One character past the namespace and therefore outside it, so this
+        // path must fall through to the preserved response — which is what a
+        // `startsWith('/activities')` predicate gets wrong.
         assertPreservedResponse(await request({ path: '/activities-old' }), 'GET /activities-old');
       }
     );
@@ -2466,15 +2487,15 @@ describe('a running instance', () => {
   });
 
   /* ----------------------------------------------------------------------- *
-   * PHASE 7 — loopback-only reachability
+   * Loopback-only reachability
    *
-   * The bind is `127.0.0.1` and the feature deliberately left it alone.
-   * Widening it would expose a write endpoint that has no authentication, no
-   * authorization and no session mechanism of any kind — a submission is
-   * attributed to whatever Student ID the submitter types, and the feature
-   * checks only that the ID names a real student, never that the submitter is
-   * that student. Loopback is therefore not a default that happens to be in
-   * place; it is the containment this feature relies on.
+   * The listener is bound to `127.0.0.1`. Widening it would expose a write
+   * endpoint that has no authentication, no authorization and no session
+   * mechanism of any kind — a submission is attributed to whatever Student ID
+   * the submitter types, and the service checks only that the ID names a real
+   * student, never that the submitter is that student. Loopback is therefore
+   * not a default that happens to be in place; it is the containment this
+   * feature relies on.
    * ----------------------------------------------------------------------- */
 
   describe('loopback-only reachability', () => {
@@ -2497,86 +2518,141 @@ describe('a running instance', () => {
     );
 
     test(
-      'the service is NOT reachable on a non-loopback address of this host',
+      'the bind is the loopback address rather than every interface',
       { timeout: CASE_TIMEOUT_MS },
-      async (t) => {
-        // Resolved at run time rather than hard-coded, because the addresses a
-        // host holds are its own business. This is the ONE conditional skip in
-        // this file, and it is appropriate precisely because its condition is
-        // about the host rather than about the code: on a host with no routable
-        // IPv4 address there is nothing to refuse from, and asserting anyway
-        // would make the suite fragile for a reason unrelated to the service.
-        const addresses = [];
+      async () => {
+        // EVIDENCE THAT DOES NOT DEPEND ON THIS HOST'S ADDRESSES, taken through
+        // the seam `server.js` exports for exactly this purpose. Requiring the
+        // module binds nothing — `server.listen` sits behind the main-module
+        // guard — so the exported server can be listened on port 0 and asked
+        // what it actually bound. `address()` is the kernel's answer rather than
+        // the service's: a listener opened with the exported `hostname` reports
+        // `127.0.0.1`, where a bind widened to every interface would report the
+        // wildcard `0.0.0.0`. Port 0 because the running instance still holds
+        // 3000.
+        //
+        // The store path is redirected into the temporary root BEFORE the
+        // require: `activity-store.js` resolves `ACTIVITY_STORE` once at module
+        // load and its default sits in the checkout, and nothing in this file
+        // may write there.
+        process.env.ACTIVITY_STORE = writableStorePath('in-process-bind');
+        const composed = require('../server');
+
+        assert.strictEqual(
+          composed.hostname,
+          HOST,
+          'the exported bind host is the loopback literal this suite asserts against'
+        );
+        assert.strictEqual(
+          composed.port,
+          PORT,
+          'the exported bind port is the literal this suite asserts against'
+        );
+        assert.strictEqual(
+          composed.server.listening,
+          false,
+          'requiring the module must not have bound anything'
+        );
+
+        const bound = await new Promise((resolve, reject) => {
+          // Detached on success, so the module-level server object is not left
+          // carrying a one-shot rejection handler for the rest of the run.
+          const onError = (error) => reject(error);
+
+          composed.server.once('error', onError);
+          composed.server.listen(0, composed.hostname, () => {
+            composed.server.off('error', onError);
+            resolve(composed.server.address());
+          });
+        });
+
+        try {
+          assert.strictEqual(
+            bound.address,
+            HOST,
+            `a listener opened with the exported hostname must bind the loopback ` +
+              `address, not the wildcard (observed: ${bound.address}); widening ` +
+              `the bind would expose an unauthenticated write endpoint`
+          );
+          assert.strictEqual(bound.family, 'IPv4', 'the loopback bind is IPv4');
+        } finally {
+          // Bounded like every other wait here, and awaited rather than fired
+          // and forgotten: a listener left open in this process is the one
+          // handle that would make the runner sit there after its last
+          // assertion.
+          const closed = await awaitWithDeadline(
+            new Promise((resolve) => composed.server.close(() => resolve())),
+            CLOSE_DEADLINE_MS
+          );
+          assert.strictEqual(
+            closed,
+            true,
+            `the in-process listener must close within ${CLOSE_DEADLINE_MS}ms`
+          );
+        }
+
+        // AND THE SAME INVARIANT AGAINST A REAL PROCESS, wherever this host can
+        // supply an address to be refused from. The addresses are resolved at
+        // run time rather than written down, because the set a host holds is
+        // its own business; holding none is a normal state, and it costs this
+        // case nothing, because the assertions above already carry the
+        // invariant. One address is enough: the failure guarded against is a
+        // widened bind, and a bind widened to every interface answers on all of
+        // them, so the first address detects it while each further probe only
+        // repeats that evidence at the cost of another refusal-or-timeout wait.
+        const nonLoopback = [];
         for (const interfaces of Object.values(os.networkInterfaces())) {
           for (const entry of interfaces ?? []) {
             if (entry.family === 'IPv4' && !entry.internal) {
-              addresses.push(entry.address);
+              nonLoopback.push(entry.address);
             }
           }
         }
 
-        if (addresses.length === 0) {
-          t.skip(
-            'this host has no non-loopback IPv4 address, so there is no address ' +
-              'from which to observe the refusal'
+        for (const address of nonLoopback.slice(0, 1)) {
+          const outcome = await probeConnect(address, CONNECT_DEADLINE_MS);
+
+          // `connected` is the only failing outcome. A refusal and a dropped
+          // SYN are reported separately by `probeConnect` and both are
+          // acceptable evidence here — the service is not answering on that
+          // address either way — but they are not conflated, so the message
+          // says which was observed.
+          assert.notStrictEqual(
+            outcome,
+            'connected',
+            `the listener is bound to ${HOST} only, so ${address}:${PORT} must not ` +
+              `accept a connection (observed: ${outcome}); widening the bind would ` +
+              `expose an unauthenticated write endpoint`
           );
-          return;
         }
 
-        // ONE address is sufficient and is all this case spends time on. The
-        // failure being guarded against is a widened bind, and a bind widened
-        // to every interface would answer on all of these addresses, so the
-        // first one detects it. Probing all of them was measured at roughly two
-        // seconds each on this host — six seconds of refusal latency for
-        // evidence the first address already gives, on a port that other work
-        // on this host is waiting to take a turn at.
-        const address = addresses[0];
-        const outcome = await probeConnect(address, CONNECT_DEADLINE_MS);
-
-        // `connected` is the only failing outcome. A refusal and a dropped SYN
-        // are reported separately by `probeConnect` and both are acceptable
-        // evidence here — the service is not answering on that address either
-        // way — but they are not conflated, so the message says which was
-        // observed.
-        assert.notStrictEqual(
-          outcome,
-          'connected',
-          `the listener is bound to ${HOST} only, so ${address}:${PORT} must not ` +
-            `accept a connection (observed: ${outcome}); widening the bind would ` +
-            `expose an unauthenticated write endpoint`
-        );
-
-        // And the same instance is still answering on loopback, which is what
-        // makes the refusal above evidence about the BIND rather than about a
+        // And the running instance is still answering on loopback, which is what
+        // makes everything above evidence about the BIND rather than about a
         // service that had simply stopped.
         assertPreservedResponse(
           await request({ path: '/', host: HOST }),
-          `GET / over ${HOST}:${PORT} after the non-loopback probe`
+          `GET / over ${HOST}:${PORT} after the bind-address assertions`
         );
       }
     );
   });
 });
 
-/* ===== end of the running-instance group ===== */
-
-
 /* ========================================================================= *
- * PHASE 5 — the EADDRINUSE disposition
+ * The EADDRINUSE disposition
  *
- * Before this feature, a refused bind terminated the process on an unhandled
- * `'error'` event and a raw stack trace, which reads as a crash rather than as
- * "the port is held". The feature added a listener that logs the code and
- * exits non-zero, and that difference is what lets a pre-flight check — this
- * file's, or an operator's — report an environment problem instead of leaving
- * a stack trace for a reader to interpret.
+ * A refused bind is HANDLED: `server.js`'s `'error'` listener logs the code and
+ * sets a non-zero exit status instead of letting the process terminate on an
+ * unhandled `'error'` event and a raw stack trace. That difference is what lets
+ * a pre-flight check — this file's, or an operator's — report an environment
+ * problem instead of leaving a stack trace for a reader to interpret.
  *
  * WHAT THESE CASES HAVE TO BE CAREFUL ABOUT. The two dispositions are easy to
- * confuse, because almost everything observable about them agrees. Measured on
- * this runtime with the port held, BOTH the handled listener and a listener
- * with no `'error'` handler exit with status 1, send no signal, write nothing
- * to stdout, and produce output containing the string `EADDRINUSE`. They
- * differ in exactly one respect: the handled disposition writes ONE line,
+ * confuse, because almost everything observable about them agrees: with the
+ * port held, BOTH the handled listener and a listener with no `'error'` handler
+ * exit with status 1, send no signal, write nothing to stdout, and produce
+ * output containing the string `EADDRINUSE`. They differ in exactly one
+ * respect: the handled disposition writes ONE line,
  * `server error: EADDRINUSE`, and the unhandled one writes a re-thrown
  * stack-trace report. So these cases assert the stderr exactly and reject the
  * crash markers by name. Anything weaker passes against the regression it is
@@ -2668,11 +2744,10 @@ describe('the EADDRINUSE disposition', () => {
       //
       // stderr must be EXACTLY the handled line and its newline. A test for
       // `output.includes('EADDRINUSE')` cannot distinguish the disposition this
-      // group exists to protect from the pre-feature crash it replaced:
-      // measured on this runtime, a listener with no `'error'` handler also
+      // group exists to protect from an unhandled `'error'` event: that also
       // exits 1, also writes nothing to stdout, and also contains the string
-      // `EADDRINUSE` — inside eleven lines of re-thrown stack trace. Only the
-      // exact comparison separates them.
+      // `EADDRINUSE`, inside a multi-line re-thrown stack trace. Only the exact
+      // comparison separates them.
       assert.deepStrictEqual(
         outputLines(refusedInstance.stderr),
         [HANDLED_BIND_ERROR_LINE],
@@ -2781,11 +2856,12 @@ describe('the EADDRINUSE disposition', () => {
  * both halves of the boundary.
  *
  * THE MECHANISM: the store path's PARENT DIRECTORY does not exist and is never
- * created, so the staging write and the rename both fail with `ENOENT`. This
- * is chosen over `fs.chmod` because `chmod` cannot make a directory unwritable
- * on Windows — it only toggles the read-only flag on files — and a
- * permission-based attempt would quietly do nothing, leaving these cases
- * passing for the wrong reason. A missing parent fails on every platform.
+ * created, so the staging write to `<store>.tmp` fails with `ENOENT` before the
+ * rename over the store is reached — `activity-store.js` awaits the two in that
+ * order, so the first refusal is the only one that happens. An absent parent is
+ * used because it fails that way on every platform, which a permission bit does
+ * not: on Windows `fs.chmod` reaches a file's read-only flag and cannot make a
+ * directory unwritable at all.
  * ========================================================================= */
 
 describe('the unwritable-store disposition', () => {
@@ -2988,11 +3064,9 @@ describe('the unwritable-store disposition', () => {
 /* ========================================================================= *
  * Leaving the host as it was found
  *
- * Declared last so it runs after every group has torn its instance down. An
- * orphan holding port 3000 is the single most expensive thing this file could
- * leave behind on a host where other work needs the same port, so the
- * condition is asserted rather than assumed — the suite-wide `after` hook
- * sweeps, and this case is the evidence that the sweep was not needed.
+ * The invariant this file closes on: no child it spawned is still tracked, and
+ * port 3000 is bindable again. An orphan would hold the port and fail whatever
+ * runs next on this host.
  * ========================================================================= */
 
 test(

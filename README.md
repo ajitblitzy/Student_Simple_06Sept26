@@ -178,7 +178,6 @@ Every JSON response is `application/json; charset=utf-8`; every HTML response is
 | `POST /activities` | `400` | `student_id_required` | `studentId` absent, `undefined`, or `null` | — |
 | `POST /activities` | `400` | `student_id_malformed` | `studentId` non-string, or fails `/^S\d{3}$/` | — |
 | `POST /activities` | `400` | `activity_invalid` | `activity` absent, non-string, empty after normalization, over 60 characters, or containing a control character | — |
-| `POST /activities` | `403` | `cross_origin_submission` | the browser reported the submission as coming from somewhere other than this service: an `Origin` that is `null`, unparseable, not `http:`, or whose host is not the host the request was addressed to, or a `Sec-Fetch-Site` of `same-site` or `cross-site` | — |
 | `POST /activities` | `404` | `student_not_found` | well-formed `studentId` absent from the key set | — |
 | `POST /activities` | `413` | `payload_too_large` | body over 8,192 bytes | — |
 | `POST /activities` | `415` | `unsupported_media_type` | `Content-Type` missing, **declared more than once**, or neither accepted type | — |
@@ -199,21 +198,27 @@ Only `POST /activities` with a **form-encoded** body renders HTML, and only for 
 validation outcomes a person filling in the form can act on — `student_id_required`,
 `student_id_malformed`, `activity_invalid` and `student_not_found` — shown as the form re-displayed
 with the offending field flagged. Every other outcome returns the JSON envelope in both modes:
-`403`, `413` and `415` are all decided before the body's format is known, an unresolved route has no
+`413` and `415` are both decided before the body's format is known, an unresolved route has no
 form context to re-display, and a `500` is a fault no amount of retyping fixes.
 
-**`403 cross_origin_submission`, and why a script is unaffected by it.** `POST /activities` changes
-stored state, and an HTML form can be made to submit across origins — a page on any other site can
-carry a form whose action is this service, and the browser that loads it will send the request.
-Nothing else here stands in the way: there is no authentication, session, cookie or token anywhere in
-the service, and the loopback bind is no defence, because the browser making such a request is itself
-on the loopback host. So a submission is refused when the browser's own `Origin` or `Sec-Fetch-Site`
-header says it came from somewhere other than this service. A request carrying **neither** header is
-accepted, which is deliberate: no browser omits `Origin` on a POST, so a request without one is not a
-browser form submission but `curl`, a script, or the test suite — every `curl` example in this
-document works unchanged, and none of them needs a token or a prior `GET`. What this check does
-**not** do is establish *who* is submitting; the Student ID remains self-asserted, exactly as the
-attribution section below describes.
+**Cross-site request forgery is an accepted risk here, not a controlled one.** `POST /activities`
+changes stored state, and a page on any other site can contain a form whose action is this service —
+the browser that loads that page will send the request, and nothing here tells it apart from the
+real form's submission, because it *is* a real form submission, of somebody else's form. There is
+no authentication, session, cookie or token anywhere in the service, and the loopback bind is no
+defence against this particular case, because the browser making such a request is itself on the
+loopback host. No `Origin`, `Sec-Fetch-Site`, referer or token check is applied on any route, so
+where a request says it came from takes no part in any decision this service makes. What does
+decide a response is what the rows above describe: the route and method, the media type, the body
+and its Student ID, and the state of the store and the workbook behind it — which is why the same
+submission is `201` the first time and `200` when repeated. Every `curl` example in this document
+therefore works unchanged, and none of them needs a token or a prior `GET`.
+
+What makes that acceptable is the pair of conditions the attribution section below states — the
+listener is confined to loopback and every record in the data is synthetic — and both are
+load-bearing. Before this surface is exposed off-host or used with real student records, request
+forgery protection becomes a **prerequisite** alongside identity verification, and it belongs with
+an authenticated design rather than as a header check on an endpoint that establishes no identity.
 
 ### The error envelope
 
@@ -350,15 +355,21 @@ agreement of the Student ID sets is an observed regularity, not a rule the data 
 Student ID a "primary key" therefore describes an intention; the mechanism is the validation that runs
 on every request before anything is persisted.
 
-That mechanism is **layered, and the layers answer to different callers**. The HTTP layer owns the
-*user-facing* check: it runs before the store is called at all, and it is the only place that can turn
-a bad reference into the `400`/`404` split above. The store then **revalidates independently**, because
-it is reachable by more than one caller and is backed by a file a person can edit — every write
-re-checks the Student ID's format *and* its membership of the key set before a record is appended, and
-every load re-checks both properties for every record already in the document, refusing the whole
-document with `500 store_unreadable` rather than serving one that names an unknown student. Neither
-layer relies on the other having run. That is why the HTTP check is not optional even though the store
-repeats it, and why a hand-edited store naming `S999` is refused instead of returned.
+That mechanism is **layered: three enforcement points, none of which relies on another having run.**
+
+1. The **request-time check** in the HTTP layer runs before the store is called at all. It is the only
+   one of the three that can turn a bad reference into the `400`/`404` split above.
+2. The **write guard** in the store re-checks the Student ID's format *and* its membership of the key
+   set before a record is appended, so a bad call cannot write a record the load check would then
+   refuse for good.
+3. The **load check** re-checks both properties for every record already in the document, on every
+   read, refusing the whole document with `500 store_unreadable` rather than serving one that names an
+   unknown student.
+
+The store revalidates on its own account because it is reachable by more than one caller and is backed
+by a file a person can edit. Its two checks answer with a `500`, though, never with the `400`/`404`
+split — that is why the request-time check is not optional even though the store repeats it, and why a
+hand-edited store naming `S999` is refused instead of returned.
 
 ### Provenance: why `source` exists
 
@@ -458,31 +469,97 @@ anywhere in this project.
   The staging path is *derived* from the resolved path, so the temp sibling follows `ACTIVITY_STORE`
   wherever it points and always sits in the same directory — hence on the same filesystem, which is
   what makes the rename atomic. With the default store path the staging file is `activities.json.tmp`.
+- The staging file is **created exclusively and never truncated in place**. The open is
+  `O_CREAT | O_EXCL | O_WRONLY`, plus `O_NOFOLLOW` on the platforms that define it — it is
+  `undefined` on Windows, where exclusive creation already refuses to open anything that exists,
+  link or not — with mode `0600`. So a file, a symbolic link or a hard link already sitting at the
+  staging path is never opened and never truncated: the name is unlinked, which removes *that name*
+  and never the file a link points at, and the staging file is re-created, for at most three attempts
+  before the write is refused as `500 store_write_failed` with the previous document left intact. The
+  opened descriptor is then proved to be a regular file carrying exactly one name — and, on POSIX,
+  owned by the account running the service and `chmod`ed to `0600` through the descriptor so the
+  umask cannot loosen it — the bytes are written through that same descriptor, and only then is it
+  renamed over the store. Because a stale staging file is removed and re-created rather than
+  truncated, it can no longer donate its permissions to the document that becomes the store.
+- On Windows that `0600` is **advisory**: the platform honours only the write bit, and the file
+  inherits the ACLs of the directory it is created in. There the directory *is* the access control,
+  which is why the setup below restricts it explicitly — that part is the operator's, not the
+  service's.
+- The store is **bounded, and no bound ever rewrites the file**. A store that is not a regular file,
+  that exceeds **2 MiB**, or that holds more than **5,000** activity records is refused with
+  `500 store_unreadable`, and in every one of those cases the file is left exactly as found — never
+  truncated, repaired or overwritten — so a hand edit that trips a ceiling is still there to correct.
+  A submission that would push the document past 5,000 records **or past 2 MiB once serialized** is
+  refused with `500 store_write_failed` before anything is staged, and the previous document stays
+  intact and readable; an idempotent repeat of an activity already recorded appends nothing and still
+  returns `200`, and reads keep working throughout. The write-side byte check is not redundant with
+  the record count: the 60-character label bound counts UTF-16 code units while the ceiling counts
+  UTF-8 bytes, so a document inside the record ceiling can still serialize past 2 MiB, and without
+  the check one accepted submission could publish a store that every later request refused. **The
+  service therefore never publishes a document its own loader would refuse on size** — because it
+  measures the bytes it is about to write, not because the two numbers are assumed to agree. Both
+  ceilings sit orders of magnitude above the ten-student workload the feature is for: they bound a
+  runaway, and cannot refuse a legitimate document.
 - It **may not name a protected file of this project**. The configured value is canonicalized once
-  at load — a relative form is resolved, and the comparison is case-insensitive on Windows and
-  macOS — and both it and the derived `.tmp` sibling are compared against every tracked file: the
-  three `.xlsx` workbooks, `LICENSE`, and the project's own source, test and configuration files. A
-  protected destination is refused at module load, before any store read or write, with a
-  `RangeError` carrying `code: 'E_STORE_PATH_PROTECTED'` that names `ACTIVITY_STORE` and the
-  protected file, so the service fails fast at startup instead of renaming a store document over
-  student data. The check exists because a write is a `rename` **over** the target: a mistyped
-  variable would not append to a workbook or to `LICENSE`, it would replace it. `activities.json`
-  and `activities.json.tmp` are of course still accepted — they are the default.
+  at load — a relative form is resolved first — and both it and the derived `.tmp` sibling are
+  compared against every tracked file: the three `.xlsx` workbooks, `LICENSE`, and the project's own
+  source, test and configuration files. What makes two names compare as one file depends on whether
+  the candidate already exists, and **the platform is not assumed either way**. A candidate that
+  exists is compared by **real-path identity** — the filesystem's own answer to which file this is,
+  which collapses an 8.3 short name, the on-disk casing, a symbolic link, a junction and a mapped
+  drive, with no case rule involved at all. Case folding applies **only** to the fallback for a
+  candidate that does not exist yet — the ordinary case for a store about to be created, where there
+  is nothing on disk to interrogate — and **only when a runtime probe reports that the filesystem
+  holding this project folds case**: the probe flips the case of the module's own file name and asks
+  whether that name still resolves beside it. A platform rule would be wrong in both directions here,
+  which is why it is measured rather than assumed: case-*sensitive* APFS and ReFS volumes exist, and a
+  case-insensitive volume can be mounted under Linux. So a case variant of a protected name is
+  refused where the filesystem itself treats the two names as one file, and a genuinely distinct name
+  is not refused for merely resembling one. A protected destination is refused at module load,
+  before any store read or write, with a `RangeError` carrying `code: 'E_STORE_PATH_PROTECTED'` that
+  names `ACTIVITY_STORE` and the protected file, so the service fails fast at startup instead of
+  renaming a store document over student data. The check exists because a write is a `rename`
+  **over** the target: a mistyped variable would not append to a workbook or to `LICENSE`, it would
+  replace it. `activities.json` and `activities.json.tmp` are of course still accepted — they are
+  the default.
 - The store is **deliberately untracked**. `.gitignore` covers `activities.json` and
   `activities.json.tmp`, and the store must **never** be committed: committed bytes remain
   recoverable from history indefinitely, so a real student record committed here could not be erased
   without rewriting history.
 
-Create a scratch directory **outside the checkout** and point the store at it:
+Create a **private** scratch directory **outside the checkout**, owned by the account that runs the
+service, and point the store at it. On POSIX, `mktemp -d` beneath a root the operator already owns is
+the form to copy: it returns a unique name nobody else can have pre-created, at mode `0700`.
 
 ```bash
-mkdir -p /tmp/student-simple-activities
-ACTIVITY_STORE=/tmp/student-simple-activities/activities.json npm start
+RUN="$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/student-simple-activities.XXXXXX")"
+chmod 700 "$RUN"          # mktemp -d already gives 0700; stated so a substituted directory keeps it
+ACTIVITY_STORE="$RUN/activities.json" npm start
 ```
 
-On Windows PowerShell the equivalents are
-`New-Item -ItemType Directory -Force C:\Temp\student-simple-activities` and
-`$env:ACTIVITY_STORE='C:\Temp\student-simple-activities\activities.json'; npm start`.
+On Windows PowerShell, use a unique directory under the user profile — not a shared one — created
+fresh, with inheritance broken and access granted to the current user alone:
+
+```powershell
+$Run = Join-Path $env:LOCALAPPDATA "student-simple-activities-$([guid]::NewGuid().ToString('n'))"
+New-Item -ItemType Directory -Path $Run | Out-Null
+icacls $Run /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
+$env:ACTIVITY_STORE = Join-Path $Run 'activities.json'
+npm start
+```
+
+The braces in `${env:USERNAME}` are load-bearing: written as `"$env:USERNAME:(OI)(CI)F"` the trailing
+colon is parsed as part of the variable path, the user name interpolates away, and `icacls` is handed
+a grant that never restricts anything.
+
+**A shared, fixed temporary path is not an acceptable store directory** — not
+`/tmp/student-simple-activities`, not `/var/tmp/student-simple-activities`, not
+`C:\Temp\student-simple-activities`, and not any other predictable name beneath a world-writable root.
+Such a name is guessable, so another local principal can be there first: pre-create the directory and
+read every record written into it, or leave a symbolic link or a junction at that name and decide
+where the store and its staging sibling actually land. The service never writes *through* a link at
+the staging path — it removes that name and creates its own file, as above — but nothing it can do
+from inside makes a world-writable parent directory private.
 
 Using a path outside the working tree is the recommended form. A store configured *inside* the
 checkout under a name other than the two the ignore policy covers would be staged by default, which
@@ -513,7 +590,10 @@ setting.
 **Port 3000 must be free** before the suite runs. `test/lifecycle.test.js` performs a `node:net`
 pre-flight probe that binds `127.0.0.1:3000` and immediately closes it; if the port is held the run
 fails fast and names the port and the error code, instead of surfacing an environment problem as a
-confusing assertion failure deep inside the suite.
+confusing assertion failure deep inside the suite. The probe runs in that file's `before` hook, so a
+held port fails that one group and cancels the cases behind it while the two port-free files still
+run and report normally, and `npm test` exits non-zero overall. Nothing in the code needs changing in
+that case: release whatever holds the port and run the suite again.
 
 The three test files and their division of labour:
 
@@ -535,9 +615,10 @@ the working tree.
 The command **verifies that rather than trusting it**, and it fails closed. It compares **filesystem
 identity** — device and inode, not path strings — and refuses to run if the evidence root is the
 worktree, sits anywhere beneath it, or is a shared directory such as `/tmp` itself. Identity is the
-load-bearing detail: this host is case-insensitive while Git Bash preserves whatever spelling the
-caller used, so `/TMP/...` and `/tmp/...` are the same directory under two different strings and a
-string comparison would let the second one through. Every refusal happens *before* any directory is
+load-bearing detail, because one directory can be named in more than one way: where the filesystem
+compares paths case-insensitively, `/TMP/...` and `/tmp/...` reach the same directory while the shell
+hands back whichever spelling the caller typed, and a symlink reaches it under a third name again. A
+string comparison lets every one of those through. Every refusal happens *before* any directory is
 created, because creating one inside the checkout is itself the contamination.
 
 That refusal is the containment mechanism: the ignore policy covers `coverage/` and `*.log`, but it
@@ -549,11 +630,11 @@ prune `EVIDENCE_ROOT` on whatever schedule suits.
 set -euo pipefail
 : "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a writable directory outside the checkout}"
 
-# Identity key for an existing directory: device:inode where the host reports it,
-# otherwise the case-folded physical path. Comparing path strings is not enough.
-# This host is case-insensitive while Git Bash preserves the caller's spelling, so
-# /TMP/... and /tmp/... are one directory under two different strings, and a string
-# compare would wave the second one through.
+# Identity key for an existing directory: device:inode where the filesystem reports
+# it, otherwise the case-folded physical path. Comparing path strings is not enough.
+# A case-insensitive filesystem resolves /TMP/... and /tmp/... to one directory, and
+# the shell returns whichever spelling the caller typed, so the same directory can
+# arrive as two different strings and a string compare would wave the second through.
 fold() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 dirkey() {
   local phys key
