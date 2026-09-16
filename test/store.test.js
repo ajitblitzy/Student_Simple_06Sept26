@@ -5057,15 +5057,15 @@ describe('the reader bounds the resources one package may consume', () => {
       zipLocalEntry(WORKSHEET_PART, worksheetXml(inlineStringCell('A1', 'Student ID'), 'A1:A1')),
     ]);
 
-    /* The ceiling used to be enforced once, against `fstat`, and the read that
-     * followed was unbounded. Those are two operations on a filesystem other
-     * processes can write to, so the size can be stale by the time the bytes
-     * are read — and a source that misreports its size defeats the check
-     * outright. Reproducing either for real from one synchronous thread is not
-     * possible, so the descriptor is made to report the stale number directly:
-     * zero, which is what several non-regular sources report, and a small
-     * value, which is what a file that has since grown reports. The file on
-     * disk is past the ceiling in both.
+    /* Enforcing the ceiling once, against `fstat`, and then reading without a
+     * bound would leave it defeatable two ways. Those are two operations on a
+     * filesystem other processes can write to, so the size can be stale by the
+     * time the bytes are read — and a source that misreports its size defeats
+     * the check outright. Reproducing either for real from one synchronous
+     * thread is not possible, so the descriptor is made to report the stale
+     * number directly: zero, which is what several non-regular sources report,
+     * and a small value, which is what a file that has since grown reports.
+     * The file on disk is past the ceiling in both.
      *
      * One mock, whose reported size the loop moves, because two overlapping
      * mocks of one method do not unwind in a defined order. `t.mock` restores
