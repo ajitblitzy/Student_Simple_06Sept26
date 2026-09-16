@@ -3,13 +3,16 @@
 # something this feature or its tests actually produce, and nothing more.
 # These rules prevent the accident, not the act: `git add -f` overrides them,
 # and a path's absence from `git status` says nothing about the index or history.
-# No blank lines here, deliberately: core.autocrlf=true checks this file out
-# with CRLF, and a blank CRLF line parses as a live empty pattern.
+# Stanzas are separated by bare `#` lines rather than blank lines - that is the
+# style this file uses, not a constraint: Git matches nothing on a blank line.
 #
 # Runtime activity store and its atomic-write staging sibling: submitted data
 # linked to Student IDs, written by the service, never committed, never
-# pre-created. Exact names, never an `activities*` glob, which would silently
-# un-track activities.js and activity-store.js. Default in-tree names only;
+# pre-created. Exact names, never an `activities*` glob: such a glob could not
+# un-track the committed activities.js and activity-store.js - ignore rules do
+# not apply to a path already in the index - but it would keep any new untracked
+# `activities*` path out of `git status` and out of a pathspec `git add .`,
+# which skips ignored files without saying so. Default in-tree names only;
 # ACTIVITY_STORE can move both outside the checkout.
 activities.json
 activities.json.tmp
@@ -18,6 +21,10 @@ activities.json.tmp
 node_modules/
 #
 # Test evidence: --experimental-test-coverage output and captured server logs.
+# Deliberately no pattern for the JUnit report the evidence command writes: that
+# artifact belongs outside this worktree entirely, and the command in README.md
+# enforces it by resolving EVIDENCE_ROOT and refusing to run unless it lands
+# outside the worktree, rather than relying on a pattern here to hide it.
 coverage/
 *.log
 #

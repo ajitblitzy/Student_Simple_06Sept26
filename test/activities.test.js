@@ -17,6 +17,17 @@
  * error code AND the `Content-Type`, plus `Allow` and `Location` wherever the
  * matrix says they are carried.
  *
+ * Every case runs against a store, a module chain and a listener of its OWN,
+ * handed to it by the per-case harness below, so no case can be affected by
+ * what ran before it and the file's cases can be read, reordered or run one at
+ * a time without changing what they mean.
+ *
+ * What the file deliberately leaves to `test/lifecycle.test.js` is the
+ * BYTE-LEVEL preserved response — the 34-byte body, its sha256 and the
+ * charset-free `text/plain` header — which that file owns and asserts against a
+ * real child process. Here the boundary is asserted as the predicate it is:
+ * `handle` declining a path and writing nothing at all.
+ *
  * WHY THIS FILE EXISTS
  * --------------------
  * The governing rule `Ajit_AddNewFeature_Rule` — summarized here, never
@@ -58,10 +69,14 @@
  * `../server` pulls in `../activities`, which pulls in `../activity-store`.
  *
  * So the environment variable is set here, above those requires, and not in a
- * `before` hook — a hook runs long after the module chain has already resolved
- * its path. Getting this order wrong makes the suite write into the working
- * tree, which is why the require of `node:fs` and the `mkdtempSync` below come
- * before the project requires rather than being grouped with them.
+ * hook — a hook runs long after the module chain has already resolved its
+ * path. Getting this order wrong makes the suite write into the working tree,
+ * which is why the require of `node:fs` and the `mkdtempSync` below come before
+ * the project requires rather than being grouped with them.
+ *
+ * Every CASE then gets a store path of its own, through a module chain of its
+ * own, from the per-case harness further down. The value set here is only what
+ * the LOAD-TIME chain resolves, and no case is ever driven through that chain.
  * ------------------------------------------------------------------------- */
 
 const fs = require('node:fs');
@@ -71,34 +86,63 @@ const path = require('node:path');
 /** One directory for every artifact this file creates. Removed in `after`. */
 const TEMPORARY_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'activities-test-'));
 
-/** The store the shared harness server writes. Absent until a case submits. */
-const PRIMARY_STORE_PATH = path.join(TEMPORARY_ROOT, 'activities.json');
+/**
+ * The store path the LOAD-TIME module chain resolves.
+ *
+ * Requiring the feature below resolves a store path whether a case uses it or
+ * not, so this must point inside the temporary root: otherwise the mere act of
+ * loading this file would aim the store at the repository root. Nothing writes
+ * it — no case is driven through the load-time chain, and each case writes the
+ * store its own harness resolved.
+ */
+const LOAD_TIME_STORE_PATH = path.join(TEMPORARY_ROOT, 'load-time-chain', 'activities.json');
 
-process.env.ACTIVITY_STORE = PRIMARY_STORE_PATH;
+process.env.ACTIVITY_STORE = LOAD_TIME_STORE_PATH;
 
-const { describe, it, before, after } = require('node:test');
+const { describe, it, before, beforeEach, afterEach, after } = require('node:test');
 const assert = require('node:assert');
+const crypto = require('node:crypto');
 const http = require('node:http');
 const fsp = require('node:fs/promises');
 
 /**
- * The module object, not a destructured `handle`. Holding the object is what
- * lets the `internal_error` case replace the property that `server.js` reads at
- * call time, and it is deliberately captured here so that a later
- * `freshModuleChain` swap cannot move this reference off the instance the
- * shared harness server closes over.
+ * The feature's module object, not a destructured `handle`. Holding the object
+ * is what lets the `internal_error` cases replace the property that `server.js`
+ * reads at call time.
+ *
+ * The binding is `let` and is REBOUND by the per-case harness to the chain the
+ * running case's own server closes over, so a patch applied inside a case
+ * reaches the server that case is driving rather than a chain nothing is
+ * listening on. This load-time value is only what holds until the first case
+ * starts.
  */
-const activities = require('../activities');
+let activities = require('../activities');
 
 /**
- * The real composed server. Safe to require: `server.js` wraps its `listen`
- * call in `if (require.main === module)`, so loading it binds no port.
+ * The real composed server, as the load-time chain built it. Safe to require:
+ * `server.js` wraps its `listen` call in `if (require.main === module)`, so
+ * loading it binds no port.
  *
  * Driving the real composition rather than a hand-rolled one matters twice
  * over: it is the code that actually ships, and the `internal_error` branch
- * lives in `server.js` and is reachable no other way.
+ * lives in `server.js` and is reachable no other way. Like `activities` above
+ * this binding tracks the active per-case chain; the load-time instance here is
+ * never listened on, so there is no load-time listener to close.
+ *
+ * The export surface is itself part of the contract: `server.js` exports
+ * exactly `server`, `hostname` and `port`, and the export-surface cases at the
+ * end of this file consume all three rather than leaving two of them unread.
+ * The hostname and the port are load-time literals that NO chain re-derives —
+ * `'127.0.0.1'` and `3000`, written as literals in `server.js` and never
+ * recomputed from a store path, an environment variable or a bound address —
+ * so destructuring them once here is what those two cases assert against. The
+ * `server` binding below is the one that must follow the active chain, which
+ * is why the case that pins the surface and the instance identity resolves the
+ * ACTIVE chain's module object for itself rather than reading this one.
  */
-const { server } = require('../server');
+const serverModule = require('../server');
+const { hostname: serviceHostname, port: servicePort } = serverModule;
+let server = serverModule.server;
 
 /* ------------------------------------------------------------------------- *
  * The contract's vocabulary, as constants rather than repeated literals
@@ -112,15 +156,6 @@ const CONTENT_TYPE_JSON = 'application/json; charset=utf-8';
 const CONTENT_TYPE_HTML = 'text/html; charset=utf-8';
 const MEDIA_TYPE_JSON = 'application/json';
 const MEDIA_TYPE_FORM = 'application/x-www-form-urlencoded';
-
-/**
- * The preserved fall-through response, byte for byte. The absent `charset`
- * parameter is deliberate and asserted: the legacy header carries none, and
- * every response the feature adds carries one.
- */
-const LEGACY_CONTENT_TYPE = 'text/plain';
-const LEGACY_BODY = 'Hello, World Welcome to Sharebot!\n';
-const LEGACY_BYTE_LENGTH = 34;
 
 /** The request-body ceiling, INCLUSIVE: this many bytes is read, one more is not. */
 const MAX_BODY_BYTES = 8192;
@@ -170,30 +205,74 @@ const SOURCE_WORKBOOK = 'workbook';
  * 64 KB, 200 KB, 1 MB, 5 MB and 20 MB alike. The difference is entirely in the
  * client's connection handling; the server sent its response in every case.
  *
- * The agent is destroyed in `after` BEFORE `server.close()`, because a pooled
- * socket left open would keep the listener alive and the runner would hang
- * instead of exiting. With that ordering, close completes in about a
- * millisecond and no `--test-force-exit` is needed.
+ * A pooled socket left open would keep a listener alive and the runner would
+ * hang instead of exiting, so every close in this file — the per-case listener
+ * in `afterEach`, an isolated one in its own `t.after` — drops its connections
+ * with `closeAllConnections()` before awaiting the close, and the agent itself
+ * is destroyed in the final `after`. With that ordering each close completes in
+ * about a millisecond and no `--test-force-exit` is needed.
  * ------------------------------------------------------------------------- */
 
 const agent = new http.Agent({ keepAlive: true, maxSockets: 8 });
 
-/** The shared harness server's ephemeral port, filled in by `before`. */
-let sharedPort = 0;
+/**
+ * The ceiling on a single request, in milliseconds.
+ *
+ * WITHOUT A CEILING THE SUITE CANNOT FAIL, IT CAN ONLY HANG: the runner's own
+ * per-test timeout defaults to Infinity, so a server that accepted a request
+ * and then answered nothing — a handler that never calls `end`, a body read
+ * that never settles — would leave the promise below pending for ever and take
+ * the whole run with it. Every settlement path disarms the timer, so the
+ * ceiling costs a cleared timeout per request and nothing else.
+ *
+ * The value is generous against the largest fixture this file sends (a 5 MB
+ * body over loopback, measured in milliseconds) and small against any wait a
+ * person would sit through. A case needing a different bound passes
+ * `deadlineMs`.
+ */
+const REQUEST_DEADLINE_MS = 20000;
+
+/**
+ * The case currently running, and the whole of what a helper needs to reach it.
+ *
+ * Installed by `beforeEach` and cleared by `afterEach`, so `null` here means no
+ * case is running. Subtests execute strictly one at a time, which is what makes
+ * a single mutable slot the right shape for this.
+ */
+let harness = null;
+
+/**
+ * The ephemeral port of the case currently running.
+ *
+ * Every request helper defaults to it, which is what lets a case say
+ * `postJson({ ... })` and reach its OWN isolated server without naming a port. A
+ * helper called with no case running fails loudly here rather than silently
+ * addressing whatever happened to be listening last.
+ *
+ * @returns {number} The running case's port.
+ */
+function activePort() {
+  assert.ok(
+    harness !== null,
+    'a request helper was called with no case harness running — every request must belong to a case'
+  );
+  return harness.port;
+}
 
 /**
  * Issues one request and resolves with the whole response.
  *
- * Rejects on a socket failure, so a request the server never answers surfaces
- * as a failed assertion rather than as a test that hangs until the runner's
- * ambient timeout. The one exception is a write error that arrives AFTER the
- * response has started: that is the server hanging up on a request it has
+ * Rejects on a socket failure AND on the deadline above, so a request the
+ * server never answers surfaces as a failed assertion rather than as a test
+ * that hangs for ever. The one exception is a write error that arrives AFTER
+ * the response has started: that is the server hanging up on a request it has
  * already refused, so the error is held back and raised only if the response
  * never completes.
  *
  * @param {{method?: string, target?: string, headers?: Record<string, string>,
- *   body?: string|Buffer, port?: number}} [options] `port` defaults to the
- *   shared harness server, so an isolated server is driven by passing its own.
+ *   body?: string|Buffer, port?: number, deadlineMs?: number}} [options] `port`
+ *   defaults to the running case's own server, so a second server inside a case
+ *   is driven by passing its own.
  * @returns {Promise<{status: number, headers: Record<string, string|string[]>,
  *   body: string}>} The status, the response headers, and the body as text.
  */
@@ -203,23 +282,39 @@ function request(options = {}) {
     target = '/',
     headers = {},
     body,
-    port: requestPort = sharedPort,
+    port: requestPort = activePort(),
+    deadlineMs = REQUEST_DEADLINE_MS,
   } = options;
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let responseStarted = false;
     let deferredError = null;
+    let deadline = null;
+
+    /**
+     * Clears the deadline. Called from BOTH settlement funnels below, which are
+     * between them the only ways out of this promise, so the timer cannot
+     * outlive the request that armed it.
+     */
+    const disarm = () => {
+      if (deadline !== null) {
+        clearTimeout(deadline);
+        deadline = null;
+      }
+    };
 
     const succeed = (value) => {
       if (!settled) {
         settled = true;
+        disarm();
         resolve(value);
       }
     };
     const failWith = (error) => {
       if (!settled) {
         settled = true;
+        disarm();
         reject(error);
       }
     };
@@ -255,6 +350,19 @@ function request(options = {}) {
           new Error(`${method} ${target} closed without delivering a response`)
       );
     });
+
+    deadline = setTimeout(() => {
+      // The rejection comes FIRST and the destroy second: destroying emits
+      // `error` and then `close`, and both are already no-ops once the promise
+      // has settled, so the reported failure names the deadline that was missed
+      // rather than the teardown that missing it caused. The destroy itself is
+      // not optional — an abandoned request would hold a pooled socket, and
+      // through it the listener, past the end of the case.
+      failWith(
+        new Error(`${method} ${target} did not complete within ${deadlineMs} ms`)
+      );
+      clientRequest.destroy();
+    }, deadlineMs);
 
     if (body !== undefined) {
       clientRequest.write(body);
@@ -347,20 +455,36 @@ function postFormBody(body, options = {}) {
 }
 
 /* ------------------------------------------------------------------------- *
- * Isolated servers, for the cases that need their own store state
+ * Per-case isolation: a store, a module chain and a listener for every case
  *
- * Four cases cannot share the harness store: one proves a read never CREATES
- * the file, and three need the store broken in a specific way. Each gets its
- * own directory and its own module chain, so no case can contaminate another
- * and none of them can disturb the shared harness.
+ * EVERY case in this file gets all three from the harness below, because a
+ * store shared across cases is shared state whichever way its labels are
+ * chosen: a case that fails part-way leaves its writes behind, a case that
+ * reads "the store" is reading whatever ran before it, and the file's cases
+ * stop being reorderable. Unique labels narrow that; they do not remove it.
+ *
+ * A handful of cases build a SECOND chain of their own on top of the harness,
+ * with `startIsolatedServer`: one needs a dependency substituted in the window
+ * between eviction and require, one needs a store path whose parent directory
+ * does not exist, and the rest own the whole lifetime of a deliberately broken
+ * store document. Each closes its own server in its own `t.after`, and the
+ * case's harness keeps serving alongside it, untouched.
  * ------------------------------------------------------------------------- */
 
 /**
- * The feature's module chain, in dependency order. Every one of these must be
- * evicted together: `activity-store.js` captures the store path at load, and
- * `activities.js` and `server.js` each capture the instance below them, so
- * re-requiring only the top of the chain would hand back a server still
- * pointing at the previous store.
+ * The COMPLETE eviction set for the feature's module chain.
+ *
+ * Every one of these must be evicted TOGETHER: `activity-store.js` captures the
+ * store path at load, and `activities.js` and `server.js` each capture the
+ * instance below them, so re-requiring only the top of the chain would hand
+ * back a server still pointing at the previous store.
+ *
+ * The listing order is incidental and is NOT the dependency order, which runs
+ * `xlsx-read` then `activity-store` then `activities` then `server`. Eviction
+ * does not depend on either order: deleting a cache entry cannot fail and
+ * cannot be observed by another module, and the `require` that follows rebuilds
+ * the chain in true dependency order by itself. Completeness is the only
+ * property this list has to have.
  */
 const FEATURE_MODULE_PATHS = Object.freeze([
   '../activity-store',
@@ -372,11 +496,13 @@ const FEATURE_MODULE_PATHS = Object.freeze([
 /**
  * Evicts the feature's modules and re-requires them against a new store path.
  *
- * The module-level `activities` and `server` captured at the top of this file
- * are unaffected: they are references to the ORIGINAL objects, and the shared
- * harness server closes over the original `activities` module object. So the
- * `internal_error` patch keeps working no matter how many isolated chains have
- * been built since.
+ * The returned `activities` is the SAME object the returned `server` closes
+ * over — `require('../server')` loads `../activities` on its way up, and the
+ * `require('../activities')` below reads that instance back out of the CommonJS
+ * registry rather than building a second one. That identity is what makes the
+ * `internal_error` patch observable: the harness rebinds this file's
+ * module-level `activities` to it, so patching the property reaches the very
+ * chain the case is driving.
  *
  * @param {string} storePath The store the new chain should resolve.
  * @param {() => void} [prepare] Runs AFTER the eviction and BEFORE the
@@ -399,7 +525,124 @@ function freshModuleChain(storePath, prepare) {
 }
 
 /**
- * Starts an isolated server on its own ephemeral port and its own store.
+ * The ceiling on binding one listener, in milliseconds.
+ *
+ * An ephemeral bind on loopback either succeeds or errors within microseconds,
+ * so this is not a wait anyone should ever observe — it exists so that a bind
+ * which does neither is a failed test instead of a suspended one.
+ */
+const LISTEN_DEADLINE_MS = 10000;
+
+/**
+ * Binds a server to an EPHEMERAL port and resolves with the port it was given.
+ *
+ * BOUNDED ON EVERY OUTCOME, which `listen(0, HOST, resolve)` is not: that form
+ * subscribes to success alone, so a listener error — a consumed `'error'` event
+ * that no longer terminates the process because `server.js` installs its own
+ * listener for exactly that reason — leaves setup pending instead of failing,
+ * and the run never reports anything at all. Here `'listening'` and `'error'`
+ * each remove the other, a deadline covers the case where neither arrives, and
+ * every failure path shuts down a listener that may already hold a partially
+ * initialized handle.
+ *
+ * The port is always 0. Taking a port as a parameter is exactly how this file
+ * would one day bind the literal 3000 that `test/lifecycle.test.js` owns, so it
+ * does not take one — and it asserts the outcome as well, because a structural
+ * guarantee worth having is worth checking once per bind.
+ *
+ * @param {import('node:http').Server} target The server to bind.
+ * @param {string} context What is being started, for the failure message.
+ * @returns {Promise<number>} The ephemeral port.
+ */
+function listenOnEphemeralPort(target, context) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let deadline = null;
+
+    const disarm = () => {
+      if (deadline !== null) {
+        clearTimeout(deadline);
+        deadline = null;
+      }
+    };
+
+    const succeed = (boundPort) => {
+      if (settled) return;
+      settled = true;
+      disarm();
+      resolve(boundPort);
+    };
+
+    const fail = (reason) => {
+      if (settled) return;
+      settled = true;
+      disarm();
+      // Best effort, and deliberately NOT awaited: a listener that failed to
+      // come up may still hold a handle that would keep the runner alive after
+      // the failure, but waiting on a close that might itself never call back
+      // would reintroduce the hang this helper exists to prevent.
+      target.close(() => {});
+      reject(new Error(`${context}: ${reason}`));
+    };
+
+    const onListening = () => {
+      target.off('error', onError);
+      const address = target.address();
+      const boundPort = address === null || typeof address === 'string' ? 0 : address.port;
+      if (boundPort <= 0) {
+        // A listener that came up on no TCP port at all would make every
+        // request in the case address nothing, and the first failure would be
+        // an unhelpful connection error rather than this one.
+        fail('came up without an ephemeral TCP port');
+        return;
+      }
+      if (boundPort === 3000) {
+        fail('bound the literal port 3000, which test/lifecycle.test.js owns');
+        return;
+      }
+      succeed(boundPort);
+    };
+
+    const onError = (error) => {
+      target.off('listening', onListening);
+      // The error CODE and nothing else: enough to tell a refused bind from a
+      // permissions failure, without putting a stack or a path into the
+      // runner's output.
+      fail(`listen failed with ${error.code ?? error.name}`);
+    };
+
+    target.once('listening', onListening);
+    target.once('error', onError);
+
+    deadline = setTimeout(() => {
+      target.off('listening', onListening);
+      target.off('error', onError);
+      fail(`listen neither succeeded nor failed within ${LISTEN_DEADLINE_MS} ms`);
+    }, LISTEN_DEADLINE_MS);
+
+    target.listen(0, HOST);
+  });
+}
+
+/**
+ * Closes a listener and drops the connections that would otherwise hold it.
+ *
+ * `close` waits for every open connection to end, and this file's client keeps
+ * its sockets alive on purpose, so without `closeAllConnections()` the callback
+ * never arrives and the runner hangs at the end of the case instead of exiting.
+ *
+ * @param {import('node:http').Server} target The server to close.
+ * @returns {Promise<void>} Settles when the listener is closed.
+ */
+async function closeServer(target) {
+  const closed = new Promise((resolve) => target.close(resolve));
+  target.closeAllConnections();
+  await closed;
+}
+
+/**
+ * Starts a SECOND server inside a case, on its own ephemeral port and its own
+ * store, for the cases that must prepare state before a chain loads.
  *
  * @param {string} storePath The store the isolated chain should resolve.
  * @param {() => void} [prepare] Passed through to `freshModuleChain`.
@@ -408,21 +651,25 @@ function freshModuleChain(storePath, prepare) {
  */
 async function startIsolatedServer(storePath, prepare) {
   const chain = freshModuleChain(storePath, prepare);
-  await new Promise((resolve) => chain.server.listen(0, HOST, resolve));
+  // Named by its case directory rather than by the store's absolute path: the
+  // name is what identifies the failure, and the path would put the filesystem
+  // layout into the runner's output for nothing.
+  const isolatedPort = await listenOnEphemeralPort(
+    chain.server,
+    `the isolated server for "${path.basename(path.dirname(storePath))}"`
+  );
 
   return {
-    port: chain.server.address().port,
+    port: isolatedPort,
     storePath,
     async stop() {
-      const closed = new Promise((resolve) => chain.server.close(resolve));
-      // Pooled keep-alive sockets would otherwise hold this listener open and
-      // `close` would never call back.
-      chain.server.closeAllConnections();
-      await closed;
-      // Leave the variable as the rest of the file expects to find it. The
-      // shared harness resolved its own path at load and is indifferent, but a
-      // later isolated chain reads this value's replacement, not this one.
-      process.env.ACTIVITY_STORE = PRIMARY_STORE_PATH;
+      await closeServer(chain.server);
+      // Put the variable back to what the RUNNING case's harness resolved, so a
+      // second isolated chain built later in the same case starts from the
+      // case's own store rather than from this one's. Between cases the value is
+      // irrelevant — `beforeEach` sets it again — but leaving a stale path in
+      // place would be a trap for the next chain built inside this case.
+      process.env.ACTIVITY_STORE = harness === null ? LOAD_TIME_STORE_PATH : harness.storePath;
     },
   };
 }
@@ -447,6 +694,110 @@ async function makeCaseDirectory(name) {
  * of that is asserted in one place so that no case can quietly settle for
  * matching a status alone.
  * ------------------------------------------------------------------------- */
+
+/**
+ * The fixed English sentence the matrix binds to each error code.
+ *
+ * The matrix does not merely require A message — it requires THE sentence for
+ * that code: fixed, not free text, not interpolated, and carrying no internal
+ * detail. Asserting only that some non-empty string arrived would pass on text
+ * that changed release to release, on a sentence written for a different code,
+ * and on text built from the submitted input the envelope is supposed never to
+ * reflect. So every sentence is stated here and compared exactly.
+ *
+ * These are RESTATED from the code that owns them rather than imported from
+ * it — `activities.js` exports only `handle`, and a test that read its
+ * expectations out of the implementation would agree with the implementation
+ * by construction, whatever the implementation said.
+ *
+ * One entry per code the feature can send, `internal_error` included: the
+ * rejection boundary in `server.js` answers with the SAME two-key envelope as
+ * every other failure, so the case that induces it goes through the shared
+ * `assertErrorEnvelope` like the rest and needs its sentence recorded here.
+ * That one sentence is restated from the frozen `500` body in `server.js`,
+ * the code that owns it; every other sentence is restated from the failure
+ * table in `activities.js`. Neither source is imported, for the reason above.
+ */
+const EXPECTED_MESSAGES = Object.freeze({
+  malformed_json: 'The request body could not be parsed as JSON.',
+  body_not_an_object: 'The request body must be a JSON object.',
+  student_id_required: 'A Student ID is required.',
+  student_id_malformed:
+    'A Student ID must be the letter S followed by exactly three digits, for example S001.',
+  activity_invalid:
+    'An activity must be a label of 1 to 60 characters and must not contain control characters.',
+  cross_origin_submission:
+    "A submission must be sent from this service's own form, not from another origin.",
+  student_not_found: 'No student exists with that Student ID.',
+  not_found: 'That resource does not exist.',
+  method_not_allowed: 'That method is not allowed for this resource.',
+  payload_too_large: 'The request body is larger than the 8192-byte limit.',
+  unsupported_media_type:
+    'A submission must be sent as application/x-www-form-urlencoded or application/json.',
+  reference_data_unavailable: 'The student reference data could not be read.',
+  store_unreadable: 'The activity store could not be read.',
+  store_write_failed: 'The activity could not be saved.',
+  internal_error:
+    'The request could not be completed because of an unexpected internal error.',
+});
+
+/**
+ * The sentence bound to one code, or a failed assertion naming the code that
+ * has none.
+ *
+ * A code with no recorded sentence is a hole in the expectation rather than a
+ * detail to skip: falling back to "any string" for an unmapped code would
+ * reintroduce exactly the weakness this map exists to remove.
+ *
+ * @param {string} expectedCode The error code the matrix specifies.
+ * @param {string} context The case name, for the failure message.
+ * @returns {string} The fixed sentence for that code.
+ */
+function expectedMessageFor(expectedCode, context) {
+  const message = EXPECTED_MESSAGES[expectedCode];
+  assert.ok(
+    message !== undefined,
+    `${context}: no fixed sentence is recorded for the code ${JSON.stringify(expectedCode)} — add it here from the failure table in activities.js`
+  );
+  return message;
+}
+
+/** The five characters the page escapes, and what each becomes. */
+const HTML_ENTITIES = Object.freeze({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+});
+
+/**
+ * Escapes text the way the page does, so an expectation can be stated in plain
+ * words and compared against the markup as served.
+ *
+ * Exactly one of the fixed sentences carries one of these characters today —
+ * the apostrophe in `cross_origin_submission` — which is exactly why the
+ * escaping is applied by the helper rather than baked into the map: a
+ * sentence that gains an `&` or an apostrophe keeps its expectation correct
+ * instead of turning into a false failure.
+ *
+ * @param {string} value The text to escape.
+ * @returns {string} The escaped text.
+ */
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, (character) => HTML_ENTITIES[character]);
+}
+
+/**
+ * A `<script>` open or close tag in ANY casing, with any whitespace after the
+ * `<`.
+ *
+ * HTML tag names are case-insensitive, so `<SCRIPT>`, `<ScRiPt>` and
+ * `< script>` all execute exactly as `<script>` does. A case-sensitive
+ * substring check for `'<script'` misses every one of them, which would let a
+ * genuine injection regression pass as clean.
+ */
+const SCRIPT_ELEMENT = /<\s*\/?\s*script/i;
 
 /**
  * Substrings that would mean a response leaked something internal.
@@ -476,6 +827,48 @@ const INTERNAL_DETAIL_MARKERS = Object.freeze([
 ]);
 
 /**
+ * Names a marker without reproducing it, where reproducing it would itself
+ * publish the detail this file is trying to keep out of its output.
+ *
+ * Two of the markers above are live filesystem paths, so a failure message
+ * quoting the marker verbatim would print the path regardless of what the
+ * response contained. Every other entry is a fixed, harmless token that is
+ * clearer quoted than described.
+ */
+const MARKER_DESCRIPTIONS = new Map([
+  [TEMPORARY_ROOT, 'the temporary root path'],
+  [process.cwd(), 'the working directory path'],
+]);
+
+/**
+ * @param {string} marker One entry from `INTERNAL_DETAIL_MARKERS`.
+ * @returns {string} A description safe to print.
+ */
+function describeMarker(marker) {
+  return MARKER_DESCRIPTIONS.get(marker) ?? JSON.stringify(marker);
+}
+
+/**
+ * Identifies a response body without reproducing a byte of it.
+ *
+ * A DETECTOR FOR LEAKED DETAIL MUST NOT PUBLISH THE LEAK IT FOUND. Test output
+ * is durable — the runner prints it, the JUnit reporter writes it to a file, and
+ * a retained failure artifact carries it onward — so a message that pasted the
+ * offending body in whole would hand every one of those the stack trace,
+ * filesystem path or store value that made the assertion fail in the first
+ * place. The byte length plus a truncated digest is enough to tell two failing
+ * responses apart, to recognize the same failure across runs, and to confirm a
+ * fix changed the body, while carrying none of its content.
+ *
+ * @param {string} body The body to summarize.
+ * @returns {string} A safe, bounded description of the body.
+ */
+function bodyFingerprint(body) {
+  const digest = crypto.createHash('sha256').update(body, 'utf8').digest('hex');
+  return `${Buffer.byteLength(body)} bytes, sha256:${digest.slice(0, 12)}`;
+}
+
+/**
  * Asserts a response body carries no stack trace, filesystem path or other
  * internal detail.
  *
@@ -485,9 +878,11 @@ const INTERNAL_DETAIL_MARKERS = Object.freeze([
  */
 function assertNoInternalDetail(body, context) {
   for (const marker of INTERNAL_DETAIL_MARKERS) {
-    assert.ok(
-      !body.includes(marker),
-      `${context}: the response must not leak internal detail, but it contains ${JSON.stringify(marker)}: ${body}`
+    // Guarded rather than asserted, so the failure message — and the digest it
+    // carries — is built only for a body that actually failed.
+    if (!body.includes(marker)) continue;
+    assert.fail(
+      `${context}: the response must not leak internal detail, but it contains ${describeMarker(marker)} (${bodyFingerprint(body)})`
     );
   }
 }
@@ -508,13 +903,20 @@ function parseJsonResponse(response, context) {
   try {
     return JSON.parse(response.body);
   } catch (error) {
-    return assert.fail(`${context}: body was not valid JSON (${error.message}): ${response.body}`);
+    // Neither the body nor the parser's own message: `JSON.parse` quotes the
+    // offending input back at you, so re-emitting its message would leak the
+    // body through the back door. The error's NAME, the status and the
+    // fingerprint identify the response without publishing it.
+    return assert.fail(
+      `${context}: body was not valid JSON (${error.name}) — status ${response.status}, ${bodyFingerprint(response.body)}`
+    );
   }
 }
 
 /**
  * Asserts the full error envelope: status, JSON content type, exactly the two
- * keys, the code, a non-empty fixed sentence, and no leaked internal detail.
+ * keys, the code, the FIXED sentence bound to that code, and no leaked
+ * internal detail.
  *
  * @param {object} response A response from `request`.
  * @param {number} expectedStatus The status the matrix specifies.
@@ -533,8 +935,51 @@ function assertErrorEnvelope(response, expectedStatus, expectedCode, context) {
   );
   assert.strictEqual(payload.error, expectedCode, `${context}: error code`);
   assert.strictEqual(typeof payload.message, 'string', `${context}: message is a string`);
-  assert.ok(payload.message.length > 0, `${context}: message is non-empty`);
+  // The exact sentence, not merely a non-empty one. Truthiness would accept
+  // text that drifted, text belonging to another code, and text assembled from
+  // the submitted input — the three things "a fixed sentence per code" rules
+  // out and the only three a reader of this envelope has no way to detect.
+  assert.strictEqual(
+    payload.message,
+    expectedMessageFor(expectedCode, context),
+    `${context}: the message must be the fixed sentence bound to ${expectedCode}`
+  );
   assertNoInternalDetail(response.body, context);
+
+  return payload;
+}
+
+/**
+ * Asserts a success envelope: status, JSON content type, exactly the two
+ * top-level keys, and the `created` flag.
+ *
+ * Used for EVERY JSON success outcome rather than the `201` alone. The `200`
+ * branches — a repeat of a submission and a label already on the student
+ * record — are the ones a third key would most plausibly appear on, since both
+ * describe something that did NOT happen and invite an explanatory field the
+ * matrix does not define.
+ *
+ * @param {object} response A response from `request`.
+ * @param {number} expectedStatus `201` for a created record, `200` for one
+ *   already on record.
+ * @param {boolean} expectedCreated The `created` flag the matrix specifies.
+ * @param {string} context The case name.
+ * @returns {object} The parsed payload.
+ */
+function assertSuccessEnvelope(response, expectedStatus, expectedCreated, context) {
+  assert.strictEqual(response.status, expectedStatus, `${context}: status`);
+  const payload = parseJsonResponse(response, context);
+
+  assert.deepStrictEqual(
+    Object.keys(payload).sort(),
+    ['created', 'record'],
+    `${context}: the success envelope must carry exactly "created" and "record" — no third key`
+  );
+  assert.strictEqual(
+    payload.created,
+    expectedCreated,
+    `${context}: created is ${expectedCreated}`
+  );
 
   return payload;
 }
@@ -559,21 +1004,27 @@ function assertHtmlPage(response, expectedStatus, context) {
     response.body.startsWith('<!DOCTYPE html>'),
     `${context}: expected a complete HTML document`
   );
+  // Case-insensitive, because `<SCRIPT>` and `< script>` are the same element
+  // to a browser as `<script>` is, and a substring check for the lowercase
+  // spelling alone would clear a page carrying either.
   assert.ok(
-    !response.body.includes('<script'),
-    `${context}: the page must carry no client-side script`
+    !SCRIPT_ELEMENT.test(response.body),
+    `${context}: the page must carry no client-side script, in any casing`
   );
   return response.body;
 }
 
 /**
  * Asserts a form-mode validation failure: the HTML page, in its error state,
- * naming the same code the JSON envelope would have carried.
+ * carrying the same fixed SENTENCE and the same code the JSON envelope would
+ * have carried.
  *
- * A person reading the page and a script reading the envelope get the same
- * diagnosis in the same words, which is the property worth pinning — and the
- * code in the page is what makes the assertion specific rather than merely
- * "some error was rendered".
+ * "The same diagnosis in the same words" is the property worth pinning, and the
+ * words are the load-bearing half of it: a page that printed only the machine
+ * code would satisfy a code check while telling the person reading it nothing,
+ * and a page that invented its own phrasing would give a submitter and a
+ * script two descriptions to reconcile. The sentence comes from the same map
+ * the JSON assertion uses, escaped as the page escapes every dynamic value.
  *
  * @param {object} response A response from `request`.
  * @param {number} expectedStatus The status the matrix specifies.
@@ -588,32 +1039,14 @@ function assertHtmlFailure(response, expectedStatus, expectedCode, context) {
     `${context}: the page must name the same code the API uses (${expectedCode})`
   );
   assert.ok(
+    markup.includes(escapeHtml(expectedMessageFor(expectedCode, context))),
+    `${context}: the page must carry the same fixed sentence the JSON envelope carries for ${expectedCode}`
+  );
+  assert.ok(
     markup.includes('class="error"'),
     `${context}: the page must be in its error state`
   );
   return markup;
-}
-
-/**
- * Asserts the preserved fall-through response, byte for byte.
- *
- * @param {object} response A response from `request`.
- * @param {string} context The case name.
- * @returns {void}
- */
-function assertLegacyResponse(response, context) {
-  assert.strictEqual(response.status, 200, `${context}: the legacy status`);
-  assert.strictEqual(
-    response.headers['content-type'],
-    LEGACY_CONTENT_TYPE,
-    `${context}: the legacy header carries NO charset parameter`
-  );
-  assert.strictEqual(response.body, LEGACY_BODY, `${context}: the legacy body, verbatim`);
-  assert.strictEqual(
-    Buffer.byteLength(response.body),
-    LEGACY_BYTE_LENGTH,
-    `${context}: the legacy body is exactly ${LEGACY_BYTE_LENGTH} bytes`
-  );
 }
 
 /**
@@ -751,29 +1184,108 @@ async function assertStillServing(context, options = {}) {
 }
 
 /* ------------------------------------------------------------------------- *
- * The shared harness
+ * The per-case harness
+ *
+ * `beforeEach` at the top level of the file runs before EVERY leaf case,
+ * recursively through every `describe` below it, and cases run strictly one at
+ * a time. So one hook is enough to give all of them a store, a module chain and
+ * a listener of their own, and no case has to ask for isolation to get it —
+ * which is what keeps the isolation from decaying as cases are added.
+ *
+ * Rebuilding the chain per case is what makes the isolation real rather than
+ * cosmetic: `activity-store.js` resolves its store path at load and caches the
+ * workbook key set, the seed snapshot and its write mutex in module state, so a
+ * case sharing that instance inherits every one of them. Measured at about
+ * 1.6 ms per case on the pinned runtime — an eviction, four requires, a bind
+ * and a close — against a file that runs in well under a second.
  * ------------------------------------------------------------------------- */
 
-before(async () => {
-  await new Promise((resolve) => server.listen(0, HOST, resolve));
-  sharedPort = server.address().port;
+/** Numbers the case directories, so two cases with one name cannot collide. */
+let caseSequence = 0;
 
-  assert.ok(sharedPort > 0, 'the harness must have been given an ephemeral port');
-  assert.notStrictEqual(
-    sharedPort,
-    3000,
-    'this file must never bind the literal port 3000 — test/lifecycle.test.js owns it'
+/**
+ * Turns a case name into a unique, filesystem-safe directory name, advancing
+ * the sequence above as it goes.
+ *
+ * The name is carried into the path rather than being replaced by the counter
+ * alone, because a store left behind by a failing case is only useful evidence
+ * if its directory says which case wrote it. The counter is what makes it
+ * unique, since two cases may legitimately share a name.
+ *
+ * @param {string} caseName The running case's name.
+ * @returns {string} A unique directory name under the temporary root.
+ */
+function caseDirectoryName(caseName) {
+  caseSequence += 1;
+  const slug = caseName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return `case-${String(caseSequence).padStart(3, '0')}-${slug}`;
+}
+
+/**
+ * Builds one case's harness: its own directory, store path, module chain and
+ * listener on an ephemeral port.
+ *
+ * The store file itself is NOT created — an absent store is the first-use state
+ * every case should start from, and a pre-created empty document would be a
+ * valid one, which would suppress seeding and hide the workbook's labels.
+ *
+ * @param {string} caseName The running case's name.
+ * @returns {Promise<{port: number, storePath: string,
+ *   server: import('node:http').Server}>} The running case's harness.
+ */
+async function startCaseHarness(caseName) {
+  const directory = await makeCaseDirectory(caseDirectoryName(caseName));
+  const storePath = path.join(directory, 'activities.json');
+  const chain = freshModuleChain(storePath);
+
+  // The module-level bindings follow the ACTIVE chain. Without this the
+  // `internal_error` cases would patch a module object no listening server
+  // closes over, and would pass while proving nothing.
+  activities = chain.activities;
+  server = chain.server;
+
+  const port = await listenOnEphemeralPort(server, `the harness for "${caseName}"`);
+  return { port, storePath, server };
+}
+
+before(() => {
+  // Asserted once, here, rather than per case: `mkdtempSync` fixed the root at
+  // load and every case directory is created inside it, so one check covers
+  // every artifact the file will write. Nothing this suite creates may land in
+  // the checkout — a store written there would be an untracked file in a
+  // repository whose ignore policy names only the two default store paths.
+  const escape = path.relative(path.join(__dirname, '..'), TEMPORARY_ROOT);
+  assert.ok(
+    escape.startsWith('..') || path.isAbsolute(escape),
+    'every artifact this suite writes must live outside the checkout'
   );
 });
 
-after(async () => {
-  // Order matters: pooled sockets first, then the listener, or `close` never
-  // calls back and the runner hangs instead of exiting on its own.
-  agent.destroy();
-  const closed = new Promise((resolve) => server.close(resolve));
-  server.closeAllConnections();
-  await closed;
+beforeEach(async (t) => {
+  harness = await startCaseHarness(t.name);
+});
 
+afterEach(async () => {
+  const finished = harness;
+  // Cleared BEFORE the close is awaited, so a helper called after the case has
+  // ended fails on `activePort` rather than addressing a closing listener.
+  harness = null;
+  if (finished !== null) {
+    await closeServer(finished.server);
+  }
+  process.env.ACTIVITY_STORE = LOAD_TIME_STORE_PATH;
+});
+
+after(async () => {
+  // Every listener was closed by `afterEach` and the load-time chain never
+  // bound one, so all that is left is the client's own socket pool: an idle
+  // pooled socket holds the event loop open, and the runner would sit there
+  // instead of exiting on its own.
+  agent.destroy();
   await fsp.rm(TEMPORARY_ROOT, { recursive: true, force: true });
 });
 
@@ -862,10 +1374,20 @@ describe('GET /activities — the submission form', () => {
     // the endpoint's accepted media type are the same thing. And the flat
     // repository root gains no static asset: the page is a template literal, so
     // there is nothing to fetch.
-    for (const forbidden of ['<script', '<link', 'src=', '@import', 'url(']) {
+    //
+    // Every pattern is case-insensitive: HTML element and attribute names are,
+    // so `<LINK>` and `SRC=` would fetch exactly as their lowercase spellings
+    // do while sailing past a lowercase substring check.
+    for (const [description, pattern] of [
+      ['a script element', SCRIPT_ELEMENT],
+      ['a link element', /<\s*link/i],
+      ['an asset-fetching src attribute', /\bsrc\s*=/i],
+      ['a CSS @import', /@import/i],
+      ['a CSS url() reference', /url\s*\(/i],
+    ]) {
       assert.ok(
-        !markup.includes(forbidden),
-        `${context}: the page must not contain ${JSON.stringify(forbidden)}`
+        !pattern.test(markup),
+        `${context}: the page must not contain ${description} (${pattern})`
       );
     }
   });
@@ -891,12 +1413,235 @@ describe('GET /activities — the submission form', () => {
 
 
 /* ========================================================================= *
+ * The rendered page — its inventory, its stylesheet, and its error wiring
+ *
+ * The page is specified down to its contents and its literal style values, so
+ * these cases pin it as those things rather than as "some markup came back".
+ * Three properties, each of which a well-meaning edit breaks silently:
+ *
+ *   The INVENTORY is a heading, two labelled fields, a submit button, and the
+ *   outcome text of whichever state is being rendered. Prose beyond that is
+ *   content nobody asked for, and it is invisible in a diff review once the
+ *   page has grown to a hundred lines.
+ *
+ *   The STYLESHEET is a fixed list of sixteen declarations resolving to six
+ *   colours, and every value in it is authorized individually. A shorthand is
+ *   the easy way to introduce a literal nobody approved — `border` smuggles in
+ *   a width and a style keyword alongside the one colour that was specified —
+ *   so the declarations are compared as a LIST rather than merely counted.
+ *
+ *   The ERROR WIRING must connect the reason to the field. `aria-invalid` on
+ *   its own says only THAT a field is wrong; a screen-reader user who tabs
+ *   straight to it then hears "invalid" and no reason, because the sentence
+ *   explaining it sits above the form and is never announced with the control.
+ * ========================================================================= */
+
+describe('the rendered page — inventory, stylesheet and error association', () => {
+  /** The sixteen authorized declarations, in the order the page emits them. */
+  const AUTHORIZED_DECLARATIONS = Object.freeze([
+    ['font-family', 'system-ui, sans-serif'],
+    ['color', '#1a1a1a'],
+    ['background-color', '#ffffff'],
+    ['max-width', '32rem'],
+    ['margin', '2rem auto'],
+    ['padding', '0 1rem'],
+    ['margin-bottom', '0.25rem'],
+    ['width', '100%'],
+    ['padding', '0.5rem'],
+    ['border-color', '#767676'],
+    ['background-color', '#1a4f8b'],
+    ['color', '#ffffff'],
+    ['padding', '0.5rem 1rem'],
+    ['border-radius', '4px'],
+    ['color', '#b3261e'],
+    ['color', '#146c2e'],
+  ]);
+
+  /**
+   * The page's single inline stylesheet.
+   *
+   * @param {string} markup A served page.
+   * @param {string} context The case name.
+   * @returns {string} The text between the one `<style>` pair.
+   */
+  function styleBlockOf(markup, context) {
+    const blocks = markup.match(/<style>([\s\S]*?)<\/style>/g) ?? [];
+    assert.strictEqual(
+      blocks.length,
+      1,
+      `${context}: exactly one inline <style> block, so a later migration to tokens has one site to change`
+    );
+    return blocks[0];
+  }
+
+  /**
+   * Every `property: value` pair in a stylesheet, in source order.
+   *
+   * @param {string} styleBlock The stylesheet text.
+   * @returns {Array<[string, string]>} The declarations.
+   */
+  function declarationsOf(styleBlock) {
+    return [...styleBlock.matchAll(/([a-z-]+)\s*:\s*([^;]+);/g)].map(([, property, value]) => [
+      property,
+      value.trim(),
+    ]);
+  }
+
+  it('places nothing between the heading and the form on the empty page', async () => {
+    const context = 'GET /activities page inventory';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // Asserted as adjacency rather than as the absence of one sentence: any
+    // prose added between the two would break this, whatever it said.
+    assert.ok(
+      markup.includes('<h1>Add an extracurricular activity</h1>\n    <form method="post"'),
+      `${context}: the form follows the heading directly, with no instructional prose between them`
+    );
+
+    // Three paragraphs, each wrapping a control group. The page carries no
+    // standalone paragraph of its own until a state supplies outcome text.
+    const paragraphs = markup.match(/<p[\s>]/g) ?? [];
+    assert.strictEqual(
+      paragraphs.length,
+      3,
+      `${context}: exactly three <p> elements — the two fields and the button — not ${paragraphs.length}`
+    );
+  });
+
+  it('adds exactly one paragraph, the outcome text, when a state has something to say', async () => {
+    const context = 'POST /activities form-encoded failure page inventory';
+    const markup = assertHtmlFailure(
+      await postForm('S0012', 'Chess Club'),
+      400,
+      'student_id_malformed',
+      context
+    );
+
+    const paragraphs = markup.match(/<p[\s>]/g) ?? [];
+    assert.strictEqual(
+      paragraphs.length,
+      4,
+      `${context}: the three control groups plus the message, and nothing else`
+    );
+  });
+
+  it('serves exactly the sixteen authorized declarations, in order', async () => {
+    const context = 'GET /activities stylesheet';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    assert.deepStrictEqual(
+      declarationsOf(styleBlockOf(markup, context)),
+      AUTHORIZED_DECLARATIONS.map((pair) => [...pair]),
+      `${context}: every declaration and every value is authorized individually, so an extra property or an unlisted literal is a deviation`
+    );
+  });
+
+  it('resolves to exactly six unique colours', async () => {
+    const context = 'GET /activities stylesheet colours';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+    const styleBlock = styleBlockOf(markup, context);
+
+    const colours = new Set(styleBlock.match(/#[0-9a-f]{3,8}/g) ?? []);
+    assert.deepStrictEqual(
+      [...colours].sort(),
+      ['#146c2e', '#1a1a1a', '#1a4f8b', '#767676', '#b3261e', '#ffffff'],
+      `${context}: six unique colours, with #ffffff serving both the page background and the button text`
+    );
+  });
+
+  it('styles the input border with the authorized colour and no shorthand literals', async () => {
+    const context = 'GET /activities input border';
+    const styleBlock = styleBlockOf(assertHtmlPage(await get(NAMESPACE), 200, context), context);
+
+    // The inventory authorizes one value for this border: the colour. A
+    // shorthand would add a width and a style keyword that nothing authorized.
+    assert.ok(
+      styleBlock.includes('border-color: #767676;'),
+      `${context}: the border is declared as its authorized colour`
+    );
+    for (const unauthorized of ['border:', '1px', 'solid']) {
+      assert.ok(
+        !styleBlock.includes(unauthorized),
+        `${context}: the stylesheet must not contain the unauthorized literal ${JSON.stringify(unauthorized)}`
+      );
+    }
+  });
+
+  it('binds the invalid field to the message that explains it', async () => {
+    const context = 'POST /activities form-encoded failure association';
+    const markup = assertHtmlFailure(
+      await postForm('S0012', 'Chess Club'),
+      400,
+      'student_id_malformed',
+      context
+    );
+
+    const described = markup.match(/aria-describedby="([^"]+)"/g) ?? [];
+    assert.strictEqual(
+      described.length,
+      1,
+      `${context}: exactly the offending field is described — pointing every input at the same message would announce a Student ID error while the activity field was focused`
+    );
+
+    const messageId = /aria-describedby="([^"]+)"/.exec(markup)[1];
+    assert.ok(
+      markup.includes(`<p id="${messageId}" class="error">`),
+      `${context}: the reference resolves to the error message element, so the reason is announced with the control`
+    );
+    assert.ok(
+      new RegExp(`name="studentId"[^>]*aria-invalid="true"[^>]*aria-describedby="${messageId}"`).test(
+        markup
+      ),
+      `${context}: the Student ID input carries both the flag and the reference`
+    );
+    assert.ok(
+      !/name="activity"[^>]*aria-(invalid|describedby)/.test(markup),
+      `${context}: the field that was fine carries neither attribute`
+    );
+  });
+
+  it('leaves no dangling aria reference in any page state', async () => {
+    const context = 'aria references resolve in every state';
+
+    const states = [
+      ['the empty form', assertHtmlPage(await get(NAMESPACE), 200, context)],
+      [
+        'the confirmation page',
+        assertHtmlPage(await postForm('S004', 'Aria Wiring Club'), 201, context),
+      ],
+      [
+        'the failure page',
+        assertHtmlFailure(await postForm('S0012', 'Chess Club'), 400, 'student_id_malformed', context),
+      ],
+    ];
+
+    for (const [state, markup] of states) {
+      for (const [, referenced] of markup.matchAll(/aria-describedby="([^"]+)"/g)) {
+        assert.ok(
+          markup.includes(`id="${referenced}"`),
+          `${context}: ${state} references ${referenced}, which must exist on the page`
+        );
+      }
+      // Nothing is invalid on a success page, so nothing may claim to be.
+      if (state !== 'the failure page') {
+        assert.ok(
+          !markup.includes('aria-invalid'),
+          `${context}: ${state} flags no field as invalid`
+        );
+      }
+    }
+  });
+});
+
+
+/* ========================================================================= *
  * POST /activities — the success paths
  *
- * These cases WRITE, so each one owns a label no other case submits, and the
- * multi-step cases perform both steps themselves rather than relying on a
- * predecessor. The shared store begins every run absent, because the temporary
- * root is freshly created at load, so nothing carries over between runs either.
+ * These cases WRITE, so each performs every step of its own flow rather than
+ * relying on a predecessor — and each runs against a store of its own, created
+ * absent by the per-case harness, so nothing carries over between cases or
+ * between runs. The distinct labels below are for legibility now rather than
+ * for isolation; the harness owns that.
  * ========================================================================= */
 
 describe('POST /activities — accepting a submission', () => {
@@ -911,13 +1656,7 @@ describe('POST /activities — accepting a submission', () => {
       `${context}: Location names the student's collection`
     );
 
-    const payload = parseJsonResponse(response, context);
-    assert.deepStrictEqual(
-      Object.keys(payload).sort(),
-      ['created', 'record'],
-      `${context}: the success envelope is exactly created and record`
-    );
-    assert.strictEqual(payload.created, true, `${context}: created is true`);
+    const payload = assertSuccessEnvelope(response, 201, true, context);
     assertSubmissionRecord(payload.record, KNOWN_STUDENT_ID, 'Chess Club', context);
   });
 
@@ -931,15 +1670,16 @@ describe('POST /activities — accepting a submission', () => {
     assertIsoUtcInstant(originalTimestamp, context);
 
     const repeat = await postJson({ studentId: KNOWN_STUDENT_ID, activity: label });
-    assert.strictEqual(repeat.status, 200, `${context}: a repeat is 200, not 201`);
     assert.strictEqual(
       repeat.headers.location,
       undefined,
       `${context}: Location is sent only with the 201`
     );
 
-    const payload = parseJsonResponse(repeat, context);
-    assert.strictEqual(payload.created, false, `${context}: created is false`);
+    // The same exact-key envelope the 201 gets: this branch reports something
+    // that did NOT happen, which is where an extra explanatory field would
+    // most plausibly appear.
+    const payload = assertSuccessEnvelope(repeat, 200, false, `${context}: a repeat is 200, not 201`);
     assertSubmissionRecord(payload.record, KNOWN_STUDENT_ID, label, context);
     // The exact original instant, not merely some timestamp: a re-stamped
     // record would mean the store had been rewritten on a no-op submission.
@@ -958,10 +1698,13 @@ describe('POST /activities — accepting a submission', () => {
     assert.strictEqual(created.status, 201, `${context}: the original casing creates`);
 
     const variant = await postJson({ studentId: KNOWN_STUDENT_ID, activity: 'sailing club' });
-    assert.strictEqual(variant.status, 200, `${context}: a case variant is recognized, not appended`);
 
-    const payload = parseJsonResponse(variant, context);
-    assert.strictEqual(payload.created, false, `${context}: created is false`);
+    const payload = assertSuccessEnvelope(
+      variant,
+      200,
+      false,
+      `${context}: a case variant is recognized, not appended`
+    );
     assert.strictEqual(
       payload.record.activity,
       stored,
@@ -978,10 +1721,13 @@ describe('POST /activities — accepting a submission', () => {
     const seeded = SEEDED_LABELS[KNOWN_STUDENT_ID];
 
     const response = await postJson({ studentId: KNOWN_STUDENT_ID, activity: seeded });
-    assert.strictEqual(response.status, 200, `${context}: nothing is added for a label already on record`);
 
-    const payload = parseJsonResponse(response, context);
-    assert.strictEqual(payload.created, false, `${context}: created is false`);
+    const payload = assertSuccessEnvelope(
+      response,
+      200,
+      false,
+      `${context}: nothing is added for a label already on record`
+    );
     // An import must stay distinguishable from a submission: a label sitting in
     // a spreadsheet was not necessarily submitted by anyone, so no timestamp is
     // invented for it.
@@ -1009,13 +1755,38 @@ describe('POST /activities — accepting a submission', () => {
     const label = 'Archery Club';
 
     const first = await postForm('S002', label);
-    assertHtmlPage(first, 201, `${context} (first)`);
+    const firstMarkup = assertHtmlPage(first, 201, `${context} (first)`);
+    // Captured so the repeat can be told apart from it rather than merely
+    // shown to mention the label, which both pages do.
+    assert.ok(
+      firstMarkup.includes(`Recorded ${label} for S002.`),
+      `${context}: the 201 confirms that the activity WAS recorded`
+    );
 
     const repeat = await postForm('S002', label);
     const markup = assertHtmlPage(repeat, 200, context);
+
+    // Only a 201 may carry Location. A 200 created nothing, so a Location
+    // pointing at the student's collection would be announcing a resource this
+    // request did not bring into existence.
+    assert.strictEqual(
+      repeat.headers.location,
+      undefined,
+      `${context}: Location is sent only with the 201, never with the already-recorded 200`
+    );
+
+    // The page must SAY that the activity already existed and that nothing was
+    // added. Asserting only that the label appears would pass on the 201
+    // confirmation, on the empty form with the value pre-filled, and on any
+    // page that happened to mention it — none of which tells the submitter
+    // what became of their submission.
     assert.ok(
-      markup.includes(label),
-      `${context}: the already-recorded page names the activity`
+      markup.includes(`${label} was already submitted for S002, so nothing was added.`),
+      `${context}: the page states the activity was already submitted and nothing was added`
+    );
+    assert.ok(
+      !markup.includes(`Recorded ${label} for S002.`),
+      `${context}: and it is NOT the 201 confirmation wording`
     );
   });
 
@@ -1033,8 +1804,12 @@ describe('POST /activities — accepting a submission', () => {
     });
     const after = Date.now();
 
-    assert.strictEqual(response.status, 201, `${context}: the submission is accepted`);
-    const record = parseJsonResponse(response, context).record;
+    const record = assertSuccessEnvelope(
+      response,
+      201,
+      true,
+      `${context}: the submission is accepted`
+    ).record;
 
     // Provenance cannot be forged from the request body: both fields are set by
     // the server, so a submitted `source` of "workbook" must not turn a real
@@ -1054,10 +1829,26 @@ describe('POST /activities — accepting a submission', () => {
 
     const persisted = findRecord(await readActivities('S004', context), label);
     assert.ok(persisted !== undefined, `${context}: the record was persisted`);
+
+    // What was WRITTEN is asserted in full, not just what was answered. A
+    // response carrying a clean record while the forged values went to disk
+    // would pass every assertion above: the store is the lasting artifact, so
+    // the forgery has to be shown absent from IT.
+    assertSubmissionRecord(persisted, 'S004', label, `${context} (persisted)`);
     assert.strictEqual(
       persisted.source,
       SOURCE_SUBMISSION,
       `${context}: what was STORED carries the server's source, not the client's`
+    );
+    assert.strictEqual(
+      persisted.submittedAt,
+      record.submittedAt,
+      `${context}: the stored timestamp is the same server-generated instant that was returned`
+    );
+    assert.notStrictEqual(
+      persisted.submittedAt,
+      forgedTimestamp,
+      `${context}: the client's submittedAt reached neither the response nor the store`
     );
   });
 });
@@ -1083,8 +1874,7 @@ describe('POST /activities — media-type normalization', () => {
         { contentType: spelling }
       );
 
-      assert.strictEqual(response.status, 201, `${context}: accepted as JSON`);
-      const payload = parseJsonResponse(response, context);
+      const payload = assertSuccessEnvelope(response, 201, true, `${context}: accepted as JSON`);
       assertSubmissionRecord(payload.record, 'S006', label, context);
     });
   }
@@ -1104,6 +1894,61 @@ describe('POST /activities — media-type normalization', () => {
       assert.ok(markup.includes(label), `${context}: the confirmation names the activity`);
     });
   }
+});
+
+
+/* ========================================================================= *
+ * The response mode follows the REQUEST media type, never `Accept`
+ *
+ * Negotiation on the request's own `Content-Type` is what makes the mode
+ * deterministic: the form gets a page because it POSTS a form, and a script
+ * gets JSON because it POSTS JSON, whatever either of them happens to send in
+ * `Accept`. The read route proves the rule for a request with no body; these
+ * two prove it for the route that has one, in both directions — which is the
+ * only way to tell a `Content-Type` decision from an `Accept` decision that
+ * merely agrees with it in the common case.
+ * ========================================================================= */
+
+describe('POST /activities — the response mode ignores Accept', () => {
+  it('answers a form-encoded submission with HTML even when Accept asks for JSON', async () => {
+    const context = 'POST /activities form body with Accept: application/json';
+    const label = 'Orienteering Club';
+    const response = await request({
+      method: 'POST',
+      target: NAMESPACE,
+      headers: { 'Content-Type': MEDIA_TYPE_FORM, Accept: MEDIA_TYPE_JSON },
+      body: new URLSearchParams({ studentId: 'S009', activity: label }).toString(),
+    });
+
+    // An implementation honouring `Accept` would answer this one in JSON,
+    // which is precisely the browser case it would break: a form post carries
+    // whatever `Accept` the browser chose, and the submitter needs the page.
+    const markup = assertHtmlPage(response, 201, context);
+    assert.ok(markup.includes(label), `${context}: the confirmation page names the activity`);
+    assert.strictEqual(
+      response.headers.location,
+      `${NAMESPACE}/S009`,
+      `${context}: the 201 still carries Location`
+    );
+  });
+
+  it('answers a JSON submission with JSON even when Accept asks for HTML', async () => {
+    const context = 'POST /activities JSON body with an HTML Accept header';
+    const label = 'Bouldering Club';
+    const response = await request({
+      method: 'POST',
+      target: NAMESPACE,
+      headers: {
+        'Content-Type': MEDIA_TYPE_JSON,
+        Accept: 'text/html,application/xhtml+xml,*/*',
+      },
+      body: JSON.stringify({ studentId: 'S009', activity: label }),
+    });
+
+    const payload = assertSuccessEnvelope(response, 201, true, context);
+    assertSubmissionRecord(payload.record, 'S009', label, context);
+    assert.ok(!response.body.includes('<!DOCTYPE'), `${context}: no document was rendered`);
+  });
 });
 
 
@@ -1262,6 +2107,33 @@ describe('POST /activities — structural refusals', () => {
     const response = await postJson('{bad');
 
     assertErrorEnvelope(response, 400, 'malformed_json', context);
+  });
+
+  it('answers 400 malformed_json for a truly zero-byte body declared as JSON', async () => {
+    const context = 'POST /activities with an accepted media type and NO body at all';
+    // No body is written, so the request really carries zero bytes rather than
+    // a short one. Every other accepted-media-type case in this file sends at
+    // least one byte, which leaves the body reader's empty-stream path — it
+    // resolves with nothing accumulated — otherwise unexercised.
+    const response = await postBody({ contentType: MEDIA_TYPE_JSON });
+
+    // The empty string is not JSON, so this is the ordinary parse refusal. It
+    // must NOT be mistaken for an empty object and fall through to the field
+    // checks, and it must not be answered 413 or 415 either.
+    assertErrorEnvelope(response, 400, 'malformed_json', context);
+    await assertStillServing(context);
+  });
+
+  it('answers a truly zero-byte FORM body with student_id_required as HTML', async () => {
+    const context = 'POST /activities form-encoded with NO body at all';
+    const response = await postBody({ contentType: MEDIA_TYPE_FORM });
+
+    // The same empty stream in the other mode: `URLSearchParams('')` yields no
+    // parameters at all and never throws, so the request fails on presence of
+    // the first field — and because it is a form submission, on a page the
+    // person who submitted it can act on.
+    assertHtmlFailure(response, 400, 'student_id_required', context);
+    await assertStillServing(context);
   });
 
   for (const [description, rawBody] of [
@@ -1447,6 +2319,95 @@ describe('POST /activities — activity validation', () => {
     assertErrorEnvelope(response, 400, 'activity_invalid', context);
   });
 
+  it('accepts 30 astral characters, which is 60 UTF-16 code units', async () => {
+    const context = 'POST /activities with a 30-character astral activity';
+    const label = '\u{1f680}'.repeat(30);
+
+    // The two cases above use BMP characters, where a code point and a code
+    // unit are the same thing, so neither can tell the two candidate rules
+    // apart. This fixture can, and its arithmetic is asserted rather than
+    // asserted about: an astral character is ONE code point and TWO code
+    // units, so this label is AT the bound by the code-unit rule and at half
+    // of it by the code-point rule.
+    assert.strictEqual(label.length, 60, `${context}: the fixture is 60 UTF-16 code units`);
+    assert.strictEqual(
+      Array.from(label).length,
+      30,
+      `${context}: the same fixture is only 30 code points`
+    );
+
+    const response = await postJson({ studentId: 'S007', activity: label });
+
+    assert.strictEqual(
+      response.status,
+      201,
+      `${context}: the bound is inclusive at 60 code units, whichever plane the characters come from`
+    );
+    const record = parseJsonResponse(response, context).record;
+    assertSubmissionRecord(record, 'S007', label, context);
+    // Surrogate pairs must survive the round trip whole: a label re-encoded or
+    // split mid-pair would arrive here as a different string of the same
+    // length, which only an exact comparison catches.
+    const persisted = findRecord(await readActivities('S007', context), label);
+    assert.ok(persisted !== undefined, `${context}: the astral label is readable back`);
+    assert.strictEqual(
+      persisted.activity,
+      label,
+      `${context}: re-reading the store neither refuses the stored astral label nor rewrites it`
+    );
+  });
+
+  it('answers 400 activity_invalid for 31 astral characters, which is 62 UTF-16 code units', async () => {
+    const context = 'POST /activities with a 31-character astral activity';
+    const label = '\u{1f680}'.repeat(31);
+
+    assert.strictEqual(label.length, 62, `${context}: the fixture is 62 UTF-16 code units`);
+    // This is the case that bites. Measured in code points the label is 31 —
+    // comfortably inside the limit — so the earlier code-point rule ACCEPTED
+    // it over the JSON API while the form's maxlength="60", counted in code
+    // units by the browser, would never have let a person submit it. One
+    // bound, two answers; the code-unit answer is the one that holds.
+    assert.strictEqual(
+      Array.from(label).length,
+      31,
+      `${context}: only 31 code points, so a code-point rule would have let this through`
+    );
+
+    const response = await postJson({ studentId: 'S007', activity: label });
+
+    assertErrorEnvelope(response, 400, 'activity_invalid', context);
+  });
+
+  it('refuses at exactly the 60-code-unit bound the served form advertises', async () => {
+    const context = 'POST /activities against the served form maxlength';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // Both sides of one bound in a single case: the attribute as the browser
+    // receives it, then the authoritative server check either side of it. The
+    // browser evaluates maxlength in UTF-16 code units, so the convenience and
+    // the check agree only if the server counts the same units.
+    assert.ok(
+      markup.includes('maxlength="60"'),
+      `${context}: the form advertises the 60 bound the server enforces`
+    );
+
+    const atBound = '\u{1f3b8}'.repeat(30);
+    const overBound = '\u{1f3b8}'.repeat(31);
+    assert.strictEqual(atBound.length, 60, `${context}: 30 astral characters are 60 code units`);
+    assert.strictEqual(overBound.length, 62, `${context}: 31 astral characters are 62 code units`);
+
+    const accepted = await postJson({ studentId: 'S007', activity: atBound });
+    assert.strictEqual(
+      accepted.status,
+      201,
+      `${context}: what the form would let a person submit, the server records`
+    );
+    assertSubmissionRecord(parseJsonResponse(accepted, context).record, 'S007', atBound, context);
+
+    const refused = await postJson({ studentId: 'S007', activity: overBound });
+    assertErrorEnvelope(refused, 400, 'activity_invalid', `${context} (two code units over)`);
+  });
+
   it('measures the 60-character bound AFTER normalization, so padding does not count', async () => {
     const context = 'POST /activities with a padded 60-character activity';
     const label = 'C'.repeat(60);
@@ -1619,6 +2580,307 @@ describe('POST /activities — media type', () => {
 });
 
 /* ========================================================================= *
+ * A Content-Type declared more than once
+ *
+ * `req.headers` is a collapsed view: for `content-type` Node keeps the FIRST
+ * field line and silently discards every later one, while `headersDistinct`
+ * and `rawHeaders` retain them all. Measured on this runtime — a request
+ * declaring `application/json` and then `text/plain` presents as plain
+ * `application/json` in the collapsed map.
+ *
+ * So a check written against that map cannot tell one unambiguous declaration
+ * from two contradictory ones, and it answers the request according to
+ * whichever line happened to arrive first. That is a decision the sender never
+ * made, and it is made on the strength of a header the endpoint is supposed to
+ * be enforcing. Exactly one declaration is required; zero and two are both
+ * refused, and the third case below is the one a first-line-wins
+ * implementation passes while getting the answer for the wrong reason.
+ * ========================================================================= */
+
+describe('POST /activities — a Content-Type declared more than once', () => {
+  /** A label no accepting case submits, so its absence is meaningful. */
+  const REFUSED_LABEL = 'Ambiguous Club';
+
+  /**
+   * Posts with several `Content-Type` field lines. An array header value makes
+   * `http.request` emit one line per element — verified against a raw socket
+   * read on the server side.
+   *
+   * @param {string[]} declarations The media types to declare, in order.
+   * @returns {Promise<object>} The response.
+   */
+  function postWithDeclarations(declarations) {
+    return postBody({
+      contentType: declarations,
+      body: JSON.stringify({ studentId: KNOWN_STUDENT_ID, activity: REFUSED_LABEL }),
+    });
+  }
+
+  it('answers 415 for two conflicting declarations', async () => {
+    const context = 'POST /activities declaring application/json then text/plain';
+    const response = await postWithDeclarations([MEDIA_TYPE_JSON, 'text/plain']);
+
+    assertErrorEnvelope(response, 415, 'unsupported_media_type', context);
+  });
+
+  it('answers 415 when the accepted type is declared SECOND', async () => {
+    const context = 'POST /activities declaring text/plain then application/json';
+    const response = await postWithDeclarations(['text/plain', MEDIA_TYPE_JSON]);
+
+    // Both orderings must answer the same way. An implementation reading the
+    // collapsed header agrees with this case by accident and disagrees with
+    // the one above, which is exactly the ambiguity being refused.
+    assertErrorEnvelope(response, 415, 'unsupported_media_type', context);
+  });
+
+  it('answers 415 even when the duplicate declarations agree', async () => {
+    const context = 'POST /activities declaring application/json twice';
+    const response = await postWithDeclarations([MEDIA_TYPE_JSON, MEDIA_TYPE_JSON]);
+
+    // Refused on ambiguity rather than on disagreement: the endpoint requires
+    // one declaration, and does not adjudicate between several.
+    assertErrorEnvelope(response, 415, 'unsupported_media_type', context);
+  });
+
+  it('answers 415 for duplicate form-encoded declarations too', async () => {
+    const context = 'POST /activities declaring the form media type twice';
+    const response = await postBody({
+      contentType: [MEDIA_TYPE_FORM, MEDIA_TYPE_FORM],
+      body: new URLSearchParams({ studentId: KNOWN_STUDENT_ID, activity: REFUSED_LABEL }).toString(),
+    });
+
+    assertErrorEnvelope(response, 415, 'unsupported_media_type', context);
+    assert.ok(!response.body.includes('<!DOCTYPE'), `${context}: the JSON envelope, not a page`);
+  });
+
+  it('stores nothing from an ambiguously declared submission', async () => {
+    const context = 'an ambiguous declaration persists nothing';
+    await postWithDeclarations([MEDIA_TYPE_JSON, 'text/plain']);
+
+    const records = await readActivities(KNOWN_STUDENT_ID, context);
+    assert.strictEqual(
+      findRecord(records, REFUSED_LABEL),
+      undefined,
+      `${context}: the body was never read, so no record can exist for it`
+    );
+    await assertStillServing(context);
+  });
+});
+
+/* ========================================================================= *
+ * The cross-origin submission boundary
+ *
+ * `POST /activities` changes stored state, and an HTML form can be made to
+ * submit across origins: a page on any other site can carry a form whose
+ * action is this service and whose encoding is the one this endpoint accepts,
+ * and the browser that loads that page will send the request. Field validation
+ * cannot tell it apart from the real form's, because it IS a real form
+ * submission — of somebody else's form. Nothing else in this service stands in
+ * the way: no authentication, no session, no cookie, no token; and the
+ * loopback bind is no defence, because the browser making the request is on
+ * the loopback host itself.
+ *
+ * What a browser cannot forge is where it says a request came from, and these
+ * cases pin both halves of that: a submission whose `Origin` or
+ * `Sec-Fetch-Site` names somewhere else is refused, while a request carrying
+ * NEITHER header is accepted — that is the documented non-browser client, and
+ * every published `curl` command is one, so an over-broad check would refuse
+ * the very callers the endpoint is specified to serve.
+ * ========================================================================= */
+
+describe('POST /activities — the cross-origin submission boundary', () => {
+  const FOREIGN_ORIGIN = 'http://evil.example';
+  const REFUSED_LABEL = 'Forged Club';
+
+  /**
+   * Posts a form-encoded submission with browser-shaped headers added.
+   *
+   * @param {Record<string, string>} headers The origin signals to send.
+   * @param {{studentId?: string, activity?: string}} [fields] The submission.
+   * @returns {Promise<object>} The response.
+   */
+  function postFromBrowser(headers, fields = {}) {
+    const { studentId = KNOWN_STUDENT_ID, activity = REFUSED_LABEL } = fields;
+    return request({
+      method: 'POST',
+      target: NAMESPACE,
+      headers: { 'Content-Type': MEDIA_TYPE_FORM, ...headers },
+      body: new URLSearchParams({ studentId, activity }).toString(),
+    });
+  }
+
+  /** This service's own origin, as a browser on the harness port would send it. */
+  function ownOrigin() {
+    return `http://${HOST}:${activePort()}`;
+  }
+
+  it('refuses a form submission from another origin with 403 cross_origin_submission', async () => {
+    const context = 'POST /activities with a foreign Origin';
+    const response = await postFromBrowser({
+      Origin: FOREIGN_ORIGIN,
+      'Sec-Fetch-Site': 'cross-site',
+    });
+
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+    // The envelope in both modes: the decision is taken before the body's
+    // format matters, and re-rendering the form would reflect a caller's own
+    // input into a page that caller controls.
+    assert.ok(!response.body.includes('<!DOCTYPE'), `${context}: no page is rendered for a 403`);
+    assert.ok(
+      !response.body.includes('evil.example'),
+      `${context}: the refused origin is not echoed back`
+    );
+  });
+
+  it('refuses a submission whose Origin alone is foreign', async () => {
+    const context = 'POST /activities with a foreign Origin and no Sec-Fetch-Site';
+    const response = await postFromBrowser({ Origin: FOREIGN_ORIGIN });
+
+    // Not every browser sends `Sec-Fetch-Site`, so `Origin` must be sufficient
+    // on its own.
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  it('refuses the opaque Origin: null a sandboxed document sends', async () => {
+    const context = 'POST /activities with Origin: null';
+    const response = await postFromBrowser({ Origin: 'null' });
+
+    // Refused rather than interpreted: an opaque origin names nothing, and
+    // treating it as "no origin" would hand a sandboxed page the non-browser
+    // client's acceptance.
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  it('refuses an Origin whose host matches but whose scheme does not', async () => {
+    const context = 'POST /activities with an https Origin for an http service';
+    const response = await postFromBrowser({ Origin: `https://${HOST}:${activePort()}` });
+
+    // A different scheme is a different origin, whatever the host says. This
+    // service speaks only http.
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  it('refuses an Origin declared more than once', async () => {
+    const context = 'POST /activities declaring two Origins';
+    const response = await postFromBrowser({ Origin: [ownOrigin(), FOREIGN_ORIGIN] });
+
+    // Ambiguity is refused here for the same reason it is refused on the media
+    // type: the endpoint does not choose between two declarations.
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  for (const site of ['cross-site', 'same-site']) {
+    it(`refuses a submission the browser classifies as ${site}`, async () => {
+      const context = `POST /activities with Sec-Fetch-Site: ${site}`;
+      const response = await postFromBrowser({ 'Sec-Fetch-Site': site });
+
+      // `same-site` matters as much as `cross-site`: on loopback there are no
+      // subdomains, so anything the browser calls same-site-but-not-same-origin
+      // reached this service from a different port or scheme.
+      assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+    });
+  }
+
+  it('refuses a cross-origin submission in JSON mode as well', async () => {
+    const context = 'POST /activities JSON with a foreign Origin';
+    const response = await request({
+      method: 'POST',
+      target: NAMESPACE,
+      headers: { 'Content-Type': MEDIA_TYPE_JSON, Origin: FOREIGN_ORIGIN },
+      body: JSON.stringify({ studentId: KNOWN_STUDENT_ID, activity: REFUSED_LABEL }),
+    });
+
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  it('refuses before the media type, so an unaccepted type does not mask it', async () => {
+    const context = 'POST /activities cross-origin with an unaccepted media type';
+    const response = await request({
+      method: 'POST',
+      target: NAMESPACE,
+      headers: { 'Content-Type': 'text/plain', Origin: FOREIGN_ORIGIN },
+      body: 'anything',
+    });
+
+    // Authority to submit is settled first: a foreign submission is refused as
+    // a whole rather than parsed and then refused on its content type.
+    assertErrorEnvelope(response, 403, 'cross_origin_submission', context);
+  });
+
+  it('persists nothing from any refused submission', async () => {
+    const context = 'a refused cross-origin submission persists nothing';
+    const records = await readActivities(KNOWN_STUDENT_ID, context);
+
+    assert.strictEqual(
+      findRecord(records, REFUSED_LABEL),
+      undefined,
+      `${context}: none of the refusals above may have reached the store`
+    );
+    await assertStillServing(context);
+  });
+
+  it('accepts the real form: an Origin naming this service, classified same-origin', async () => {
+    const context = 'POST /activities from this service own form';
+    const response = await postFromBrowser(
+      { Origin: ownOrigin(), 'Sec-Fetch-Site': 'same-origin' },
+      { studentId: 'S004', activity: 'Origin Gated Club' }
+    );
+
+    // The browser path this feature exists for. Its `Origin` is whatever host
+    // the page was served from, which is the host the request is addressed to,
+    // which is why the comparison works on an ephemeral port as well as on
+    // the fixed one.
+    const markup = assertHtmlPage(response, 201, context);
+    assert.ok(
+      markup.includes('Origin Gated Club'),
+      `${context}: the confirmation restates what was recorded`
+    );
+  });
+
+  it('accepts a user-initiated navigation, which the browser classifies as none', async () => {
+    const context = 'POST /activities with Sec-Fetch-Site: none';
+    const response = await postFromBrowser(
+      { Origin: ownOrigin(), 'Sec-Fetch-Site': 'none' },
+      { studentId: 'S004', activity: 'Bookmark Club' }
+    );
+
+    assertHtmlPage(response, 201, context);
+  });
+
+  it('accepts a script sending neither header, so the documented curl commands still work', async () => {
+    const context = 'POST /activities with no origin signal at all';
+    const response = await postJson({ studentId: 'S009', activity: 'Scripted Club' });
+
+    // The non-browser client, and the reason the check keys on a signal being
+    // WRONG rather than on it being absent: no browser omits `Origin` on a
+    // POST, so a request without one is not a browser form submission. Every
+    // published curl example is one of these.
+    assert.strictEqual(response.status, 201, `${context}: accepted, exactly as documented`);
+    assertSubmissionRecord(
+      parseJsonResponse(response, context).record,
+      'S009',
+      'Scripted Club',
+      context
+    );
+  });
+
+  it('leaves reads open, because a read changes nothing', async () => {
+    const context = 'GET /activities/S004 with a foreign Origin';
+    const response = await request({
+      method: 'GET',
+      target: `${NAMESPACE}/S004`,
+      headers: { Origin: FOREIGN_ORIGIN, 'Sec-Fetch-Site': 'cross-site' },
+    });
+
+    // The boundary is on the state-changing method only. Adding it to reads
+    // would refuse a request that alters nothing, and the service's read
+    // exposure is documented as it stands rather than half-fixed here.
+    assert.strictEqual(response.status, 200, `${context}: reads are unaffected`);
+    parseJsonResponse(response, context);
+  });
+});
+
+/* ========================================================================= *
  * Body size — the limit is INCLUSIVE at 8192 bytes
  *
  * The naive implementation of this limit crashes the process: responding from
@@ -1735,6 +2997,227 @@ describe('POST /activities — the 8192-byte body limit', () => {
       'Rowing Club',
       context
     );
+    await assertStillServing(context);
+  });
+});
+
+
+/* ========================================================================= *
+ * A request stream that fails part way
+ *
+ * Both cases here need something no pooled keep-alive client will do: declare
+ * a body and then abandon it. They therefore drive a raw socket, and they are
+ * the only cases in this file that do.
+ *
+ * The first is the oversize DRAIN, and it is subtler than the 413 cases above.
+ * Measured on this runtime: an oversize request is answered `413` with
+ * `Connection: keep-alive`, and the runtime then holds the connection open
+ * waiting for the rest of the body the sender declared, with the drain still
+ * running. Anything that disarmed the request stream's error handling at the
+ * moment of the 413 would leave that window unguarded, and a client that reset
+ * mid-drain would emit `'error'` on an EventEmitter with no listener for it —
+ * which throws, and ends the process. One abandoned upload would then be a
+ * denial of service, delivered through the very limit that exists to bound
+ * what one request can cost.
+ *
+ * The second is a stream that fails BEFORE the limit is reached, which is the
+ * ordinary "client went away" case. Nothing can be sent to a client that is
+ * gone, so the observable requirement is not a status: it is that the request
+ * reaches a definite end and that the fault is written down. A silent return
+ * leaves an operator with no evidence the request ever happened.
+ * ========================================================================= */
+
+describe('POST /activities — a request stream that fails part way', () => {
+  // Required here rather than at the top of the file because these are the
+  // only cases that need a connection they can abandon; every other case in
+  // this file goes through the shared keep-alive client.
+  const net = require('node:net');
+
+  /** How long a case waits for a condition it cannot be notified of. */
+  const CONDITION_TIMEOUT_MS = 5000;
+
+  /**
+   * Pauses.
+   *
+   * @param {number} ms How long.
+   * @returns {Promise<void>}
+   */
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Waits for a condition, or fails the case saying what it waited for.
+   *
+   * @param {() => boolean} condition The condition to poll.
+   * @param {string} description What is being waited for.
+   * @returns {Promise<void>}
+   */
+  async function waitFor(condition, description) {
+    const deadline = Date.now() + CONDITION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (condition()) {
+        return;
+      }
+      await delay(10);
+    }
+    assert.fail(`timed out after ${CONDITION_TIMEOUT_MS}ms waiting for ${description}`);
+  }
+
+  /**
+   * Opens a raw connection to the harness server and sends a request head that
+   * declares a body length, without delivering it.
+   *
+   * @param {number} declaredLength The `Content-Length` to declare.
+   * @returns {Promise<{socket: import('node:net').Socket, send: (bytes: number|string) => void, received: () => string}>}
+   *   The socket, a writer, and a reader of everything received so far.
+   */
+  async function openDeclaredSubmission(declaredLength) {
+    const socket = net.connect(activePort(), HOST);
+    let received = '';
+
+    socket.on('data', (chunk) => {
+      received += chunk.toString('utf8');
+    });
+    // A socket this case is going to reset will report that reset. It is the
+    // point of the case, not a failure of it.
+    socket.on('error', () => {});
+
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+
+    socket.write(
+      `POST ${NAMESPACE} HTTP/1.1\r\nHost: ${HOST}:${activePort()}\r\n` +
+        `Content-Type: ${MEDIA_TYPE_JSON}\r\nContent-Length: ${declaredLength}\r\n\r\n`
+    );
+
+    return {
+      socket,
+      send(bytes) {
+        socket.write(typeof bytes === 'number' ? Buffer.alloc(bytes, 0x78) : bytes);
+      },
+      received: () => received,
+    };
+  }
+
+  it('keeps the request stream guarded through the oversize drain, and survives an abort in it', async (t) => {
+    const context = 'POST /activities aborted during the oversize drain';
+
+    // The server-side request object is captured so the abort can be applied
+    // to the exact stream the body reader was draining — a client-side reset
+    // alone races the runtime's own teardown and proves nothing either way.
+    let captured = null;
+    const capture = (incoming) => {
+      if (captured === null) {
+        captured = incoming;
+      }
+    };
+    server.prependListener('request', capture);
+
+    const link = await openDeclaredSubmission(5 * 1024 * 1024);
+    t.after(() => {
+      server.removeListener('request', capture);
+      link.socket.destroy();
+    });
+
+    link.send(64 * 1024);
+    await waitFor(() => link.received().includes('\r\n\r\n'), 'the 413 response head');
+
+    assert.match(
+      link.received().split('\r\n')[0],
+      /^HTTP\/1\.1 413 /,
+      `${context}: the client is told the body was too large`
+    );
+    assert.ok(captured !== null, `${context}: the server-side request was captured`);
+    assert.strictEqual(
+      captured.readableEnded,
+      false,
+      `${context}: megabytes were declared and kilobytes sent, so the drain is still in progress`
+    );
+    assert.ok(
+      captured.listenerCount('error') >= 1,
+      `${context}: the request stream must still carry an error listener while it drains — without one, the abort below is an unhandled 'error' event and the process dies`
+    );
+
+    // The abort itself. With the drain guarded this is observed and dropped;
+    // unguarded it throws out of the emit and terminates the process, so the
+    // assertions after it are the ones that matter.
+    captured.destroy(Object.assign(new Error('client reset'), { code: 'ECONNRESET' }));
+    await delay(50);
+
+    await assertStillServing(context);
+    const accepted = await postJson({ studentId: 'S006', activity: 'Post Abort Club' });
+    assert.strictEqual(
+      accepted.status,
+      201,
+      `${context}: and submissions are still honoured afterwards`
+    );
+  });
+
+  it('records a failed request stream once, in a bounded shape, and keeps serving', async (t) => {
+    const context = 'POST /activities whose stream fails mid-body';
+
+    const logged = [];
+    const originalError = console.error;
+    console.error = (...args) => {
+      logged.push(args.map((argument) => String(argument)).join(' '));
+    };
+    t.after(() => {
+      console.error = originalError;
+    });
+
+    const link = await openDeclaredSubmission(4096);
+    t.after(() => link.socket.destroy());
+
+    // A partial body well under the limit, then a reset: the read fails while
+    // it is still accumulating, which is the path that used to return with no
+    // response, no teardown and no evidence.
+    link.send('{"studentId"');
+    await delay(50);
+    link.socket.resetAndDestroy();
+
+    await waitFor(
+      () => logged.some((line) => line.includes('request_stream_failed')),
+      'the stream-failure event to be recorded'
+    );
+
+    console.error = originalError;
+
+    const line = logged.find((candidate) => candidate.includes('request_stream_failed'));
+    const record = JSON.parse(line.slice(line.indexOf('{')));
+
+    assert.deepStrictEqual(
+      Object.keys(record).sort(),
+      ['at', 'code', 'detail', 'event', 'method', 'number', 'path', 'reason'],
+      `${context}: one fixed-shape record, so the evidence is countable and greppable`
+    );
+    assert.strictEqual(record.event, 'request_stream_failed', `${context}: the event`);
+    assert.strictEqual(record.method, 'POST', `${context}: the method`);
+    assert.strictEqual(record.path, NAMESPACE, `${context}: the pathname, with no query string`);
+    assert.match(
+      record.detail,
+      /^(?:[A-Z][A-Z_]*|none|unclassified)$/,
+      `${context}: the underlying fault is named by an allow-listed token, never by its message`
+    );
+
+    // What must NOT be in the evidence: this is a log, so it outlives the
+    // request, and the store's and reader's messages carry store paths,
+    // workbook paths, Student IDs and activity labels by design.
+    for (const marker of ['\\', '.js', ' at ', 'Error:', TEMPORARY_ROOT]) {
+      assert.ok(
+        !line.includes(marker),
+        `${context}: the log line must not carry ${JSON.stringify(marker)}`
+      );
+    }
+
+    assert.strictEqual(
+      logged.filter((candidate) => candidate.includes('request_stream_failed')).length,
+      1,
+      `${context}: recorded exactly once — a second line would make a count of these meaningless`
+    );
+
     await assertStillServing(context);
   });
 });
@@ -1912,33 +3395,24 @@ describe('handle() claims only the /activities namespace', () => {
   }
 });
 
-describe('every path outside the namespace keeps the preserved response', () => {
-  for (const outside of ['/', '/nonsense', '/activities-old', '/activitieslist', '/activitiesx', '/index.html', '/students/S001']) {
-    it(`serves the 34-byte plaintext greeting for ${outside}`, async () => {
-      const context = `GET ${outside}`;
-      const response = await get(outside);
-
-      // The previously universal response is NARROWED, not replaced. A path
-      // that merely shares the namespace's characters as text is not claimed,
-      // which is precisely what a loose route predicate would break.
-      assertLegacyResponse(response, context);
-    });
-  }
-
-  it('keeps the preserved response for a non-GET method outside the namespace', async () => {
-    const context = 'POST /activities-old';
-    const response = await request({
-      method: 'POST',
-      target: '/activities-old',
-      headers: { 'Content-Type': MEDIA_TYPE_JSON },
-      body: JSON.stringify({ studentId: KNOWN_STUDENT_ID, activity: 'Chess Club' }),
-    });
-
-    // Outside the namespace the method is irrelevant, exactly as it was before
-    // the feature existed.
-    assertLegacyResponse(response, context);
-  });
-});
+/* ------------------------------------------------------------------------- *
+ * The byte-level legacy response is NOT asserted here
+ *
+ * What the fall-through actually returns — the 200, the `text/plain` header
+ * with no charset parameter, the 34-byte body and its sha256 — belongs to
+ * `test/lifecycle.test.js`, which owns the preserved response and asserts it
+ * against a real `node server.js` child process for `/`, `/nonsense`,
+ * `/index.html`, `/students/S001`, `/activities-old`, `/activitieslist`, an
+ * arbitrary unrelated path, and a non-GET method. Repeating those assertions
+ * here would give one contract two owners that could disagree, and the copy
+ * driving an in-process listener would be the weaker of the two.
+ *
+ * This file's stake in the boundary is the predicate, and the suite above is
+ * it: `handle` returns `false` for every lookalike path AND writes nothing to
+ * the response — which is what leaves the legacy response byte-identical, and
+ * which cannot be observed over HTTP at all, because by then `server.js` has
+ * already written its own.
+ * ------------------------------------------------------------------------- */
 
 
 /* ========================================================================= *
@@ -1956,14 +3430,37 @@ describe('HTML escaping of submitted values', () => {
     const context = 'POST /activities form-encoded with a <script> label';
     const response = await postForm('S003', '<script>alert(1)</script>');
 
-    // `assertHtmlPage` already refuses any occurrence of "<script"; these
+    // `assertHtmlPage` already refuses a script tag in any casing; these
     // assertions additionally prove the value was RENDERED, escaped, rather
     // than silently dropped — a page that discarded it would also pass the
     // absence check on its own.
     const markup = assertHtmlPage(response, 201, context);
     assert.ok(markup.includes('&lt;script&gt;'), `${context}: the opening tag is escaped`);
     assert.ok(markup.includes('&lt;/script&gt;'), `${context}: the closing tag is escaped`);
-    assert.ok(!markup.includes('<script'), `${context}: no raw script tag survives`);
+    assert.ok(!SCRIPT_ELEMENT.test(markup), `${context}: no raw script tag survives`);
+  });
+
+  it('escapes a MIXED-CASE script tag, which a browser would run exactly as lowercase', async () => {
+    const context = 'POST /activities form-encoded with a <ScRiPt> label';
+    // A different payload from the lowercase case above on purpose: labels are
+    // deduplicated case-insensitively, so submitting the same characters in
+    // another casing would be answered 200 with the FIRST case's stored
+    // spelling and would prove nothing about this one.
+    const label = '<ScRiPt>alert(2)</ScRiPt>';
+
+    const response = await postForm('S003', label);
+
+    // The escaping is not case-sensitive either, so the mixed-case spelling
+    // must come back as entities exactly as the lowercase one does. An
+    // implementation that matched only `<script` before escaping would emit
+    // this payload raw, and a lowercase-only absence check would clear it.
+    const markup = assertHtmlPage(response, 201, context);
+    assert.ok(markup.includes('&lt;ScRiPt&gt;'), `${context}: the mixed-case opening tag is escaped`);
+    assert.ok(markup.includes('&lt;/ScRiPt&gt;'), `${context}: the mixed-case closing tag is escaped`);
+    assert.ok(
+      !SCRIPT_ELEMENT.test(markup),
+      `${context}: no raw script tag survives in any casing`
+    );
   });
 
   it('escapes all five special characters to their entity forms', async () => {
@@ -2068,10 +3565,23 @@ describe('HTML escaping of submitted values', () => {
  *
  * There are FOUR, not one, and telling them apart is the point: a submitter
  * told "internal error" cannot distinguish an unreadable workbook from a full
- * disk. Each has its own case, each induces its fault by a real mechanism
- * rather than by asserting on a mock, and each is followed by a probe proving
- * the service is STILL SERVING — a failure mode that kills the process must not
- * be able to pass here.
+ * disk. Each has its own case, each is driven over real HTTP against the real
+ * composed server, and each is followed by a probe proving the service is STILL
+ * SERVING — a failure mode that kills the process must not be able to pass
+ * here.
+ *
+ * Each fault is induced at the narrowest mechanism that produces the real
+ * failure, and for two of the four that mechanism reaches INTO the process
+ * rather than sitting on disk. `store_unreadable` and `store_write_failed` are
+ * induced by breaking the actual store file and its directory, but
+ * `reference_data_unavailable` SUBSTITUTES `xlsx-read` through the CommonJS
+ * cache, and `internal_error` REPLACES `activities.handle`. Neither of those
+ * two is reachable from outside: a client cannot corrupt a committed workbook,
+ * and every foreseeable request fault is already caught and mapped upstream, so
+ * substitution is the only door in. What no case does is assert against a
+ * double — every assertion below is made on the HTTP response the real server
+ * sent, and the substitutes exist only to make the real code take its error
+ * path.
  *
  * A valid store document, used as the "previous document" wherever a case needs
  * one to still be intact afterwards. Every field satisfies the loader: the
@@ -2113,6 +3623,18 @@ describe('500 store_unreadable — the store exists but cannot be used', () => {
         { port: isolated.port }
       );
       assertErrorEnvelope(write, 500, 'store_unreadable', `${context} (write)`);
+
+      // The SAME fault in form mode, which the matrix answers in JSON too: a
+      // 500 is a fault the form cannot help with, so there is no field to flag
+      // and no page to re-render. Exercised explicitly because the renderer is
+      // reached by the request mode rather than by the status, so a 500 wrongly
+      // routed into the HTML path would only ever show up here.
+      const formWrite = await postForm(KNOWN_STUDENT_ID, 'Chess Club', { port: isolated.port });
+      assertErrorEnvelope(formWrite, 500, 'store_unreadable', `${context} (form-mode write)`);
+      assert.ok(
+        !formWrite.body.includes('<!DOCTYPE'),
+        `${context}: a 500 is never rendered as a page, even for a form submission`
+      );
 
       // The file is preserved for inspection, never silently replaced or
       // repaired: a hand-edit mistake must cost an error response rather than
@@ -2159,6 +3681,15 @@ describe('500 store_write_failed — the write cannot complete', () => {
       { port: isolated.port }
     );
     assertErrorEnvelope(refused, 500, 'store_write_failed', context);
+
+    // The same refusal reached from the form, answered in JSON rather than as a
+    // re-rendered page — the mode-specific half of this row of the matrix.
+    const formRefused = await postForm(KNOWN_STUDENT_ID, 'Kite Club', { port: isolated.port });
+    assertErrorEnvelope(formRefused, 500, 'store_write_failed', `${context} (form mode)`);
+    assert.ok(
+      !formRefused.body.includes('<!DOCTYPE'),
+      `${context}: a form-mode 500 is the JSON envelope, not a page`
+    );
 
     assert.strictEqual(
       await fsp.readFile(storePath, 'utf8'),
@@ -2215,7 +3746,10 @@ describe('500 store_write_failed — the write cannot complete', () => {
   it('answers 500 store_write_failed when the store directory does not exist', async (t) => {
     const context = 'store_write_failed with a missing parent directory';
     const directory = await makeCaseDirectory('write-failed-missing-parent');
-    // Deliberately never created, so BOTH the staging write and the rename fail.
+    // The subdirectory is deliberately never created, so the STAGING WRITE to
+    // `<store>.tmp` is what fails and the rename is never attempted at all.
+    // That is the whole of what this case can observe, and it is enough: the
+    // write path refuses, reports `store_write_failed`, and keeps serving.
     const storePath = path.join(directory, 'absent-subdirectory', 'activities.json');
 
     const isolated = await startIsolatedServer(storePath);
@@ -2226,6 +3760,13 @@ describe('500 store_write_failed — the write cannot complete', () => {
       { port: isolated.port }
     );
     assertErrorEnvelope(refused, 500, 'store_write_failed', context);
+
+    const formRefused = await postForm(KNOWN_STUDENT_ID, 'Luge Club', { port: isolated.port });
+    assertErrorEnvelope(formRefused, 500, 'store_write_failed', `${context} (form mode)`);
+    assert.ok(
+      !formRefused.body.includes('<!DOCTYPE'),
+      `${context}: a form-mode 500 is the JSON envelope, not a page`
+    );
 
     // Reading is unaffected: an absent store is the first-use state, answered
     // from the workbook seed.
@@ -2253,10 +3794,11 @@ describe('500 reference_data_unavailable — the workbook cannot be read', () =>
       require.cache[readerPath] = savedCacheEntry;
     });
 
-    // The first two column reads fail, every later one delegates to the real
-    // reader. Two, because both routes are exercised and each makes exactly one
-    // key-set read before giving up.
-    let failuresRemaining = 2;
+    // The first three column reads fail, every later one delegates to the real
+    // reader. Three, because the read route, the JSON write and the form-mode
+    // write are each exercised, and each makes exactly one key-set read before
+    // giving up.
+    let failuresRemaining = 3;
     let inducedFailures = 0;
 
     const stubEntry = {
@@ -2298,7 +3840,26 @@ describe('500 reference_data_unavailable — the workbook cannot be read', () =>
     );
     assertErrorEnvelope(write, 500, 'reference_data_unavailable', `${context} (write)`);
 
-    assert.strictEqual(inducedFailures, 2, `${context}: both routes really did attempt the read`);
+    // And in form mode, where the matrix still says JSON: the reference data is
+    // unreadable, so there is no key set to validate against and nothing a
+    // re-rendered field could fix.
+    const formWrite = await postForm(KNOWN_STUDENT_ID, 'Chess Club', { port: isolated.port });
+    assertErrorEnvelope(
+      formWrite,
+      500,
+      'reference_data_unavailable',
+      `${context} (form-mode write)`
+    );
+    assert.ok(
+      !formWrite.body.includes('<!DOCTYPE'),
+      `${context}: a form-mode 500 is the JSON envelope, not a page`
+    );
+
+    assert.strictEqual(
+      inducedFailures,
+      3,
+      `${context}: the read route, the JSON write and the form-mode write each really did attempt the read`
+    );
 
     // The load-bearing assertion, and the reason the fault is induced on the
     // SAME module instance rather than by re-requiring a clean one: a failed
@@ -2334,6 +3895,431 @@ describe('500 reference_data_unavailable — the workbook cannot be read', () =>
   });
 });
 
+/* ========================================================================= *
+ * The evidence a mapped 500 leaves behind
+ *
+ * A 500 tells its client which of the four codes applied. `store_unreadable`
+ * alone covers a dozen distinct faults, and `reference_data_unavailable`
+ * covers every way a workbook package can be refused, so a log that recorded
+ * only the public code would leave an operator where no log at all leaves
+ * them: knowing the store is unreadable, and nothing about why.
+ *
+ * These cases induce representative faults through the REAL store and the REAL
+ * reader — a genuinely broken document, a genuinely unwritable path, and a
+ * genuinely mutated package — and assert that each leaves its own
+ * distinguishable record. They are also what holds the classifier's coupling
+ * in place: it recognises refusals by anchor phrases that live in
+ * `activity-store.js` and `xlsx-read.js`, so a rewording there fails a case
+ * here rather than silently degrading every future log line to
+ * `unclassified`.
+ *
+ * And they assert the other half, which matters more: those refusals carry
+ * workbook paths, store paths, Student IDs and activity labels in their
+ * messages by design, because that detail belongs in a diagnosis and not in a
+ * response. A log outlives the request, so none of it may appear there.
+ * ========================================================================= */
+
+describe('500 diagnostics — what a mapped failure records, and what it must not', () => {
+  /** The fixed field set every record carries, sorted. */
+  const RECORD_KEYS = Object.freeze([
+    'at',
+    'code',
+    'detail',
+    'event',
+    'method',
+    'number',
+    'path',
+    'reason',
+  ]);
+
+  /**
+   * Runs a block with `console.error` captured.
+   *
+   * @param {() => Promise<void>} block The work to run.
+   * @returns {Promise<string[]>} Everything written while it ran.
+   */
+  async function capturingLog(block) {
+    const captured = [];
+    const original = console.error;
+    console.error = (...args) => {
+      captured.push(args.map((argument) => String(argument)).join(' '));
+    };
+    try {
+      await block();
+    } finally {
+      console.error = original;
+    }
+    return captured;
+  }
+
+  /**
+   * Asserts exactly one failure record was written, and returns it parsed.
+   *
+   * @param {string[]} captured Lines from `capturingLog`.
+   * @param {string} context The case name.
+   * @returns {object} The parsed record.
+   */
+  function soleRecord(captured, context) {
+    const failures = captured.filter((line) => line.includes('"event":"store_failure"'));
+    assert.strictEqual(
+      failures.length,
+      1,
+      `${context}: exactly one record per mapped failure — logging upstream as well would make a count of these meaningless. Saw: ${JSON.stringify(captured)}`
+    );
+
+    const line = failures[0];
+    const record = JSON.parse(line.slice(line.indexOf('{')));
+    assert.deepStrictEqual(Object.keys(record).sort(), RECORD_KEYS, `${context}: the fixed shape`);
+    assert.strictEqual(record.event, 'store_failure', `${context}: the event`);
+
+    // Never anywhere in the line, `path` included: a filesystem path, a source
+    // file name, a workbook name, the store's own name, or the shapes a stack
+    // trace and a formatted Error take. Every one of these appears in the
+    // refusal's message, which is exactly why the message is not logged.
+    for (const forbidden of ['\\', '.js', '.xlsx', ' at ', 'Error:', 'activities.json', TEMPORARY_ROOT]) {
+      assert.ok(
+        !line.includes(forbidden),
+        `${context}: the record must not carry ${JSON.stringify(forbidden)}, but it reads ${line}`
+      );
+    }
+
+    // `path` is the request target, which the failure-handling contract says to
+    // log — with the query removed and the length bounded. For a read route
+    // that pathname necessarily contains the Student ID being addressed,
+    // because the Student ID IS the resource identifier, so it is asserted as
+    // the request's own pathname rather than treated as a leak.
+    assert.match(
+      record.path,
+      /^\/activities(?:\/[A-Za-z0-9%._-]{0,32})?$/,
+      `${context}: path is the bounded request pathname and nothing else`
+    );
+    return record;
+  }
+
+  /**
+   * Asserts none of a fixture's own values reached the classification.
+   *
+   * Scoped to every field EXCEPT `path`, because those are the fields derived
+   * from the refusal — and the refusal's message is where a stored Student ID,
+   * an activity label or a rejected value lives. This is the assertion that
+   * would fail if the classifier ever emitted captured text instead of one of
+   * its own tokens.
+   *
+   * @param {object} record A record from `soleRecord`.
+   * @param {string[]} values The values the fixture put in the document.
+   * @param {string} context The case name.
+   * @returns {void}
+   */
+  function assertClassificationCarriesNoValues(record, values, context) {
+    const { path: requestPath, ...classification } = record;
+    assert.ok(typeof requestPath === 'string', `${context}: path is present`);
+
+    const serialized = JSON.stringify(classification);
+    for (const value of values) {
+      assert.ok(
+        !serialized.includes(value),
+        `${context}: the classification must not carry the fixture value ${JSON.stringify(value)}, but it reads ${serialized}`
+      );
+    }
+  }
+
+  /**
+   * Stands up an isolated service over a store written verbatim.
+   *
+   * @param {object} t The test context, for teardown.
+   * @param {string} name The case's directory name.
+   * @param {string} contents The exact bytes to write to the store.
+   * @returns {Promise<object>} The isolated server handle.
+   */
+  async function serviceOverStore(t, name, contents) {
+    const directory = await makeCaseDirectory(name);
+    const storePath = path.join(directory, 'activities.json');
+    await fsp.writeFile(storePath, contents, 'utf8');
+    const isolated = await startIsolatedServer(storePath);
+    t.after(() => isolated.stop());
+    return isolated;
+  }
+
+  for (const [name, label, document, expectedReason, expectedAt, leakCandidates] of [
+    [
+      'diag-schema',
+      'a document declaring the wrong schema version',
+      JSON.stringify({ schemaVersion: 2, activities: [] }),
+      'store_schema_version',
+      null,
+      ['schemaVersion'],
+    ],
+    [
+      'diag-not-array',
+      'a document whose activities is not an array',
+      JSON.stringify({ schemaVersion: 1, activities: {} }),
+      'store_activities_not_an_array',
+      null,
+      ['must hold', 'it holds'],
+    ],
+    [
+      'diag-record-source',
+      'a record at index 1 with an unrecognised source',
+      JSON.stringify({
+        schemaVersion: 1,
+        activities: [
+          { studentId: 'S001', activity: 'Robotics Club', source: 'workbook' },
+          { studentId: 'S002', activity: 'Debate Society', source: 'guesswork' },
+        ],
+      }),
+      'record_source_unrecognised',
+      1,
+      ['S001', 'S002', 'Robotics Club', 'Debate Society', 'guesswork'],
+    ],
+    [
+      'diag-record-id',
+      'a record at index 0 with a malformed Student ID',
+      JSON.stringify({
+        schemaVersion: 1,
+        activities: [{ studentId: 'nope', activity: 'Robotics Club', source: 'workbook' }],
+      }),
+      'record_student_id_malformed',
+      0,
+      ['S001', 'nope', 'Robotics Club'],
+    ],
+  ]) {
+    it(`distinguishes ${label} as ${expectedReason}`, async (t) => {
+      const context = `store_unreadable / ${expectedReason}`;
+      const isolated = await serviceOverStore(t, name, document);
+
+      const captured = await capturingLog(async () => {
+        const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`, { port: isolated.port });
+        assertErrorEnvelope(response, 500, 'store_unreadable', context);
+      });
+
+      const record = soleRecord(captured, context);
+      assert.strictEqual(record.code, 'store_unreadable', `${context}: the public code`);
+      assert.strictEqual(record.reason, expectedReason, `${context}: the classified reason`);
+      assert.strictEqual(
+        record.at,
+        expectedAt,
+        `${context}: the record index the refusal named, so two bad records are told apart`
+      );
+      assert.strictEqual(record.number, null, `${context}: no package numeric applies`);
+      assertClassificationCarriesNoValues(record, leakCandidates, context);
+    });
+  }
+
+  it('records a refused write as store_write_refused with its errno', async (t) => {
+    const context = 'store_write_failed / store_write_refused';
+    const directory = await makeCaseDirectory('diag-write');
+    // A parent directory that does not exist, so both the temp write and the
+    // rename fail and the errno is the informative part.
+    const storePath = path.join(directory, 'absent-directory', 'activities.json');
+    const isolated = await startIsolatedServer(storePath);
+    t.after(() => isolated.stop());
+
+    const captured = await capturingLog(async () => {
+      const response = await postJson(
+        { studentId: 'S004', activity: 'Unwritable Club' },
+        { port: isolated.port }
+      );
+      assertErrorEnvelope(response, 500, 'store_write_failed', context);
+    });
+
+    const record = soleRecord(captured, context);
+    assert.strictEqual(record.code, 'store_write_failed', `${context}: the public code`);
+    assert.strictEqual(record.reason, 'store_write_refused', `${context}: the classified reason`);
+    assert.strictEqual(
+      record.detail,
+      'ENOENT',
+      `${context}: the errno distinguishes a missing directory from a read-only or full one`
+    );
+    assert.strictEqual(record.method, 'POST', `${context}: the method`);
+  });
+
+  for (const [name, label, expectedReason, expectedDetail, expectedNumber, breakPackage] of [
+    [
+      'diag-compression',
+      'an unsupported compression method',
+      'zip_compression_method',
+      'E_XLSX_UNSUPPORTED_COMPRESSION',
+      99,
+      (bytes) => {
+        bytes.writeUInt16LE(99, 8);
+      },
+    ],
+    [
+      'diag-flags',
+      'a set general-purpose bit flag',
+      'zip_general_purpose_flag',
+      'E_XLSX_UNSUPPORTED_FLAGS',
+      1,
+      (bytes) => {
+        bytes.writeUInt16LE(1, 6);
+      },
+    ],
+  ]) {
+    it(`carries ${label} through the store's wrapper as ${expectedReason}`, async (t) => {
+      const context = `reference_data_unavailable / ${expectedReason}`;
+      const directory = await makeCaseDirectory(name);
+
+      // A real copy of the real workbook with its first local file header
+      // mutated, read by the REAL reader. The refusal under test is the one
+      // the reader actually raises, not a hand-written imitation of it.
+      const workbook = await fsp.readFile(
+        path.join(__dirname, '..', 'student_details.xlsx')
+      );
+      breakPackage(workbook);
+      const brokenWorkbook = path.join(directory, 'student_details.xlsx');
+      await fsp.writeFile(brokenWorkbook, workbook);
+
+      const readerPath = require.resolve('../xlsx-read');
+      const realReader = require('../xlsx-read');
+      const savedCacheEntry = require.cache[readerPath];
+      t.after(() => {
+        require.cache[readerPath] = savedCacheEntry;
+      });
+
+      // The only substitution is WHICH FILE the key-set read opens. Every
+      // refusal, every message and every code still comes from the real
+      // reader parsing real bytes.
+      const isolated = await startIsolatedServer(
+        path.join(directory, 'activities.json'),
+        () => {
+          require.cache[readerPath] = {
+            id: readerPath,
+            filename: readerPath,
+            loaded: true,
+            children: [],
+            paths: [],
+            exports: {
+              readColumn: (file, part, column) =>
+                realReader.readColumn(
+                  file.includes('student_details') ? brokenWorkbook : file,
+                  part,
+                  column
+                ),
+              readSheetRows: (...args) => realReader.readSheetRows(...args),
+              readEntry: (...args) => realReader.readEntry(...args),
+              listEntries: (...args) => realReader.listEntries(...args),
+            },
+          };
+        }
+      );
+      t.after(() => isolated.stop());
+
+      const captured = await capturingLog(async () => {
+        const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`, { port: isolated.port });
+        assertErrorEnvelope(response, 500, 'reference_data_unavailable', context);
+      });
+
+      const record = soleRecord(captured, context);
+      assert.strictEqual(
+        record.code,
+        'reference_data_unavailable',
+        `${context}: the public code`
+      );
+      // The point of the case: the store wraps this refusal in its own generic
+      // sentence, and the reader's distinction must survive that wrap.
+      assert.strictEqual(
+        record.reason,
+        expectedReason,
+        `${context}: the reader's refusal mode, not the wrapper's generic one`
+      );
+      assert.strictEqual(record.detail, expectedDetail, `${context}: the reader's own code`);
+      assert.strictEqual(
+        record.number,
+        expectedNumber,
+        `${context}: the bounded numeric the reader rejected`
+      );
+      // The reader's message names the package it was reading and the entry
+      // inside it. Neither may reach the classification.
+      assertClassificationCarriesNoValues(
+        record,
+        ['student_details', 'sheet1', 'Content_Types', 'DEFLATE', 'only flag 0'],
+        context
+      );
+    });
+  }
+
+  it("names a missing package part rather than the wrapper's generic refusal", async (t) => {
+    const context = 'reference_data_unavailable / package_part_missing';
+    const directory = await makeCaseDirectory('diag-part');
+
+    const readerPath = require.resolve('../xlsx-read');
+    const realReader = require('../xlsx-read');
+    const savedCacheEntry = require.cache[readerPath];
+    t.after(() => {
+      require.cache[readerPath] = savedCacheEntry;
+    });
+
+    const isolated = await startIsolatedServer(
+      path.join(directory, 'activities.json'),
+      () => {
+        require.cache[readerPath] = {
+          id: readerPath,
+          filename: readerPath,
+          loaded: true,
+          children: [],
+          paths: [],
+          exports: {
+            // A part the package genuinely does not hold, so the real reader
+            // raises its real E_XLSX_PART_NOT_FOUND against real bytes.
+            readColumn: (file, part, column) =>
+              realReader.readColumn(file, 'xl/worksheets/sheet9.xml', column),
+            readSheetRows: (...args) => realReader.readSheetRows(...args),
+            readEntry: (...args) => realReader.readEntry(...args),
+            listEntries: (...args) => realReader.listEntries(...args),
+          },
+        };
+      }
+    );
+    t.after(() => isolated.stop());
+
+    const captured = await capturingLog(async () => {
+      const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`, { port: isolated.port });
+      assertErrorEnvelope(response, 500, 'reference_data_unavailable', context);
+    });
+
+    const record = soleRecord(captured, context);
+    assert.strictEqual(record.reason, 'package_part_missing', `${context}: the refusal mode`);
+    assert.strictEqual(
+      record.detail,
+      'E_XLSX_PART_NOT_FOUND',
+      `${context}: the reader's own code`
+    );
+    // The refusal's message names the part it wanted AND lists every part the
+    // package does hold — a list of paths. None of it may appear.
+    assertClassificationCarriesNoValues(
+      record,
+      ['sheet9', 'sheet1', 'docProps', 'Content_Types', 'student_details'],
+      context
+    );
+  });
+
+  it('answers a client with no diagnostic detail at all, whatever it records', async (t) => {
+    const context = 'the client learns nothing the log knows';
+    const isolated = await serviceOverStore(
+      t,
+      'diag-client',
+      JSON.stringify({ schemaVersion: 7, activities: [] })
+    );
+
+    const captured = await capturingLog(async () => {
+      const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`, { port: isolated.port });
+      const payload = assertErrorEnvelope(response, 500, 'store_unreadable', context);
+
+      // The division of labour: the operator gets the classification, the
+      // client gets a fixed sentence and nothing else.
+      assert.ok(
+        !payload.message.includes('schemaVersion'),
+        `${context}: the response names no internal detail`
+      );
+      assert.ok(!payload.message.includes('7'), `${context}: nor the offending value`);
+    });
+
+    const record = soleRecord(captured, context);
+    assert.strictEqual(record.reason, 'store_schema_version', `${context}: the log does know`);
+    assertClassificationCarriesNoValues(record, ['schemaVersion'], context);
+  });
+});
+
 describe('500 internal_error — the rejection boundary in server.js', () => {
   it('answers 500 internal_error for an unexpected rejection, then keeps serving', async (t) => {
     const context = 'internal_error';
@@ -2347,37 +4333,32 @@ describe('500 internal_error — the rejection boundary in server.js', () => {
     // verified against the implementation before this case was written. It is
     // also the ONLY way to reach the boundary: every foreseeable fault is
     // already caught and mapped upstream, so nothing a client can send gets
-    // here. `server.js` logs the induced error to stderr, which is expected
-    // output for this case and not a failure.
+    // here. `server.js` writes one sanitized line to stderr for this fault,
+    // which is expected output for this case and not a failure; the case below
+    // is the one that pins that line's content.
     activities.handle = async () => {
       throw new Error('induced handler failure');
     };
 
     const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`);
 
-    assert.strictEqual(response.status, 500, `${context}: status`);
-    assert.strictEqual(
-      response.headers['content-type'],
-      CONTENT_TYPE_JSON,
-      `${context}: the boundary answers in JSON`
-    );
+    // The boundary is NOT an exception to the envelope. The authoritative
+    // matrix admits exactly one error shape — a stable `error` code and a
+    // fixed `message` sentence for it — and `internal_error` is one of its
+    // rows, so the shared assertion is reused deliberately: it requires the
+    // status, the JSON content type, exactly those two keys, a non-empty
+    // sentence, and no leaked internal detail. Asserting the same shape here
+    // as for the other thirteen codes is what stops the boundary drifting
+    // into a second response schema a client would have to special-case.
+    const payload = assertErrorEnvelope(response, 500, 'internal_error', context);
 
-    const payload = JSON.parse(response.body);
-    // The boundary envelope carries the code and NOTHING ELSE — deliberately
-    // one key, not the two-key envelope `activities.js` sends. Pinned exactly,
-    // because a `message` appearing here would mean the boundary had started
-    // describing a fault it cannot safely describe.
-    assert.deepStrictEqual(
-      Object.keys(payload),
-      ['error'],
-      `${context}: the boundary body is exactly { error }`
-    );
-    assert.strictEqual(payload.error, 'internal_error', `${context}: the code`);
-
-    assertNoInternalDetail(response.body, context);
     assert.ok(
       !response.body.includes('induced'),
       `${context}: the underlying error message must not reach the client`
+    );
+    assert.ok(
+      !payload.message.includes('induced'),
+      `${context}: the sentence is a fixed literal, not the thrown message`
     );
 
     activities.handle = originalHandle;
@@ -2385,6 +4366,111 @@ describe('500 internal_error — the rejection boundary in server.js', () => {
     const recovered = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`);
     assert.strictEqual(recovered.status, 200, `${context}: a normal request still succeeds`);
     parseJsonResponse(recovered, `${context} (recovered)`);
+  });
+
+  it('logs one sanitized line: no Error object, no stack, no query string', async (t) => {
+    const context = 'internal_error log line';
+    const originalHandle = activities.handle;
+    const originalConsoleError = console.error;
+    const calls = [];
+
+    // Restored here as well as inline below, so an assertion that throws
+    // mid-case cannot leave the suite with a swallowed console or a rejecting
+    // `handle` for every later case.
+    t.after(() => {
+      console.error = originalConsoleError;
+      activities.handle = originalHandle;
+    });
+
+    // Shaped like the faults that could actually reach this boundary rather
+    // than a bare `new Error`: a message naming a filesystem path, an
+    // errno-style code, and a nested `cause`. Everything except the name and
+    // the code must be dropped, because handing the value to `console.error`
+    // as a second argument prints its inspected form — the message, the stack
+    // with the absolute path of every source file in it, and the cause.
+    const pathInMessage = 'C:\\scratch\\clone-11\\activities.json';
+    activities.handle = async () => {
+      const fault = new Error(`induced failure writing ${pathInMessage}`);
+      fault.code = 'E_STORE_WRITE_FAILED';
+      fault.cause = new Error('EACCES: permission denied');
+      throw fault;
+    };
+
+    // The submitted-looking values go in the QUERY STRING, which is the half
+    // of the request target the log must drop: a caller can park a Student ID
+    // or an activity label there and would otherwise have it recorded on any
+    // unexpected fault.
+    const queryLabel = 'Confidential Chess Club';
+    const target =
+      `${NAMESPACE}/${KNOWN_STUDENT_ID}` +
+      `?studentId=${KNOWN_STUDENT_ID}&activity=${encodeURIComponent(queryLabel)}`;
+
+    // Captured rather than silenced: the assertion is about what the boundary
+    // writes, so it has to be read back.
+    console.error = (...args) => {
+      calls.push(args);
+    };
+    const response = await get(target);
+    console.error = originalConsoleError;
+
+    assert.strictEqual(response.status, 500, `${context}: the request was still answered`);
+    assert.strictEqual(calls.length, 1, `${context}: the boundary logs exactly once per fault`);
+
+    const [args] = calls;
+    assert.strictEqual(
+      args.length,
+      1,
+      `${context}: one pre-formatted argument — a second argument is how the Error object, its stack and its cause get printed`
+    );
+    assert.strictEqual(
+      typeof args[0],
+      'string',
+      `${context}: the argument is a string, never the thrown value`
+    );
+
+    const line = args[0];
+    assert.ok(!line.includes('\n'), `${context}: one line, so nothing can inject a second`);
+    assert.ok(
+      line.startsWith('request_handler_failed '),
+      `${context}: the line opens with the stable event code, but was ${JSON.stringify(line)}`
+    );
+    assert.ok(
+      line.includes(`path=${NAMESPACE}/${KNOWN_STUDENT_ID} `),
+      `${context}: the bounded pathname is logged, and the trailing space proves nothing was appended to it`
+    );
+    assert.ok(
+      line.includes('method=GET'),
+      `${context}: the method the AAP asks for is logged`
+    );
+    assert.ok(
+      line.includes('code=E_STORE_WRITE_FAILED'),
+      `${context}: the allow-listed fault code survives, because it is the whole diagnostic value of the line`
+    );
+
+    // Each forbidden substring is a distinct leak the naive line produced:
+    // the query string and its values, the thrown message, the nested cause,
+    // a stack frame, and a source path.
+    for (const forbidden of [
+      queryLabel,
+      'Confidential',
+      '?',
+      'studentId=',
+      'activity=',
+      'induced failure',
+      'EACCES',
+      ' at ',
+      '.js',
+      pathInMessage,
+      'C:\\',
+    ]) {
+      assert.ok(
+        !line.includes(forbidden),
+        `${context}: the log line must not contain ${JSON.stringify(forbidden)}, but was ${JSON.stringify(line)}`
+      );
+    }
+
+    activities.handle = originalHandle;
+    await assertStillServing(context);
   });
 
   it('destroys the socket rather than corrupting a response already begun', async (t) => {
@@ -2414,3 +4500,91 @@ describe('500 internal_error — the rejection boundary in server.js', () => {
   });
 });
 
+
+/* ========================================================================= *
+ * The composition seam — the exported surface
+ *
+ * `server.js` exports three symbols and this file is their only caller, so an
+ * export nothing reads here is an export nothing reads at all: a drift in
+ * either literal would pass unnoticed, and the README documents both of them.
+ * The harness already consumes `server` by listening on it, so what these
+ * cases add is a consumer for `hostname` and `port`, plus a pin on the export
+ * surface itself — the AAP fixes it at exactly these three names.
+ *
+ * They also record, in passing, that requiring the module bound nothing: the
+ * port this suite answers on is the ephemeral one the harness asked for, not
+ * the 3000 the export names.
+ * ========================================================================= */
+
+describe('the composition seam — the exported surface', () => {
+  it('exports exactly the live server, the bound hostname and the bound port', () => {
+    const context = 'export surface';
+
+    // THE ACTIVE CHAIN'S MODULE OBJECT, NOT THE LOAD-TIME ONE. `serverModule`
+    // at the top of this file is the object the load-time chain published, and
+    // `startCaseHarness` has since evicted `../server` and re-required it for
+    // this case — that rebinding is required, because it is what lets the
+    // `internal_error` cases patch the module the listening server closes over.
+    // So the load-time object names an instance nothing is listening on, while
+    // this read returns the object the case's own listener was published by.
+    // The `require` resolves the registry entry the harness's own `require`
+    // just populated rather than building a fourth chain, which is precisely
+    // why it yields the live module object.
+    const activeModule = require('../server');
+
+    // Pinned on the ACTIVE object for the same reason: a surface checked on a
+    // module nothing is serving would not be the surface this suite is served
+    // by. The AAP fixes it at exactly these three names.
+    assert.deepStrictEqual(
+      Object.keys(activeModule).sort(),
+      ['hostname', 'port', 'server'],
+      `${context}: exactly these three symbols — none missing, and no fourth`
+    );
+    assert.ok(
+      activeModule.server instanceof http.Server,
+      `${context}: the exported server is a live http.Server`
+    );
+    assert.strictEqual(
+      activeModule.server,
+      server,
+      `${context}: it is the very instance this suite listens on, not a copy`
+    );
+  });
+
+  it('exports the loopback hostname the listener is actually bound to', () => {
+    const context = 'exported hostname';
+
+    assert.strictEqual(
+      serviceHostname,
+      '127.0.0.1',
+      `${context}: the bind stays loopback-only, so the literal must be preserved`
+    );
+    assert.strictEqual(
+      serviceHostname,
+      HOST,
+      `${context}: it is the host this suite connects to`
+    );
+    assert.strictEqual(
+      server.address().address,
+      serviceHostname,
+      `${context}: the export is the address the listener holds, not one re-derived by the caller`
+    );
+  });
+
+  it('exports the fixed port 3000, which is not the ephemeral port the harness bound', () => {
+    const context = 'exported port';
+
+    assert.strictEqual(typeof servicePort, 'number', `${context}: a number, not a string`);
+    assert.strictEqual(servicePort, 3000, `${context}: the preserved literal`);
+    assert.strictEqual(
+      server.address().port,
+      activePort(),
+      `${context}: the live port is the one the harness asked the OS for`
+    );
+    assert.notStrictEqual(
+      server.address().port,
+      servicePort,
+      `${context}: requiring the module bound nothing, so 3000 stays free for test/lifecycle.test.js`
+    );
+  });
+});

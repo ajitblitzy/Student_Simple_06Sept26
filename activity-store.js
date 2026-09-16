@@ -75,6 +75,19 @@
  * condition, so it is a `TypeError` or `RangeError` and carries none of these
  * codes.
  *
+ * One further refusal exists and is deliberately OUTSIDE that vocabulary:
+ *
+ *   E_STORE_PATH_PROTECTED  `ACTIVITY_STORE` names a tracked file of this
+ *                           repository. A `RangeError`, thrown at MODULE
+ *                           LOAD. -> no status
+ *
+ * It is a CONFIGURATION fault rather than a request outcome, so it is not in
+ * the mapping `activities.js` holds and cannot be: nothing can reach a
+ * request handler, because `require` itself fails and the service does not
+ * start. That is the intended disposition — a store path pointing at a
+ * workbook or at `LICENSE` must stop the process, not be discovered by the
+ * first submission that renames a document over student data.
+ *
  * Every failure path is NON-DESTRUCTIVE. A store this module refuses to load
  * is left exactly as found — never overwritten, never silently repaired —
  * because the document is a plain file a person can edit, and a hand-edit
@@ -89,15 +102,80 @@
  * insufficient for a second process — which nothing here runs, and which the
  * service's fixed port prevents in any case.
  *
- * Usage:
+ * Usage. Complete and runnable as written — this is CommonJS with no
+ * top-level `await`, so the sequence lives in an async function that a
+ * caller invokes.
+ *
+ * Note what `checkStudentId` below does NOT do: test membership alone.
+ * `isKnownStudent` answers `false` for three different mistakes — a MISSING
+ * value, a MALFORMED one, and a well-formed value that names NO student —
+ * while the endpoint contract keeps them apart: `400 student_id_required`,
+ * `400 student_id_malformed` and `404 student_not_found` respectively. So the
+ * example checks presence, then form, then membership, in that order.
+ * `activities.js` owns that precedence for real requests (presence before
+ * type before format before existence, and an empty string counts as
+ * PRESENT, hence malformed rather than missing); the sequence is mirrored
+ * here only so a reader copying this block does not collapse three answers
+ * into one:
+ *
  *   const store = require('./activity-store');
- *   if (!store.isKnownStudent('S001')) { ... }                 // 404
- *   const label = store.normalizeLabel('  Chess   Club  ');    // 'Chess Club'
- *   const { created, record } = await store.addActivity('S001', label);
- *   const records = await store.listActivities('S001');
+ *
+ *   const STUDENT_ID_FORM = /^S\d{3}$/;
+ *
+ *   function checkStudentId(studentId) {
+ *     if (studentId === undefined || studentId === null) {
+ *       return { status: 400, body: { error: 'student_id_required' } };
+ *     }
+ *     if (typeof studentId !== 'string' || !STUDENT_ID_FORM.test(studentId)) {
+ *       return { status: 400, body: { error: 'student_id_malformed' } };
+ *     }
+ *     if (!store.isKnownStudent(studentId)) {
+ *       return { status: 404, body: { error: 'student_not_found' } };
+ *     }
+ *     return null;
+ *   }
+ *
+ *   async function submit(studentId, rawLabel) {
+ *     const refusal = checkStudentId(studentId);
+ *     if (refusal !== null) {
+ *       return refusal;
+ *     }
+ *     let label;
+ *     try {
+ *       label = store.normalizeLabel(rawLabel);   // '  Chess   Club  ' -> 'Chess Club'
+ *     } catch (error) {
+ *       if (error.code === 'E_LABEL_INVALID') {
+ *         return { status: 400, body: { error: 'activity_invalid' } };
+ *       }
+ *       throw error;
+ *     }
+ *     const { created, record } = await store.addActivity(studentId, label);
+ *     return { status: created ? 201 : 200, body: record };
+ *   }
+ *
+ *   async function list(studentId) {
+ *     // A path segment is always present, so only the form and membership
+ *     // legs can fire on this route; the same helper serves both.
+ *     const refusal = checkStudentId(studentId);
+ *     if (refusal !== null) {
+ *       return refusal;
+ *     }
+ *     const records = await store.listActivities(studentId);
+ *     return { status: 200, body: { studentId, activities: records } };
+ *   }
+ *
+ *   // Where the records are going, for a startup log line:
+ *   console.log('activity store:', store.storePath());
  */
 
 const fs = require('node:fs/promises');
+/* The synchronous surface, for the ONE thing the promise API cannot do at
+ * module load: canonicalize the configured store path before anything is read
+ * or written. A module body cannot await, and the check has to complete
+ * before the first export is handed out. Everything else in this file stays
+ * on `node:fs/promises`. Both are the same built-in, so no dependency is
+ * added. */
+const fsSync = require('node:fs');
 const path = require('node:path');
 const xlsxRead = require('./xlsx-read');
 
@@ -117,6 +195,9 @@ const xlsxRead = require('./xlsx-read');
  * independently, so it follows the variable wherever it points and always
  * sits in the same directory — hence on the same filesystem, which is what
  * makes the rename in `writeDocument` atomic rather than a copy.
+ *
+ * The one destination the variable may NOT name is a tracked file of this
+ * repository; the block immediately below refuses that at load.
  * ------------------------------------------------------------------------- */
 
 const DEFAULT_STORE_FILE_NAME = 'activities.json';
@@ -125,6 +206,221 @@ const TEMPORARY_FILE_SUFFIX = '.tmp';
 const RESOLVED_STORE_PATH =
   process.env.ACTIVITY_STORE || path.join(__dirname, DEFAULT_STORE_FILE_NAME);
 const RESOLVED_TEMPORARY_PATH = RESOLVED_STORE_PATH + TEMPORARY_FILE_SUFFIX;
+
+/* ------------------------------------------------------------------------- *
+ * The destinations this module refuses to write, and the load-time check.
+ *
+ * `ACTIVITY_STORE` is external configuration and a write is a `rename` OVER
+ * the target, not an append: a mistyped value pointing at a workbook or at
+ * `LICENSE` would not corrupt that file, it would REPLACE it. The workbooks
+ * and `LICENSE` are read-only to this feature, so the guarantee has to be
+ * mechanical rather than a documented expectation.
+ *
+ * The comparison is by filesystem IDENTITY rather than by string, because a
+ * file can have more than one name: `./LICENSE` and `test/../LICENSE` are
+ * collapsed by resolution, but a Windows 8.3 short name, a junction, a
+ * symbolic link and a mapped drive are not, and a guard that compared names
+ * would refuse the spelling it expected while accepting every other spelling
+ * of the same file. `canonicalizeForComparison` below is what settles that.
+ *
+ * The refusal is at MODULE LOAD, before a single read or write can happen,
+ * and it is a `RangeError` carrying `E_STORE_PATH_PROTECTED` — see the
+ * failure vocabulary in the header: it is a CONFIGURATION fault, not one of
+ * the four request-time refusal codes, and `activities.js` neither maps it
+ * nor can ever meet it. Failing fast is the point: a static misconfiguration
+ * should stop the service starting rather than let every request rediscover
+ * it, and stopping at load is what proves nothing was staged over protected
+ * data in the meantime.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The refusal code for a protected destination. Deliberately NOT one of the
+ * four codes in the section below: those four reach a client as a status,
+ * while this one can only ever be thrown out of `require`.
+ */
+const CODE_STORE_PATH_PROTECTED = 'E_STORE_PATH_PROTECTED';
+
+/**
+ * Every tracked file that sits beside this module: the AAP's read-only
+ * reference data — the three workbooks and `LICENSE` — plus the twelve files
+ * this feature's own patch commits. Named repository-relative, with `/` as
+ * the separator, and joined against `__dirname` below, so the list reads as
+ * the repository rather than as one host's paths.
+ *
+ * `activities.json` and `activities.json.tmp` are deliberately ABSENT: they
+ * are the default store and its staging sibling, which this module exists to
+ * write, and which `.gitignore` keeps untracked.
+ */
+const PROTECTED_REPOSITORY_FILES = [
+  'student_details.xlsx',
+  'student_academics.xlsx',
+  'student_other_info.xlsx',
+  'LICENSE',
+  'server.js',
+  'activities.js',
+  'activity-store.js',
+  'xlsx-read.js',
+  'package.json',
+  'package-lock.json',
+  '.nvmrc',
+  '.gitignore',
+  'README.md',
+  'test/activities.test.js',
+  'test/store.test.js',
+  'test/lifecycle.test.js',
+];
+
+/**
+ * Whether the filesystem holding this repository compares names without
+ * regard to case — MEASURED, not inferred from `process.platform`.
+ *
+ * The probe flips the case of this module's own file name and asks whether
+ * that name resolves beside it. The file is guaranteed to be there: it is the
+ * one being loaded. So a hit can only mean the filesystem folded the case,
+ * and a miss can only mean it did not.
+ *
+ * A platform guess — `win32 || darwin` — was the previous answer and is wrong
+ * in both directions: a case-SENSITIVE APFS or ReFS volume would be assumed
+ * to fold, and a case-insensitive volume mounted under Linux would be assumed
+ * not to. Folding where the filesystem does not is the damaging direction for
+ * this guard, because it would false-refuse a genuinely distinct name such as
+ * `license` sitting beside `LICENSE`, so the answer comes from the filesystem
+ * itself. For a candidate that EXISTS the question does not arise at all —
+ * `canonicalizeForComparison` gets the filesystem's own identity for it — and
+ * this constant is applied only to the fallback form below.
+ *
+ * `fs.existsSync` reports `false` rather than throwing for every failure, so
+ * the probe cannot itself raise at module load. The platform default survives
+ * for the one case the probe cannot express: a module file name with no cased
+ * letter to flip, which this name is not and which only a rename could
+ * introduce.
+ */
+const CASE_INSENSITIVE_FILESYSTEM = (() => {
+  const ownName = path.basename(__filename);
+  const flippedName =
+    ownName === ownName.toLowerCase() ? ownName.toUpperCase() : ownName.toLowerCase();
+  if (flippedName === ownName) {
+    return process.platform === 'win32' || process.platform === 'darwin';
+  }
+  return fsSync.existsSync(path.join(__dirname, flippedName));
+})();
+
+/**
+ * Builds a canonical form of a path for COMPARISON ONLY.
+ *
+ * Never used as a path to open. `RESOLVED_STORE_PATH` stays exactly what was
+ * configured — `storePath()` returns it verbatim, and a caller asserting on
+ * it gets back precisely what it set — so this form exists solely to decide
+ * whether two strings name one file.
+ *
+ * Two forms, and which one is produced depends on whether the candidate
+ * exists on disk:
+ *
+ *   1. IT EXISTS — `fs.realpathSync.native` of the whole resolved path. That
+ *      is the filesystem's own answer to "which file is this", so it collapses
+ *      every alias the host offers rather than the ones this code thought to
+ *      anticipate: a Windows 8.3 short name (`STUDEN~2.XLS` ->
+ *      `student_details.xlsx`), the on-disk casing, a symbolic link, a
+ *      junction, a substituted or mapped drive, and the `::$DATA` stream
+ *      spelling of a file. No platform assumption is involved and no case
+ *      folding is needed — two names of one file produce one identical string.
+ *   2. IT DOES NOT EXIST — `path.resolve`, then the real path of the PARENT
+ *      directory with the resolved basename rejoined, case-folded where the
+ *      filesystem folds case. This is the ordinary case for a store that is
+ *      about to be created, and the only reason a fallback is needed at all:
+ *      there is nothing on disk to interrogate.
+ *
+ * The fallback is sound because of what it cannot miss. A path that does not
+ * exist cannot BE an existing protected file, so the only collision left for
+ * it to report is one against a protected file that is itself absent from the
+ * checkout — a partial or hand-pruned tree — and that collision is still
+ * caught, because both sides of the comparison are produced by this same
+ * function and so take the same branch for the same file.
+ *
+ * Cost matters here: this runs at module load, once per protected name plus
+ * twice for the configured paths, and the test suite re-requires the module
+ * dozens of times. Each call is one `realpath` — two only when the candidate
+ * is absent — and the protected map it feeds is built exactly once.
+ *
+ * @param {string} candidate The path to canonicalize.
+ * @returns {string} A form that compares equal for two names of one file.
+ */
+function canonicalizeForComparison(candidate) {
+  const absolute = path.resolve(candidate);
+
+  try {
+    return fsSync.realpathSync.native(absolute);
+  } catch {
+    /* Not resolvable as a whole: the candidate itself, or a directory on the
+     * way to it, is absent. The parent-relative form below stands in. */
+  }
+
+  const parent = path.dirname(absolute);
+  let realParent = parent;
+  try {
+    realParent = fsSync.realpathSync.native(parent);
+  } catch {
+    /* A configured-but-missing parent directory is a legitimate state: the
+     * store refuses the eventual write with E_STORE_WRITE_FAILED rather than
+     * creating the directory. So the resolved form stands in for the real
+     * one, which still compares correctly against a protected entry built the
+     * same way. */
+    realParent = parent;
+  }
+
+  const rejoined = path.join(realParent, path.basename(absolute));
+  return CASE_INSENSITIVE_FILESYSTEM ? rejoined.toLowerCase() : rejoined;
+}
+
+/**
+ * The protected files by canonical form, mapping back to the
+ * repository-relative name a refusal should quote. Built once, at load.
+ *
+ * Every entry goes through `canonicalizeForComparison` — the same function
+ * every candidate goes through — so an entry and a candidate that name one
+ * file take the same branch there and produce the same string. That symmetry
+ * is what makes the lookup below a single `Map.get` rather than a scan with
+ * per-platform special cases.
+ *
+ * @type {Map<string, string>}
+ */
+const PROTECTED_DESTINATIONS = new Map(
+  PROTECTED_REPOSITORY_FILES.map((relativeName) => [
+    canonicalizeForComparison(path.join(__dirname, ...relativeName.split('/'))),
+    relativeName,
+  ])
+);
+
+/**
+ * Refuses a configured destination that names a protected repository file.
+ *
+ * Both the store path and its derived staging sibling are checked. No
+ * protected name ends in `.tmp`, so the derived path can only collide through
+ * a store path that already collides — but it is checked rather than reasoned
+ * about, because the derivation is a string concatenation that a future
+ * change to `TEMPORARY_FILE_SUFFIX` could invalidate silently.
+ *
+ * @param {string} candidate The configured or derived destination.
+ * @param {string} role How the message should describe it.
+ * @returns {void}
+ * @throws {RangeError} `E_STORE_PATH_PROTECTED` when it names a protected
+ *   file. The message carries the repository-relative name rather than an
+ *   absolute path, so a log line stays free of host detail.
+ */
+function refuseProtectedDestination(candidate, role) {
+  const collision = PROTECTED_DESTINATIONS.get(canonicalizeForComparison(candidate));
+  if (collision === undefined) {
+    return;
+  }
+  const error = new RangeError(
+    `activity-store: ACTIVITY_STORE resolves ${role} to ${collision}, a file of this repository that the activity store must never write; point ACTIVITY_STORE at a path outside the repository`
+  );
+  error.code = CODE_STORE_PATH_PROTECTED;
+  throw error;
+}
+
+refuseProtectedDestination(RESOLVED_STORE_PATH, 'the store');
+refuseProtectedDestination(RESOLVED_TEMPORARY_PATH, 'the derived staging sibling');
 
 /* ------------------------------------------------------------------------- *
  * The document and record vocabulary.
@@ -138,6 +434,26 @@ const SOURCE_SUBMISSION = 'submission';
 
 /** A record seeded from the workbook column. Carries NO `submittedAt`. */
 const SOURCE_WORKBOOK = 'workbook';
+
+/**
+ * The document's own keys, exhaustively. A document carrying anything else is
+ * REFUSED rather than read, because this module rewrites the document whole in
+ * canonical form on every change: an unrecognized key that loaded cleanly
+ * would be erased by the next submission, which is data loss dressed up as a
+ * successful write.
+ */
+const RECOGNIZED_DOCUMENT_KEYS = new Set(['schemaVersion', 'activities']);
+
+/**
+ * The union of a record's own keys across both provenances, for the same
+ * reason. This set is deliberately the UNION and not the per-source shape —
+ * `submittedAt` belongs to a `submission` record only. The narrower
+ * per-source rule is enforced separately in `validateRecord`, which is what
+ * makes the two rules together say exactly: a `workbook` record carries
+ * `studentId`, `activity` and `source`; a `submission` record carries those
+ * three plus `submittedAt`; nothing carries anything else.
+ */
+const RECOGNIZED_RECORD_KEYS = new Set(['studentId', 'activity', 'source', 'submittedAt']);
 
 /** Indentation for the serialized document, so a person can read and edit it. */
 const JSON_INDENT = 2;
@@ -156,22 +472,36 @@ const MIN_LABEL_LENGTH = 1;
 const MAX_LABEL_LENGTH = 60;
 
 /**
- * Control characters, rejected in any label. C0 (`\u0000`-`\u001f`, which
- * includes tab, newline and carriage return), DEL, and C1.
+ * Control characters AND line separators, rejected in any label:
+ *
+ *   - C0, `\u0000`-`\u001f`, which includes tab, newline and carriage return;
+ *   - DEL and C1, `\u007f`-`\u009f`;
+ *   - `\p{Zl}` LINE SEPARATOR (U+2028) and `\p{Zp}` PARAGRAPH SEPARATOR
+ *     (U+2029).
+ *
+ * The last two are here rather than in the trim/collapse class below on
+ * purpose. They are line terminators, not spaces — Unicode gives them their
+ * own categories precisely because they break a line — so laundering one into
+ * a space would ACCEPT a label carrying a line break, exactly as laundering a
+ * newline would. A label is a single line of text, so the honest answer for
+ * both is refusal. Left out of this class entirely they would be worse than
+ * either: neither trimmed, nor collapsed, nor refused, so `Chess\u2028Club`
+ * would persist and produce a composite key distinct from `Chess Club`, and
+ * the loader would then read it back as already normalized.
  */
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
+const CONTROL_OR_LINE_SEPARATOR_PATTERN = /[\u0000-\u001f\u007f-\u009f\p{Zl}\p{Zp}]/u;
 
 /**
  * The whitespace that is trimmed and collapsed. Deliberately the Unicode
  * SPACE SEPARATOR category and nothing else.
  *
  * This is the load-bearing choice in normalization. Using a general `\s`
- * class would silently launder a tab or a newline into a space, so a label
- * carrying one would be ACCEPTED instead of refused. Because a control
- * character is not a space separator, it survives trimming and collapsing
- * untouched and is then rejected by the check that follows — which is both
- * what the specification asks for and the only order in which the two rules
- * do not cancel each other out.
+ * class would silently launder a tab, a newline or a U+2028 LINE SEPARATOR
+ * into a space, so a label carrying one would be ACCEPTED instead of refused.
+ * Because none of those is a space separator, each survives trimming and
+ * collapsing untouched and is then rejected by the check that follows — which
+ * is both what the specification asks for and the only order in which the two
+ * rules do not cancel each other out.
  */
 const LEADING_SPACE_PATTERN = /^\p{Zs}+/u;
 const TRAILING_SPACE_PATTERN = /\p{Zs}+$/u;
@@ -306,8 +636,9 @@ function describeValue(value) {
  *
  *   1. Trim leading and trailing space separators.
  *   2. Collapse every internal run of space separators to a single space.
- *   3. Reject any remaining control character. A tab or newline reaches this
- *      step intact because step 2 collapses space separators only.
+ *   3. Reject any remaining control character or line separator. A tab, a
+ *      newline or a U+2028 LINE SEPARATOR reaches this step intact because
+ *      step 2 collapses space separators only.
  *   4. Enforce the length bound, measured AFTER the two steps above, so
  *      padding cannot push a legitimate label over the limit.
  *
@@ -315,8 +646,13 @@ function describeValue(value) {
  * stored as typed. Case is folded only for the composite-key comparison in
  * `compositeKey`, never in what is stored.
  *
- * Length is counted in code points rather than UTF-16 units, so a character
- * outside the Basic Multilingual Plane counts once rather than twice.
+ * Length is counted in UTF-16 CODE UNITS, which is `String.prototype.length`.
+ * That is not an oversight in favour of code points: the intake form's
+ * `maxlength="60"` is evaluated by the browser in code units, so counting
+ * code points here would accept over the JSON API a label of astral
+ * characters that the native form refuses to submit — one bound with two
+ * answers. A character outside the Basic Multilingual Plane therefore counts
+ * twice, on both sides of the wire.
  *
  * @param {unknown} raw The submitted or stored label.
  * @returns {{ok: true, value: string}|{ok: false, reason: string}} On success
@@ -333,11 +669,11 @@ function inspectLabel(raw) {
     .replace(TRAILING_SPACE_PATTERN, '')
     .replace(INTERNAL_SPACE_RUN_PATTERN, ' ');
 
-  if (CONTROL_CHARACTER_PATTERN.test(normalized)) {
-    return { ok: false, reason: 'must not contain control characters' };
+  if (CONTROL_OR_LINE_SEPARATOR_PATTERN.test(normalized)) {
+    return { ok: false, reason: 'must not contain control characters or line separators' };
   }
 
-  const length = Array.from(normalized).length;
+  const length = normalized.length;
   if (length < MIN_LABEL_LENGTH) {
     return { ok: false, reason: 'must not be empty once surrounding whitespace is removed' };
   }
@@ -471,6 +807,10 @@ let cachedSeedRecords = null;
  * Reads one column of one workbook, translating every refusal the reader can
  * raise into this module's reference-data code.
  *
+ * The reader decodes only the column named here, so a key-set read does not
+ * materialise the name, date of birth, email, phone or city sitting in the
+ * same rows.
+ *
  * The reader's own codes are deliberately not re-exposed: a caller acting on
  * `E_XLSX_TRUNCATED` would be reaching past this module's contract, and all
  * of them mean the same thing here — the reference data cannot be trusted.
@@ -578,8 +918,39 @@ function loadSeedRecords() {
   }
 
   const keySet = loadKeySet();
-  const studentIds = readWorkbookColumn(SEED_WORKBOOK, SEED_STUDENT_ID_COLUMN);
-  const labels = readWorkbookColumn(SEED_WORKBOOK, SEED_LABEL_COLUMN);
+
+  /* Both columns come from ONE read, inflate and parse of one immutable
+   * workbook. Two `readWorkbookColumn` calls would do all three twice over for
+   * the same bytes — the reader is stateless by design and holds no cache — and
+   * this runs on the first request that needs seed data, blocking the single
+   * event loop while it does. Asking the reader for both columns at once also
+   * keeps the read minimal in the other direction: no cell of the four columns
+   * this feature has no use for is decoded. */
+  const seedColumns = [SEED_STUDENT_ID_COLUMN, SEED_LABEL_COLUMN];
+  let seedRows;
+  try {
+    seedRows = xlsxRead.readSheetRows(
+      path.join(__dirname, SEED_WORKBOOK),
+      WORKSHEET_PART,
+      seedColumns
+    );
+  } catch (cause) {
+    throw refuse(
+      CODE_REFERENCE_DATA,
+      `columns ${seedColumns.join(' and ')} of ${SEED_WORKBOOK} could not be read (${describeCause(cause)})`,
+      cause
+    );
+  }
+
+  /* A row with no cell in a column contributes the empty string rather than
+   * being skipped, so both columns stay aligned with each other and with the
+   * worksheet's own row order. */
+  const columnOf = (columnLetter) =>
+    seedRows.map((row) =>
+      Object.prototype.hasOwnProperty.call(row, columnLetter) ? row[columnLetter] : ''
+    );
+  const studentIds = columnOf(SEED_STUDENT_ID_COLUMN);
+  const labels = columnOf(SEED_LABEL_COLUMN);
   const rowCount = Math.min(studentIds.length, labels.length);
 
   const records = [];
@@ -709,15 +1080,41 @@ async function readStoreText() {
 }
 
 /**
+ * Finds the first own key of `value` that `recognized` does not contain.
+ *
+ * `Object.keys` is deliberate: it enumerates OWN enumerable keys only, which
+ * is exactly what `JSON.parse` produces — including a `__proto__` key, which
+ * `JSON.parse` materialises as an ordinary own property rather than as a
+ * prototype assignment, and which therefore has to be caught here like any
+ * other unrecognized key.
+ *
+ * @param {Object} value The parsed object to inspect.
+ * @param {Set<string>} recognized The keys the shape declares.
+ * @returns {string|null} The first unrecognized key, or null when there is
+ *   none.
+ */
+function findUnexpectedKey(value, recognized) {
+  for (const key of Object.keys(value)) {
+    if (!recognized.has(key)) {
+      return key;
+    }
+  }
+  return null;
+}
+
+/**
  * Validates one record and returns it in canonical form.
  *
  * Messages name the record's index, and the offending value where naming it
  * helps, because an index is what a person needs in order to find the record
  * in a document they are about to hand-edit.
  *
- * Fields beyond the four the shape declares are not carried over. The
- * document is rewritten whole in canonical form on every change, so keeping
- * an unrecognized field would promise a durability this module cannot offer.
+ * A key beyond the four the shape declares is REFUSED, before anything is
+ * canonicalized. Carrying it over is impossible — the document is rewritten
+ * whole in canonical form on every change — and dropping it silently is
+ * worse: the read would succeed and the next submission would erase a
+ * hand-edited field without anyone being told. Refusing leaves the file
+ * exactly as found and puts the decision back with the person who edited it.
  *
  * @param {unknown} raw The parsed array element.
  * @param {number} index Its position in `activities`.
@@ -731,6 +1128,19 @@ function validateRecord(raw, index, keySet) {
     throw refuse(
       CODE_STORE_UNREADABLE,
       `the activity at index ${index} must be an object; it is ${describeValue(raw)}`
+    );
+  }
+
+  /* The key set is checked FIRST, so an unrecognized key is reported as
+   * itself rather than as whatever field-level complaint happens to follow
+   * it. The per-source provenance rule further down narrows this union: it is
+   * what refuses a `workbook` record that carries `submittedAt`, with a
+   * message that names the provenance conflict rather than the key. */
+  const unexpectedRecordKey = findUnexpectedKey(raw, RECOGNIZED_RECORD_KEYS);
+  if (unexpectedRecordKey !== null) {
+    throw refuse(
+      CODE_STORE_UNREADABLE,
+      `the activity at index ${index} carries the unexpected key ${JSON.stringify(unexpectedRecordKey)}; a record holds studentId, activity, source and submittedAt only, and the document is rewritten whole on every change, so an unrecognized key would be erased by the next submission rather than kept`
     );
   }
 
@@ -815,6 +1225,19 @@ function parseStoreDocument(text, keySet) {
     throw refuse(
       CODE_STORE_UNREADABLE,
       `the activity store must hold a JSON object; it holds ${describeValue(parsed)}`
+    );
+  }
+
+  /* Checked before the two fields below, and for the same reason the record
+   * check is: this module writes `schemaVersion` and `activities` and nothing
+   * else, so a third top-level key would survive one read and be erased by
+   * the next write. Together with the presence-and-type checks that follow,
+   * this says the document's own keys are exactly those two. */
+  const unexpectedDocumentKey = findUnexpectedKey(parsed, RECOGNIZED_DOCUMENT_KEYS);
+  if (unexpectedDocumentKey !== null) {
+    throw refuse(
+      CODE_STORE_UNREADABLE,
+      `the activity store carries the unexpected top-level key ${JSON.stringify(unexpectedDocumentKey)}; this build reads schemaVersion and activities only, and the document is rewritten whole on every change, so an unrecognized key would be erased by the next submission rather than kept`
     );
   }
 
@@ -928,14 +1351,25 @@ async function writeDocument(document) {
 /* ------------------------------------------------------------------------- *
  * The write mutex
  *
- * The store is the one file that changes, so it is never cached: it is read
- * from disk inside this critical section on every submission AND on every
- * read, because a stale in-memory copy would produce a lost update. At ten
- * students and one small document that costs nothing worth optimizing.
+ * The store is the one file that changes, so it is NEVER cached: it is read
+ * from disk on every submission and on every read, because a stale in-memory
+ * copy would produce a lost update. At ten students and one small document
+ * that costs nothing worth optimizing.
+ *
+ * What this critical section covers is exactly the WRITES. A submission's
+ * whole read-modify-write runs inside it, because two interleaved cycles
+ * would each load the same document and the second rename would discard the
+ * first's record. A READ is deliberately outside it: the write is published
+ * by an atomic rename, so a reader already sees either the complete previous
+ * document or the complete new one and never a partial change. Queueing
+ * reads on the mutation chain would buy nothing and cost everything — every
+ * read would wait behind other submissions' loads, validation,
+ * stringification, staging writes and renames.
  *
  * A module-level promise chain is sufficient for one single-threaded process
  * and is not a substitute for file locking across processes, which is out of
- * scope.
+ * scope. Nothing else coordinates: there is no reader/writer lock, no queue
+ * and no cache anywhere in this module's store path.
  * ------------------------------------------------------------------------- */
 
 /** @type {Promise<unknown>} The tail of the chain. Never left rejected. */
@@ -1051,8 +1485,9 @@ function isKnownStudent(studentId) {
  * @returns {string} The normalized label, for example `'Chess Club'`, with
  *   the submitted casing preserved.
  * @throws {Error} E_LABEL_INVALID when the label is not a string, is empty
- *   once trimmed, carries a control character, or falls outside the
- *   1-to-60-character bound once normalized.
+ *   once trimmed, carries a control character or a line separator, or falls
+ *   outside the 1-to-60-character bound — counted in UTF-16 code units, as
+ *   the intake form's `maxlength` is — once normalized.
  */
 function normalizeLabel(raw) {
   const inspected = inspectLabel(raw);
@@ -1133,9 +1568,14 @@ function addActivity(studentId, normalizedLabel) {
  * checkout answers with the labels the workbook records, and the store is
  * created only by an actual submission.
  *
- * The read runs inside the same critical section as a write, so it observes
- * either the document before a concurrent submission or the one after it,
- * never a partially applied change.
+ * The store is read from disk on every call and is never cached, so a read
+ * always answers from the current document. It does NOT enter the write
+ * mutex: a submission publishes its document with an atomic rename, so a
+ * reader observes either the document before that submission or the one
+ * after it — never a partially applied change — and that guarantee comes
+ * from the rename rather than from the queue. Keeping reads out of the chain
+ * is what stops every `GET` waiting behind other submissions' reads,
+ * validation, stringification, staging writes and renames.
  *
  * Unlike a write, this does not require the Student ID to be known: a caller
  * owns the decision to refuse an unknown student, and an identifier that
@@ -1148,21 +1588,19 @@ function addActivity(studentId, normalizedLabel) {
  * @throws {TypeError} When `studentId` is not a string.
  * @throws {Error} E_REFERENCE_DATA or E_STORE_UNREADABLE.
  */
-function listActivities(studentId) {
-  return serialize(async () => {
-    if (typeof studentId !== 'string') {
-      throw new TypeError(
-        `activity-store: studentId must be a string; received ${describeValue(studentId)}`
-      );
-    }
+async function listActivities(studentId) {
+  if (typeof studentId !== 'string') {
+    throw new TypeError(
+      `activity-store: studentId must be a string; received ${describeValue(studentId)}`
+    );
+  }
 
-    const keySet = loadKeySet();
-    const document = await loadDocument(keySet);
+  const keySet = loadKeySet();
+  const document = await loadDocument(keySet);
 
-    return document.activities
-      .filter((record) => record.studentId === studentId)
-      .map(cloneRecord);
-  });
+  return document.activities
+    .filter((record) => record.studentId === studentId)
+    .map(cloneRecord);
 }
 
 /**
@@ -1181,4 +1619,3 @@ function storePath() {
 }
 
 module.exports = { isKnownStudent, normalizeLabel, addActivity, listActivities, storePath };
-
