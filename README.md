@@ -27,15 +27,18 @@ the runtime contract is actually enforced is `npm test`, which refuses to run a 
 npm start          # equivalently: node server.js
 ```
 
-The service binds `127.0.0.1:3000` and prints one readiness line to stdout:
+Started that way — from the command line, with `server.js` as the process entry point — the service
+binds `127.0.0.1:3000` and prints one readiness line to stdout:
 
 ```text
 Server running at http://127.0.0.1:3000/
 ```
 
-Requiring the entrypoint as a module binds no port: `listen` runs only when `server.js` is the
-process entry point. `require('./server')` exposes `resolveConfig`, `createServer` (a non-listening
-server) and `start` (a promise that resolves with the listening server).
+Requiring the entrypoint as a module binds no port and prints no banner: `listen` runs only when
+`server.js` is the process entry point. `require('./server')` exposes `resolveConfig`,
+`createServer` (a non-listening server) and `start` (a promise that resolves with the listening
+server). Which failures reach stderr and which are thrown or rejected instead is set out under
+[How a rejected value surfaces](#how-a-rejected-value-surfaces).
 
 ## Configuration
 
@@ -51,11 +54,41 @@ Every value has the same precedence: an explicit `options` property passed to `c
 
 **Relative path values resolve against the entrypoint's directory, never against the current
 working directory**, so `node /path/to/server.js` reads the committed workbooks and registry no
-matter where it was launched from. A rejected value fails startup with one stderr line naming the
-value and a non-zero exit code.
+matter where it was launched from.
 
-The banner reports the host and the port actually bound, so a run with `PORT=0` prints the
-ephemeral port it received.
+`MIN_TESTS` is the one further environment variable this project reads, and it configures the
+**test guard rather than the service**; it is documented with the rest of the verification surface
+under [Verification](#verification).
+
+### How a rejected value surfaces
+
+A rejected configuration value — or a data source that cannot be loaded — surfaces differently
+depending on which entry point resolved it, and the difference is deliberate:
+
+- **Programmatically, nothing is written to stderr and no exit code is set.** `resolveConfig` and
+  `createServer` **throw synchronously**: `code === 'SERVER_CONFIG_INVALID'` for a configuration
+  fault, and the loader's own `WORKBOOK_READ_FAILED`, `STUDENT_DIRECTORY_INVALID` or
+  `ACTIVITY_REPOSITORY_INVALID` for a data fault. `createServer` never listens, so it cannot
+  produce a bind error at all; `start` additionally **rejects** its promise when the bind itself
+  fails, naming the host, the port and the code — `EADDRINUSE` among them. Library code never
+  calls `process.exit`.
+- **From the command line** — `npm start`, or any `node server.js` run where this file is the
+  process entry point — that same failure becomes process behaviour in exactly one place: one line
+  on stderr, prefixed `server.js:` and naming the offending value, and exit code `1`.
+
+```bash
+PORT=abc node server.js; echo "exit=$?"
+```
+
+```text
+server.js: port must be one to five decimal digits with nothing else, not a fraction and not an empty value: "abc"
+exit=1
+```
+
+The startup banner belongs to that same command-line path: `npm start` prints it from the resolved
+host and the port actually bound, so a CLI run with `PORT=0` reports the ephemeral port it
+received. A programmatic `start()` prints no banner — it resolves with the listening server, whose
+`config` property carries the resolved values and whose `address()` reports the bound port.
 
 ## Endpoints
 
@@ -71,6 +104,11 @@ ephemeral port it received.
 - `{studentId}` is trimmed and upper-cased, then matched against `/^S\d{3}$/`, so `s001` and
   `%20S001%20` both address `S001`. The response always reports the normalized identifier. No
   padding is inferred — `S1` is malformed, not `S001`.
+- A **known student holding no activity** answers `200` with `{"count": 0, "activities": []}`,
+  never `404`. The two are kept distinguishable on purpose: `404 STUDENT_NOT_FOUND` means the
+  directory does not know the identifier at all. No committed student is in that state — each holds
+  the one activity the workbook carries — so it arises for a student whose `Extracurricular
+  Activity` cell in `student_other_info.xlsx` is blank.
 - `?activity=` is compared trimmed and case-insensitively, so `?activity=debate%20society` matches
   `Debate Society`. A filter that matches nothing is `200` with `{"count": 0, "activities": []}`,
   not an error.
@@ -81,13 +119,20 @@ ephemeral port it received.
 
 ### Examples
 
-Real requests against the committed data. The `-i` responses show the headers this service sets;
-Node's own `Date`, `Connection` and `Keep-Alive` lines are omitted from the excerpts.
+Real requests against the committed data. Every `bash` block below is a command that can be copied
+and run as it stands; the block after it is the response that command produced, so no response text
+is ever mixed into a block meant for a shell. The `-i` transcripts show the headers the service
+sets itself — `Content-Type` and `Content-Length` are set explicitly on every response it writes,
+and `Location` on the `201` — while Node's own `Date`, `Connection` and `Keep-Alive` lines are
+omitted.
 
 The greeting, preserved byte for byte:
 
 ```bash
-$ curl -i http://127.0.0.1:3000/
+curl -i http://127.0.0.1:3000/
+```
+
+```text
 HTTP/1.1 200 OK
 Content-Type: text/plain
 Content-Length: 34
@@ -99,14 +144,20 @@ A student's activities. `activities.json` ships empty, so every student starts w
 activity the workbook carries:
 
 ```bash
-$ curl http://127.0.0.1:3000/api/students/S001/activities
+curl http://127.0.0.1:3000/api/students/S001/activities
+```
+
+```json
 {"studentId":"S001","name":"Aarav Sharma","count":1,"activities":[{"activity":"Robotics Club","source":"workbook"}]}
 ```
 
 The reverse lookup — the students who hold an activity:
 
 ```bash
-$ curl "http://127.0.0.1:3000/api/activities?activity=Robotics%20Club"
+curl "http://127.0.0.1:3000/api/activities?activity=Robotics%20Club"
+```
+
+```json
 {"count":1,"activities":[{"activity":"Robotics Club","count":2,"studentIds":["S001","S009"]}]}
 ```
 
@@ -114,7 +165,10 @@ Unfiltered, the committed data answers with eight groups over ten records, order
 case-folded activity name:
 
 ```bash
-$ curl http://127.0.0.1:3000/api/activities
+curl http://127.0.0.1:3000/api/activities
+```
+
+```json
 {"count":8,"activities":[{"activity":"Coding Club","count":1,"studentIds":["S005"]},{"activity":"Cricket Team","count":1,"studentIds":["S007"]},{"activity":"Dance Club","count":1,"studentIds":["S006"]},{"activity":"Debate Society","count":2,"studentIds":["S002","S010"]},{"activity":"Football Team","count":1,"studentIds":["S003"]},{"activity":"Music Club","count":1,"studentIds":["S004"]},{"activity":"Photography Club","count":1,"studentIds":["S008"]},{"activity":"Robotics Club","count":2,"studentIds":["S001","S009"]}]}
 ```
 
@@ -122,11 +176,15 @@ Recording a second activity for a student. The body carries exactly one field, `
 student comes from the path:
 
 ```bash
-$ curl -i -X POST http://127.0.0.1:3000/api/students/S003/activities \
+curl -i -X POST http://127.0.0.1:3000/api/students/S003/activities \
     -H 'Content-Type: application/json' \
     -d '{"activity":"Music Club"}'
+```
+
+```text
 HTTP/1.1 201 Created
 Content-Type: application/json
+Content-Length: 64
 Location: /api/students/S003/activities
 
 {"studentId":"S003","activity":"Music Club","source":"registry"}
@@ -135,7 +193,10 @@ Location: /api/students/S003/activities
 The student then holds both, workbook record first and registry records in file order:
 
 ```bash
-$ curl http://127.0.0.1:3000/api/students/S003/activities
+curl http://127.0.0.1:3000/api/students/S003/activities
+```
+
+```json
 {"studentId":"S003","name":"Rohan Iyer","count":2,"activities":[{"activity":"Football Team","source":"workbook"},{"activity":"Music Club","source":"registry"}]}
 ```
 
@@ -162,13 +223,19 @@ Each code has one fixed sentence, so two requests that fail the same way produce
 | `409`  | `ACTIVITY_ALREADY_RECORDED` | The student already holds that activity, compared case-insensitively                            | `Student <id> already holds activity <value>` |
 | `413`  | `PAYLOAD_TOO_LARGE`         | The request body exceeds 8192 bytes                                                            | `Request body exceeds 8192 bytes` |
 | `415`  | `UNSUPPORTED_MEDIA_TYPE`    | A `POST` without `Content-Type: application/json`                                              | `Content-Type must be application/json` |
-| `500`  | `INTERNAL_ERROR`            | An internal fault — a failed registry write, or a dependency error while serving a read. The detail goes to stderr; no exception text or stack is ever returned | `Could not persist the activity record` |
+| `500`  | `INTERNAL_ERROR`            | An internal fault — a failed registry write, the only condition that produces a `500`. The detail goes to stderr; no exception text or stack is ever returned | `Could not persist the activity record` |
 
 How the placeholders render: `<value>` for an identifier is the raw, still-encoded path segment as
-received, truncated to 64 characters, and for an activity it is the trimmed name the caller supplied;
-`<path>` is the raw request target with the query string removed, so a `404` for `/api/unknown?x=1`
-reads `No route for GET /api/unknown`; `<key>` is the first offending key in the body's own key
-order; `<method>` is the request method verbatim; `<id>` is the normalized identifier.
+received, truncated to 64 characters — never the decoded form and never the normalized one. Both
+identifier codes render it that way: `INVALID_STUDENT_ID` echoes the segment that failed the shape
+check, and `STUDENT_NOT_FOUND` echoes the segment the directory did not know, which is why
+`GET /api/students/s999/activities` answers `No student with Student ID s999`. For an activity
+`<value>` is the trimmed name the caller supplied, truncated the same way; `<path>` is the raw
+request target with the query string removed and is **not** truncated, so a `404` for
+`/api/unknown?x=1` reads `No route for GET /api/unknown` and a long unrecognised target is named in
+full — the 64-character cap applies only to identifier and activity values; `<key>` is the first
+offending key in the body's own key order; `<method>` is the request method verbatim; and `<id>`,
+the normalized identifier, appears only in the `ACTIVITY_ALREADY_RECORDED` sentence.
 
 `Allow` values are exact and ordered:
 
@@ -179,8 +246,14 @@ order; `<method>` is the request method verbatim; `<id>` is the normalized ident
 | `/api/activities`                      | `GET, HEAD`       |
 
 `Content-Type` is matched on the media type only, so `application/json; charset=utf-8` is accepted.
-An error response also declares `Connection: close`, because a connection whose request body was
-never interpreted is not one to reuse.
+An error answered before the request body has been read declares `Connection: close` and abandons
+the request stream: every stage through identifier existence — the `405`s with their `Allow`,
+`INVALID_STUDENT_ID`, `STUDENT_NOT_FOUND`, the `415`, and the root `405` and unrecognised-path `404`
+the entrypoint writes — plus the mid-stream `413`. A connection whose body was never interpreted is
+not one to reuse, and declaring that is what stops a keep-alive client pipelining behind a discarded
+body. Errors decided after the body was fully read — `MALFORMED_JSON`, `UNEXPECTED_FIELD`,
+`INVALID_ACTIVITY`, `ACTIVITY_ALREADY_RECORDED` and `INTERNAL_ERROR` — and every successful response
+keep default connection handling.
 
 **Validation order is fixed**, so a request with several faults gets one predictable response: path,
 then method, then identifier shape, then identifier existence, then — for `POST` only — media type,
@@ -253,10 +326,17 @@ the group's first member, and groups are ordered by `activityKey` ascending.
   sheet, but nothing protects a running service from a file that was half-written at the instant it
   was read.
 - A **missing** `activities.json` is tolerated: the registry is treated as empty, a warning is
-  written to stderr, and the workbook-sourced data is still served. Malformed JSON, a non-array
-  root, a record failing field validation, a duplicate record, or a `studentId` absent from the
-  directory is a **fatal startup error** naming the offending record — silently ignoring a corrupt
-  registry would under-report a student's activities.
+  written to stderr, and the workbook-sourced data is still served. Every other fault is a **fatal
+  startup error**, because silently ignoring a corrupt registry would under-report a student's
+  activities. Each such error is prefixed `Activity registry (<path>):`, so the file is always
+  named; how precisely the fault itself can be located depends on what went wrong:
+  - a **file-level** fault has no record to point at, so the file and the fault are all it reports
+    — `the file does not contain valid JSON (…)` for content that will not parse, or `the file must
+    contain a JSON array of records (received object)` for a root that is not an array;
+  - a **record-level** fault also names the offending record by its 1-based position in file order.
+    A record failing field validation, a duplicate record, or a `studentId` absent from the
+    directory reads as, for example, `record 1 names Student ID S999, which is not in the student
+    directory`.
 - The registry's **directory** is a different matter: it must exist and be writable at startup, so a
   misconfigured `ACTIVITIES_DATA_PATH` fails while the server is being built rather than on the
   first `POST` hours later.
@@ -265,9 +345,15 @@ the group's first member, and groups are ordered by `activityKey` ascending.
   directory does not know, or a workbook that is missing or unreadable all abort startup with the
   file, row or record named.
 - A write rewrites the whole registry to `activities.json.tmp` beside the target and renames it over
-  the file, so a failed write can never leave a partial append, and no `.tmp` artifact is left
-  behind. Writes are serialized on a single queue, so two concurrent `POST`s of the same activity
-  produce one `201` and one `409`.
+  the file, so a failed write can never leave a partial append. After a failed write that scratch
+  file is removed on a **best-effort basis**: removal is always attempted, a file that was never
+  created is a no-op, and if the removal itself fails the `.tmp` artifact stays on disk and the
+  reason is written to stderr as `Could not remove the temporary activity registry file <path>: …`.
+  That failure is reported rather than raised, so a cleanup problem cannot replace the
+  `500 INTERNAL_ERROR` the request is already being rejected with — but it does mean an artifact
+  can survive, and an undeletable `activities.json.tmp` is a signal to look at the stderr log and
+  the file's permissions. Writes are serialized on a single queue, so two concurrent `POST`s of the
+  same activity produce one `201` and one `409`.
 - Writes are **single-process**. Two processes sharing one registry file would interleave; this
   service does not coordinate between instances.
 
@@ -282,22 +368,63 @@ for f in server.js verify-tests.js lib/*.js test/*.test.js; do node --check "$f"
 ```
 
 `npm test` runs `verify-tests.js`, which runs the three test files once at concurrency 1 and exits
-`0` **only** when all 45 tests passed, none failed and none was cancelled. It also refuses to run
-anything when `process.version` falls outside `engines.node`, which is the one place the runtime
-contract is enforced rather than merely declared.
+`0` **only** when at least `MIN_TESTS` tests passed, none failed and none was cancelled. It also
+refuses to run anything when `process.version` falls outside `engines.node`, which is the one place
+the runtime contract is enforced rather than merely declared.
 
 The guard exists because a bare `node --test` that discovers no test file prints a zero count and
-still **exits 0**, so an exit status alone cannot prove the suite ran. To confirm the guard is live,
-raise the minimum above what the suite can meet — this must exit `1`:
-
-```bash
-MIN_TESTS=46 npm test
-```
+still **exits 0**, so an exit status alone cannot prove the suite ran.
 
 `npm run test:raw` is the same three files through `node --test` with no guard; use it to read
 per-test output while developing, not as the gate. Both commands name the test files explicitly,
 because passing a directory to `node --test` fails and because every `.js` file inside `test/` would
 otherwise be executed as a test.
+
+### `MIN_TESTS` — the guard's minimum passing count
+
+`MIN_TESTS` configures the **test guard only**. The service never reads it, which is why it is not
+in the [Configuration](#configuration) table: setting it changes what `npm test` accepts as a
+complete run and nothing about a running server.
+
+| Environment variable | Default                            | Validation |
+| -------------------- | ---------------------------------- | ---------- |
+| `MIN_TESTS`          | `45`, the number of declared tests | A **positive decimal integer**, `1` or greater. It is resolved **before any test is executed**, so a rejected value runs nothing at all: `0`, an empty value, a negative number, a fraction, a non-numeric string, or a value too large to compare against a test count each fail with one line on stderr naming the value and exit code `1`. |
+
+`0` is rejected rather than read as "no minimum" for the same reason the guard exists at all: a
+floor of zero is met by a run that executed nothing, which is precisely the vacuous pass being
+guarded against. The override is there for **local subsetting** — running one test file while
+developing, against a floor that matches it — and `npm test` applies the full suite's floor of `45`
+whenever the variable is unset.
+
+Raising the minimum above what the suite can meet is also how a reviewer confirms the guard is
+live. This must exit `1`:
+
+```bash
+MIN_TESTS=46 npm test
+```
+
+### The suite leaves the working tree untouched
+
+Every test that writes points its registry path at a fresh directory under the system temp
+directory and removes it afterwards; no test writes to a workbook or to the committed
+`activities.json`. Check that rather than assume it, by capturing the working-tree state before the
+run and comparing it with the state after — to a path **outside the checkout**, so the capture does
+not alter what it is measuring:
+
+```bash
+git status --porcelain > /tmp/tree-before.txt
+npm test
+git status --porcelain > /tmp/tree-after.txt
+diff /tmp/tree-before.txt /tmp/tree-after.txt && echo "working tree unchanged"
+```
+
+The requirement is that the two captures are **identical**, not that either is empty: a checkout
+carrying uncommitted work of its own legitimately reports lines, and demanding zero would fail a
+perfectly clean run for an unrelated reason. Zero lines is the right expectation only in a
+committed, clean checkout, which is where a pipeline would run this. Two declared tests back the
+comparison up whatever else is uncommitted: one asserts the SHA-256 of each of the three workbooks
+against its recorded baseline together with the absence of any `activities.json.tmp` or leftover
+temporary directory, and another asserts that same absence on the write-failure path specifically.
 
 `npm audit` needs registry access; a network failure there is not a feature failure. Note that
 `test/server.test.js` deliberately spawns the real entrypoint on `127.0.0.1:3000`, so stop a running
@@ -310,11 +437,28 @@ There is no linter, formatter, type checker, coverage tool or CI pipeline in thi
 
 The service binds `127.0.0.1` by default, and **that loopback default is the only access control
 there is**: no authentication, no authorization, no TLS, no CORS and no rate limiting exists
-anywhere in this project. Every process on the host reaches the activity API anonymously, and any
-client that reaches it can also `POST` new activity records.
+anywhere in this project. Every process on the host reaches the activity API anonymously.
 
-**Setting `HOST=0.0.0.0` publishes the service to the network while it authenticates nobody.** The
-exposure is bounded — the only directory field retained and serialized is `Name`, so no Gender, Date
-of Birth, Age, Department, Year, Email, Phone or City value can leave the process — but the bound is
-not a substitute for access control. Widening the bind is the change that would require
-authentication, authorization, TLS and rate limiting together, and none of them is implemented here.
+**Setting `HOST=0.0.0.0` publishes the service to the network while it authenticates nobody.** Put
+exactly, any client that can reach the bound address then has all of the following without
+presenting a credential:
+
+- **Read the `Student ID` of every student holding an activity** — all ten, `S001` through `S010`,
+  in the committed data, since each holds one. A single `GET /api/activities` returns those
+  identifiers grouped by activity, and an identifier is the whole of what is needed to address a
+  student.
+- **Read each student's `Name`**, together with every activity recorded for that student and which
+  source each record came from, through `GET /api/students/{studentId}/activities`.
+- **Read the complete activity roster in one request** — every activity with its member count and
+  the `Student ID`s holding it — through `GET /api/activities`.
+- **Write a new activity record for any existing student**, through
+  `POST /api/students/{studentId}/activities`. The record is appended to `activities.json` on disk
+  and so survives a restart, and no route deletes or edits a record: undoing one means editing that
+  file by hand.
+
+What such a client cannot obtain is the rest of a directory row. The only directory field retained
+and serialized is `Name`, so no Gender, Date of Birth, Age, Department, Year, Email, Phone or City
+value can leave the process, and `student_academics.xlsx` is never opened by the service at all.
+That bound limits the exposure; it is not a substitute for access control. Widening the bind is the
+change that would require authentication, authorization, TLS and rate limiting together, and none of
+them is implemented here.

@@ -127,8 +127,18 @@ const ROOT_PATH = '/';
 /** `Allow` for `/`: exact and ordered, because a `405` must name what works. */
 const ALLOW_ROOT = 'GET, HEAD';
 
+/**
+ * `Allow` for `/api/students/{studentId}/activities`, byte-identical to the
+ * value `lib/activityRoutes.js` sends for the same route - the order is part of
+ * the contract, so one spelling must serve both sides of the boundary. It is
+ * needed here only for the malformed-escape case, where the identifier cannot be
+ * decoded and the route therefore never reaches the API handler.
+ */
+const ALLOW_STUDENT_ACTIVITIES = 'GET, HEAD, POST';
+
 const METHOD_GET = 'GET';
 const METHOD_HEAD = 'HEAD';
+const METHOD_POST = 'POST';
 
 const STATUS_OK = 200;
 const STATUS_BAD_REQUEST = 400;
@@ -143,7 +153,8 @@ const CODE_NOT_FOUND = 'NOT_FOUND';
  * The per-student route's shape, mirrored from `lib/activityRoutes.js`. It is
  * needed here for exactly one case: a malformed percent-escape cannot be decoded
  * into `segments`, so the *raw* segments decide whether the caller was addressing
- * a student (`400 INVALID_STUDENT_ID`) or nothing at all (`404 NOT_FOUND`).
+ * a student (a recognised path, answered by method: `405` or
+ * `400 INVALID_STUDENT_ID`) or nothing at all (`404 NOT_FOUND`).
  */
 const API_SEGMENT = 'api';
 const STUDENTS_SEGMENT = 'students';
@@ -185,7 +196,7 @@ const EMPTY_OPTIONS = Object.freeze({});
 const DEFAULT_ACTIVITIES_DATA_PATH = path.join(__dirname, DEFAULT_ACTIVITIES_FILENAME);
 const DEFAULT_WORKBOOK_DIR = __dirname;
 
-/** Swallows an event that carries no decision - used for a drained request. */
+/** Swallows an event that carries no decision - used for an abandoned request. */
 const noop = () => {};
 
 /* ---------------------------------------------------------------------------
@@ -426,23 +437,80 @@ const resolveConfig = (options) => {
  * ------------------------------------------------------------------------- */
 
 /**
- * Drains a request body this file chose not to interpret.
+ * Abandons a request body this file chose not to interpret.
  *
- * A `405` or a `404` is decided before any body is read, and a client may still
- * be uploading one. Destroying the request would reset the connection and
- * discard the response just written, so the request is put into flowing mode
- * with no consumer instead: the upload completes, the drain genuinely happens,
- * and the response survives. `'error'` is muted first so an upload the client
- * abandons mid-drain does not surface as an unhandled event. This mirrors
- * `lib/activityRoutes.js`, where the behaviour was measured.
+ * A `405`, a `404` or a malformed-escape `400` is decided before any body is
+ * read, and the contract for a request rejected that early is exact: the
+ * response is written and **the request stream is destroyed**, so a client is
+ * not left waiting for a drain that will not happen and an unbounded upload
+ * cannot go on consuming socket time, bandwidth and event-loop work after the
+ * decision. Reading such a body to its end would do that work for bytes nothing
+ * will ever look at.
  *
- * @param {import('http').IncomingMessage} req The request to drain.
+ * Four mechanics, in this order, and the order is what keeps both halves of the
+ * requirement - the response delivered, the body unread - true at once. Each
+ * was measured on the pinned runtime, 20 iterations per variant with a 1 MiB
+ * upload in flight:
+ *
+ *   1. `'error'` is muted first, because destroying a stream the client is
+ *      still writing to surfaces as `ECONNRESET` on the request: an event that
+ *      carries no decision this file has not already taken, and that would
+ *      otherwise go unhandled.
+ *   2. The stream is **paused**, so nothing here consumes another byte while
+ *      the response leaves.
+ *   3. The destroy waits for the response to **finish** and pauses the stream
+ *      **again** at that point. Destroying before the response has left the
+ *      process resets a connection whose response the client has not read yet,
+ *      and the reset discards it - 0/20 of these `404`s and `405`s delivered
+ *      that way. And `http.Server` dumps an unread request body of its own
+ *      accord once the response finishes, which resumes the stream: pausing
+ *      only once and deferring read the whole 1 MiB upload every time, which is
+ *      the drain the contract forbids wearing a destroy's clothes.
+ *   4. The **destroy is taken on the next event-loop turn** after that, with
+ *      the guards re-checked because the stream may have ended meanwhile.
+ *
+ * Measured outcome of the shape below: 20/20 responses delivered, and 65536
+ * body bytes read - the chunk the kernel had already handed over before the
+ * decision, unchanged at a 4 MiB and a 16 MiB upload, so reading does not scale
+ * with what the client is sending. The cost, stated rather than hidden: a client
+ * still writing megabytes when it is refused may see the connection reset
+ * instead of its response - the price of not reading a body nothing will look
+ * at, on a connection `Connection: close` has already declared finished.
+ *
+ * `Connection: close`, which `sendError` declares on the same response, is the
+ * other half of that safety: the client is told this message ends the exchange,
+ * so it waits for no drain and cannot pipeline a second request onto a
+ * connection that is going away. The guards keep the call idempotent - a body
+ * already complete has nothing left to abandon, and a stream already destroyed
+ * must not be destroyed again. `lib/activityRoutes.js` abandons its own
+ * pre-body rejections with the identical shape, so one pattern exists in both
+ * files.
+ *
+ * @param {import('http').IncomingMessage} req The request to abandon.
+ * @param {import('http').ServerResponse} res The response written before this
+ *   call, waited on so the destroy cannot discard it.
  * @returns {void}
  */
-const drainRequest = (req) => {
-  if (req.complete === true) return;
+const abandonRequest = (req, res) => {
+  if (req.complete === true || req.destroyed === true) return;
   req.on('error', noop);
-  req.resume();
+  req.pause();
+
+  const abandon = () => {
+    // Undoes the runtime's own dump of the unread body, which resumed the
+    // stream when the response finished.
+    req.pause();
+    setImmediate(() => {
+      if (req.complete === true || req.destroyed === true) return;
+      req.destroy();
+    });
+  };
+
+  if (res.writableFinished === true) {
+    abandon();
+    return;
+  }
+  res.once('finish', abandon);
 };
 
 /**
@@ -475,9 +543,11 @@ const sendGreeting = (req, res) => {
  *
  * `Connection: close` is declared because a connection whose request body was
  * never interpreted is not one to reuse; it keeps a keep-alive client from
- * pipelining a second request behind a body that was discarded.
+ * pipelining a second request behind a body that was never read, and it is what
+ * makes abandoning that body after the response a safe teardown rather than a
+ * lost answer.
  *
- * @param {import('http').IncomingMessage} req The request to answer and drain.
+ * @param {import('http').IncomingMessage} req The request to answer and abandon.
  * @param {import('http').ServerResponse} res The response to write.
  * @param {number} status The HTTP status code.
  * @param {string} code The stable error code.
@@ -505,11 +575,18 @@ const sendError = (req, res, status, code, message, extraHeaders) => {
   } else {
     res.end(body);
   }
-  drainRequest(req);
+  // Order matters: the response is written first, then the unread request body
+  // is abandoned. Reversing the two would tear down the stream before the
+  // answer had been handed to the socket.
+  abandonRequest(req, res);
 };
 
 /**
  * `405` for a recognised path on an unsupported method, with the exact `Allow`.
+ *
+ * The path is rendered in **full** from the query-stripped raw target. Only an
+ * identifier or an activity value is capped at 64 characters; a `<path>` that
+ * was truncated would name a target the caller never sent.
  *
  * @param {import('http').IncomingMessage} req The request.
  * @param {import('http').ServerResponse} res The response.
@@ -524,7 +601,7 @@ const sendMethodNotAllowed = (req, res, method, rawPath, allow) => {
     res,
     STATUS_METHOD_NOT_ALLOWED,
     CODE_METHOD_NOT_ALLOWED,
-    `Method ${method} is not allowed on ${truncate(rawPath)}`,
+    `Method ${method} is not allowed on ${rawPath}`,
     { Allow: allow }
   );
 };
@@ -534,8 +611,10 @@ const sendMethodNotAllowed = (req, res, method, rawPath, allow) => {
  * from - a path this file does not own, or one `lib/activityRoutes.js` declined
  * by returning `false`, whether or not it began with `api`.
  *
- * The path is rendered from the **raw** target with the query removed, so
- * `/api/unknown?x=1` reads `No route for GET /api/unknown`.
+ * The path is rendered from the **raw** target with the query removed and is
+ * never shortened, so `/api/unknown?x=1` reads `No route for GET /api/unknown`
+ * and a long unknown path is named in full rather than clipped to something no
+ * client asked for.
  *
  * @param {import('http').IncomingMessage} req The request.
  * @param {import('http').ServerResponse} res The response.
@@ -549,7 +628,7 @@ const sendNotFound = (req, res, method, rawPath) => {
     res,
     STATUS_NOT_FOUND,
     CODE_NOT_FOUND,
-    `No route for ${method} ${truncate(rawPath)}`
+    `No route for ${method} ${rawPath}`
   );
 };
 
@@ -600,7 +679,10 @@ const splitPathSegments = (pathText) => {
  * Whether raw segments have the per-student route's shape. Used **only** for a
  * malformed percent-escape, where there are no decoded segments to match: it
  * decides whether the caller was addressing a student, and therefore whether the
- * answer is `400 INVALID_STUDENT_ID` or `404 NOT_FOUND`.
+ * path is recognised at all. A recognised path is then answered by method -
+ * `405` with `Allow: GET, HEAD, POST` for a method the route does not serve, and
+ * `400 INVALID_STUDENT_ID` for one it does - while an unrecognised path is
+ * answered with `404 NOT_FOUND`.
  *
  * @param {string[]} segments The raw path segments.
  * @returns {boolean} `true` for `['api', 'students', '<id>', 'activities']`.
@@ -687,8 +769,18 @@ const createRequestHandler = (apiHandler) => (req, res) => {
 
   // A malformed escape: there is nothing to match on, so the raw shape decides
   // between a client addressing a student and a client addressing nothing.
+  //
+  // Validation order is fixed at path recognition, then method, then identifier
+  // shape. The raw shape *is* the path recognition for this case, so the method
+  // is gated before the identifier is judged: `DELETE` on this route is a `405`
+  // naming what works, and only a method the route serves gets the `400` that
+  // reports the undecodable identifier.
   if (segments === null) {
     if (isStudentActivitiesShape(rawSegments)) {
+      if (method !== METHOD_GET && method !== METHOD_HEAD && method !== METHOD_POST) {
+        sendMethodNotAllowed(req, res, method, rawPath, ALLOW_STUDENT_ACTIVITIES);
+        return;
+      }
       sendInvalidStudentId(req, res, rawSegments[STUDENT_ID_SEGMENT_INDEX]);
       return;
     }
@@ -711,8 +803,11 @@ const createRequestHandler = (apiHandler) => (req, res) => {
  * Builds the server: the **single composition root** of the feature.
  *
  * This is the only place anything is constructed, so the workbooks are read
- * exactly once per process and a test that injects dependencies exercises the
- * same wiring production uses.
+ * exactly once per server construction - each server owns its own indexes and
+ * nothing is cached across them, so a second `createServer()` or `start()` call
+ * in the same process runs the loaders again, deliberately: per-instance state
+ * is what lets one process hold two servers over different data - and a test
+ * that injects dependencies exercises the same wiring production uses.
  *
  * Because each dependency is built only when it is not injected, the filesystem
  * checks follow from the injection itself rather than from a separate probe:
@@ -779,6 +874,49 @@ const boundPortOf = (server, fallback) => {
 };
 
 /**
+ * Renders a resolved host as the **authority component of a URL**, which for an
+ * IPv6 literal means bracketing it.
+ *
+ * `resolveHost` accepts any non-empty host, `::1` included, and `listen` must
+ * receive that value exactly as configured - so the bracketing lives here, in
+ * the banner only, and never on the path to `listen`. Without it the readiness
+ * line reads `http://::1:3000/`, which `new URL()` rejects as an invalid URL and
+ * no client can use.
+ *
+ * An IPv6 literal is recognised by the colon it must contain, which neither a
+ * hostname nor an IPv4 address carries; a value that is already bracketed is
+ * returned unchanged, so `[::1]` does not become `[[::1]]`.
+ *
+ * @param {string} host The resolved host, exactly as it will be bound.
+ * @returns {string} The URL authority host: `127.0.0.1` unchanged, `::1` as
+ *   `[::1]`.
+ */
+const bannerAuthority = (host) => {
+  if (!host.includes(':')) return host;
+  if (host.startsWith('[') && host.endsWith(']')) return host;
+  return `[${host}]`;
+};
+
+/**
+ * Builds the readiness line for a listening server.
+ *
+ * The baseline banner, unchanged in string and format, built from the resolved
+ * host and the port **actually bound** - so the default case is byte-identical
+ * to `Server running at http://127.0.0.1:3000/` while an ephemeral run reports
+ * the port it got rather than the `0` it asked for.
+ *
+ * It only formats: writing it is the `require.main === module` wrapper's job, so
+ * a programmatic `start()` stays silent.
+ *
+ * @param {import('http').Server} server A listening server carrying `config`.
+ * @returns {string} The banner line, without a trailing newline.
+ */
+const readinessBanner = (server) => {
+  const { host, port } = server.config;
+  return `Server running at http://${bannerAuthority(host)}:${boundPortOf(server, port)}/`;
+};
+
+/**
  * Rewrites a bind failure's message so a conflict reads as a conflict, naming
  * the code and the exact address and port that could not be bound.
  *
@@ -825,9 +963,14 @@ const describeBindFailure = (cause, host, port, server) => {
  * synchronously** out of `createServer`, a bind fault **rejects**, and only the
  * `require.main === module` wrapper turns either into process behaviour.
  *
+ * It writes **nothing to stdout** either. The readiness banner is the CLI's
+ * signal, not the library's, so the wrapper prints it on the success path with
+ * `readinessBanner` - which keeps a programmatic caller silent and keeps promise
+ * settlement free of any console side effect.
+ *
  * @param {Parameters<typeof createServer>[0]} [options] As `createServer`.
  * @returns {Promise<import('http').Server>} Resolves with the **listening**
- *   server once it is bound, having logged the startup banner.
+ *   server once it is bound.
  * @throws {Error} Synchronously, for a configuration or load fault.
  */
 const start = (options) => {
@@ -842,10 +985,8 @@ const start = (options) => {
 
     const onListening = () => {
       settle();
-      // The baseline banner, unchanged in string and format, and still the
-      // readiness signal - emitted from the resolved host and the port actually
-      // bound, so an ephemeral run reports what it got.
-      console.log(`Server running at http://${host}:${boundPortOf(server, port)}/`);
+      // Settles and nothing else: no logging, so the promise resolves on the
+      // bind itself rather than after an unrelated console write.
       resolve(server);
     };
 
@@ -881,13 +1022,24 @@ const reportStartupFailure = (error) => {
 
 module.exports = { resolveConfig, createServer, start };
 
-// Requiring this module has no side effect: nothing listens and no port is
-// bound unless this file is the process entry point. That reversal of the
-// baseline's start-on-import lifecycle is what lets the suite start and close
-// servers in-process, on an ephemeral port, with injected dependencies.
+// Requiring this module has no side effect: nothing listens, no port is bound
+// and nothing is written to stdout unless this file is the process entry point.
+// That reversal of the baseline's start-on-import lifecycle is what lets the
+// suite start and close servers in-process, on an ephemeral port, with injected
+// dependencies.
+//
+// This wrapper is the only place the module writes to either standard stream:
+// the readiness banner on success, and one diagnostic line plus a non-zero exit
+// code on failure. The banner is printed here rather than inside `start` so the
+// library entry point stays silent; the `.catch` stays last so a bind rejection
+// is still mapped to that diagnostic line.
 if (require.main === module) {
   try {
-    start().catch(reportStartupFailure);
+    start()
+      .then((server) => {
+        console.log(readinessBanner(server));
+      })
+      .catch(reportStartupFailure);
   } catch (error) {
     reportStartupFailure(error);
   }

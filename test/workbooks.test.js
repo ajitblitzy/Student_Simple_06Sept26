@@ -90,6 +90,8 @@ const WORKBOOKS = [
 /**
  * The key space, written out literally rather than generated, so the assertion
  * states the contract instead of restating whatever the file happens to hold.
+ * Listed in ascending order, which is what lets test 43 compare a sorted copy
+ * of each workbook's keys against it without caring about row order.
  */
 const EXPECTED_IDS = [
   'S001',
@@ -111,27 +113,61 @@ const EXPECTED_ROW_COUNT = 11;
 const TMP_ARTIFACT_NAME = 'activities.json.tmp';
 
 /**
+ * A short, stable token naming THIS checkout, derived from the absolute path of
+ * its root so that two working trees of this repository never share it.
+ *
+ * Twelve hex characters of a SHA-256 over the root path: long enough that a
+ * collision between two checkouts is not a practical concern, short enough to
+ * keep a temporary directory name readable. The path is lower-cased first
+ * because Windows path comparison is case-insensitive, so the same tree reached
+ * through a differently-cased path must still yield the same token.
+ */
+const CHECKOUT_TOKEN = crypto
+  .createHash('sha256')
+  .update(REPO_ROOT.toLowerCase())
+  .digest('hex')
+  .slice(0, 12);
+
+/**
  * The `fs.mkdtempSync` prefix `test/activities.test.js` uses for its throwaway
- * registry directories. A shared helper module cannot hold it - every `.js`
- * file inside a directory named `test/` is executed as a test by default
- * discovery - so the literal is duplicated here and MUST STAY IN STEP WITH
+ * registry directories, and the namespace part 3 of test 45 inspects.
+ *
+ * `os.tmpdir()` is HOST-WIDE, and on this host up to 64 separate checkouts of
+ * this repository run their suites side by side under that one temp root. A
+ * bare `student-activities-` prefix is therefore a shared namespace, and
+ * asserting that it is empty asserts something about other checkouts: a sibling
+ * that is legitimately mid-write fails this suite, which is a false failure in
+ * a file whose whole job is detecting real drift. Embedding `CHECKOUT_TOKEN`
+ * makes the namespace private to this working tree, so the assertion covers
+ * exactly the directories this suite created and nothing else.
+ *
+ * `test/activities.test.js` derives the same value from the same input with the
+ * identical expression. It has to be derived rather than shared: a helper
+ * module cannot hold it - every `.js` file inside a directory named `test/` is
+ * executed as a test by default discovery - and the two files run in separate
+ * child processes, so a path computed from `__dirname` is the only thing they
+ * can be relied on to agree about. The derivation MUST STAY IN STEP WITH
  * `test/activities.test.js`; changing it there without changing it here turns
  * part 3 of test 45 into a check that can never fail.
  */
-const TEMP_PREFIX = 'student-activities-';
+const TEMP_PREFIX = `student-activities-${CHECKOUT_TOKEN}-`;
 
-/** Directories the artifact walk never descends into. */
+/**
+ * The only directories the artifact walk does not descend into. Both are
+ * machine-managed and neither can hold a registry write: `.git` is object
+ * storage and `node_modules` is an install target this dependency-free project
+ * never populates. Everything else under the checkout is inspected.
+ */
 const SKIPPED_DIRECTORIES = new Set(['.git', 'node_modules']);
 
 /**
- * Depth cap for the artifact walk. The checkout is two levels deep (`lib/`,
- * `test/`), so 8 is generous while still bounding the walk absolutely - a test
- * must not be able to run away over an unexpectedly deep tree.
+ * Runaway stop for the artifact walk, not a scope limit. The checkout is two
+ * levels deep (`lib/`, `test/`) and symlinks are never followed, so a finite
+ * tree cannot reach this depth; exceeding it means the walk is looping, which
+ * is a fault. It therefore THROWS rather than returning - a bound that returns
+ * "nothing found" would report a tree it never finished walking as clean.
  */
-const MAX_WALK_DEPTH = 8;
-
-/** Directory-listing failures that mean "nothing here to see", not a fault. */
-const IGNORED_WALK_ERRORS = new Set(['ENOENT', 'EACCES', 'EPERM']);
+const WALK_DEPTH_LIMIT = 64;
 
 /**
  * Reads a workbook at the checkout root and returns its rows.
@@ -151,37 +187,66 @@ const digestOf = (absolutePath) =>
   crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex');
 
 /**
- * Walks a directory tree and collects every `activities.json.tmp` left behind.
+ * Walks a directory tree collecting every `activities.json.tmp` left behind,
+ * and - just as importantly - every directory it could not inspect.
  *
- * Bounded three ways so it cannot run away or loop: `SKIPPED_DIRECTORIES` keeps
- * it out of `.git` and `node_modules`, `MAX_WALK_DEPTH` caps recursion, and a
- * symlink is never descended into because `Dirent.isDirectory()` is false for
- * one. A directory that cannot be listed for an expected reason is skipped;
- * any other failure is rethrown, because a checkout this test cannot read is a
- * real fault rather than a clean result.
+ * "No artifact found" and "nowhere left to look" are different results, and
+ * conflating them is how a cleanup check passes over a tree it never read. So
+ * the walk reports both: `artifacts` is what it found, and `unverified` names
+ * every directory whose contents remain unknown. Test 45 fails on a non-empty
+ * `unverified` exactly as it fails on a non-empty `artifacts`, because an
+ * uninspected directory is an unproven claim rather than a clean one.
+ *
+ * The walk covers the whole checkout apart from `SKIPPED_DIRECTORIES`. A
+ * symlink is not descended into - `Dirent.isDirectory()` is false for one, and
+ * for a Windows junction too - which keeps the walk inside this tree and
+ * finite; a symlink whose target lies within the checkout is still covered,
+ * because the walk reaches that target as a real directory. `ENOENT` below the
+ * root is the one benign listing failure: an entry that disappeared between the
+ * `readdir` that named it and the descent into it holds nothing, which is a
+ * complete answer rather than a missing one. `ENOENT` on the root itself, and
+ * every other error at any level - `EACCES`, `EPERM`, `ENOTDIR` - leaves real
+ * contents unread and is reported as unverified.
  *
  * @param {string} dir Absolute path of the directory to walk.
  * @param {number} [depth] Current recursion depth; callers pass nothing.
- * @returns {string[]} Absolute paths of the artifacts found, possibly empty.
+ * @returns {{artifacts: string[], unverified: string[]}} Absolute paths of the
+ *   artifacts found, and `path (CODE)` for every directory left uninspected.
+ *   Both arrays are empty when the whole tree was read and held no artifact.
  */
 const findTmpArtifacts = (dir, depth = 0) => {
-  if (depth > MAX_WALK_DEPTH) return [];
+  if (depth > WALK_DEPTH_LIMIT) {
+    throw new Error(
+      `artifact walk exceeded ${WALK_DEPTH_LIMIT} levels at ${dir}; the checkout ` +
+        'is two levels deep, so the walk is following a cycle rather than a tree'
+    );
+  }
+
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (cause) {
-    if (cause !== null && typeof cause === 'object' && IGNORED_WALK_ERRORS.has(cause.code)) {
-      return [];
-    }
-    throw cause;
+    const code =
+      cause !== null && typeof cause === 'object' && cause.code !== undefined
+        ? String(cause.code)
+        : 'UNKNOWN';
+    if (code === 'ENOENT' && depth > 0) return { artifacts: [], unverified: [] };
+    return { artifacts: [], unverified: [`${dir} (${code})`] };
   }
-  return entries.flatMap((entry) => {
+
+  const found = { artifacts: [], unverified: [] };
+  for (const entry of entries) {
     const absolute = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      return SKIPPED_DIRECTORIES.has(entry.name) ? [] : findTmpArtifacts(absolute, depth + 1);
+      if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
+      const nested = findTmpArtifacts(absolute, depth + 1);
+      found.artifacts.push(...nested.artifacts);
+      found.unverified.push(...nested.unverified);
+      continue;
     }
-    return entry.name === TMP_ARTIFACT_NAME ? [absolute] : [];
-  });
+    if (entry.name === TMP_ARTIFACT_NAME) found.artifacts.push(absolute);
+  }
+  return found;
 };
 
 // Test 42 - the shape of every fixture: a header row plus ten records.
@@ -214,26 +279,69 @@ test('every workbook holds a header row plus ten student records', () => {
       true,
       `${file} (${sheet}) must expose every pinned header column as a string`
     );
+
+    // The shape of what the reader returned, asserted against the real bytes
+    // rather than against a synthetic sheet. `lib/workbook.js` refuses a cell
+    // whose `r` attribute is not a complete column-letters-plus-row-number
+    // reference, so a key here that is not column letters would mean a
+    // malformed reference had been accepted and had claimed a real column.
+    rows.forEach((parsed, offset) => {
+      for (const [column, value] of Object.entries(parsed)) {
+        assert.match(
+          column,
+          /^[A-Z]{1,3}$/,
+          `${file} (${sheet}) row ${offset + 1} is keyed by '${column}', which is not ` +
+            'a column letter'
+        );
+        assert.equal(
+          typeof value,
+          'string',
+          `${file} (${sheet}) cell ${column}${offset + 1} must be a string, read ` +
+            `${typeof value}`
+        );
+      }
+    });
+
+    // Every column this feature depends on is populated in every data row, so
+    // a blank one would mean the reader dropped a cell it had parsed - the
+    // failure that would silently shorten a student's activity list.
+    for (let index = 1; index < rows.length; index += 1) {
+      for (const column of Object.keys(headers)) {
+        assert.notEqual(
+          rows[index][column],
+          '',
+          `${file} (${sheet}) cell ${column}${index + 1} must be populated, read an ` +
+            'empty cell'
+        );
+      }
+    }
   }
 });
 
 // Test 43 - the key set, and its identity across the three files, which is the
 // claim the feature's referential-integrity checks rest on.
+//
+// The comparison is on SORTED COPIES, because what the feature depends on is
+// the set of keys each file carries, not the order the rows happen to be in:
+// nothing in `lib/studentDirectory.js` or `lib/activityRepository.js` reads a
+// key by position, and a workbook whose rows were saved in another order would
+// otherwise fail here for a reason this test is not about. Sorting copies
+// rather than sets keeps the comparison a multiset one, so a duplicated or
+// missing key still fails; row order and byte drift are test 45's digests.
 test('every workbook carries the identical Student ID key set S001 to S010', () => {
-  const collected = WORKBOOKS.map(({ file, sheet }) => ({
-    file,
-    sheet,
-    keys: rowsOf(file)
+  const collected = WORKBOOKS.map(({ file, sheet }) => {
+    const keys = rowsOf(file)
       .slice(1)
-      .map((row) => row.A)
-  }));
+      .map((row) => row.A);
+    return { file, sheet, keys, sortedKeys: [...keys].sort() };
+  });
 
-  for (const { file, sheet, keys } of collected) {
+  for (const { file, sheet, keys, sortedKeys } of collected) {
     assert.deepEqual(
-      keys,
+      sortedKeys,
       EXPECTED_IDS,
-      `${file} (${sheet}) column A rows 2-${EXPECTED_ROW_COUNT} must be ` +
-        `${EXPECTED_IDS.join(', ')}, read ${keys.join(', ')}`
+      `${file} (${sheet}) column A rows 2-${EXPECTED_ROW_COUNT} must be the set ` +
+        `${EXPECTED_IDS.join(', ')} in any order, read ${keys.join(', ')}`
     );
   }
 
@@ -246,10 +354,10 @@ test('every workbook carries the identical Student ID key set S001 to S010', () 
   );
   for (const [left, right] of pairs) {
     assert.deepEqual(
-      left.keys,
-      right.keys,
-      `${left.file} and ${right.file} must carry identical, identically ordered ` +
-        `Student ID values; read ${left.keys.join(', ')} against ${right.keys.join(', ')}`
+      left.sortedKeys,
+      right.sortedKeys,
+      `${left.file} and ${right.file} must carry identical Student ID sets; ` +
+        `read ${left.keys.join(', ')} against ${right.keys.join(', ')}`
     );
   }
 });
@@ -265,7 +373,27 @@ test('every workbook header names the columns the service reads', () => {
         `${file} (${sheet}) header cell ${column}1 must be '${label}', ` +
           `read '${header[column]}'`
       );
+      // Exactly as stored: no trimming, no case folding, no collapsing of
+      // interior spaces. `Attendance %` and `Extracurricular Activity` are
+      // compared byte for byte by the loaders, so any normalisation the reader
+      // applied here would turn into a startup failure there.
+      assert.equal(
+        header[column].length,
+        label.length,
+        `${file} (${sheet}) header cell ${column}1 must be stored verbatim; read ` +
+          `${header[column].length} characters against ${label.length}`
+      );
     }
+
+    // Reading the same file twice must produce the same rows. The reader holds
+    // no module-level parse state - no pattern carrying `lastIndex` between
+    // calls, no cache - so two reads of one snapshot cannot diverge, and the
+    // two loaders that each read their own workbook cannot interfere.
+    assert.deepEqual(
+      rowsOf(file),
+      rowsOf(file),
+      `${file} (${sheet}) must read identically twice in a row`
+    );
   }
 });
 
@@ -282,23 +410,39 @@ test('committed workbooks match their baseline digests and leave no temporary ar
     );
   }
 
-  const artifacts = findTmpArtifacts(REPO_ROOT);
+  const walk = findTmpArtifacts(REPO_ROOT);
+
+  // Completeness is asserted first: "found no artifact" only means anything
+  // once every directory that could hold one has actually been read, so a
+  // directory the walk could not list fails here rather than passing as clean.
   assert.deepEqual(
-    artifacts,
+    walk.unverified,
     [],
-    `no ${TMP_ARTIFACT_NAME} may remain under ${REPO_ROOT}; found ${artifacts.join(', ')}`
+    `every directory under ${REPO_ROOT} except ` +
+      `${[...SKIPPED_DIRECTORIES].join(' and ')} must be readable for the ` +
+      `${TMP_ARTIFACT_NAME} check to mean anything; could not inspect ` +
+      `${walk.unverified.join(', ')}`
+  );
+  assert.deepEqual(
+    walk.artifacts,
+    [],
+    `no ${TMP_ARTIFACT_NAME} may remain under ${REPO_ROOT}; found ${walk.artifacts.join(', ')}`
   );
 
   // `verify-tests.js` runs activities, server, then workbooks at concurrency 1,
   // so this file executes last and any registry directory created by
   // test/activities.test.js has already been removed by its `after` hook -
-  // reordering TEST_FILES would make this filter assert nothing. Only the
-  // suite's own prefix is matched, so unrelated temp entries owned by other
-  // processes can never fail this test.
-  const leftovers = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX));
+  // reordering TEST_FILES would make this filter assert nothing.
+  //
+  // The filter is on TEMP_PREFIX, which carries this checkout's own token, so
+  // it matches only the directories THIS suite created: the system temp root is
+  // shared with up to 64 sibling checkouts of this repository and with every
+  // other process on the host, and none of them can fail this assertion.
+  const tempRoot = os.tmpdir();
+  const leftovers = fs.readdirSync(tempRoot).filter((name) => name.startsWith(TEMP_PREFIX));
   assert.deepEqual(
     leftovers,
     [],
-    `no ${TEMP_PREFIX}* entry may remain in ${os.tmpdir()}; found ${leftovers.join(', ')}`
+    `no ${TEMP_PREFIX}* entry may remain in ${tempRoot}; found ${leftovers.join(', ')}`
   );
 });

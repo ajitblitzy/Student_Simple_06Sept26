@@ -30,7 +30,10 @@
  *      **before a single test runs**. This is the only place the runtime
  *      contract is enforced rather than merely declared: `engines` only warns
  *      (no `.npmrc` sets `engine-strict`, and none is added) and `.nvmrc` is
- *      inert without a version manager.
+ *      inert without a version manager. The comparison follows npm's own
+ *      semver semantics, **prerelease precedence included**, so an rc or
+ *      nightly build of an otherwise in-range version is refused here exactly
+ *      as npm would refuse it rather than passing on its numbers alone.
  *   2. Every declared test file exists, named individually when one does not.
  *   3. The suite runs **once**, at concurrency 1. That is required rather than
  *      cosmetic: `test/server.test.js` binds the fixed `127.0.0.1:3000`, and at
@@ -41,9 +44,15 @@
  *      `failed === 0` and `cancelled === 0`. All three are genuinely required:
  *      an empty run produces a zero exit, and a run has been observed
  *      reporting zero failures alongside a failing status because tests were
- *      cancelled rather than failed.
+ *      cancelled rather than failed. `MIN_TESTS` is itself required to be an
+ *      integer of **at least 1**, so the floor cannot be turned off: `passed
+ *      >= 0` is satisfied by a run that executed nothing.
  *   5. A missing `test:summary` event is a failure, not a pass - it means the
- *      suite did not execute as intended.
+ *      suite did not execute as intended. Both halves are required: the
+ *      **cumulative** summary supplies the counts, and **every declared file**
+ *      must additionally have emitted exactly one summary of its own, because a
+ *      file that exits early or declares no test emits none while still
+ *      contributing to the cumulative counts.
  *
  * Only `test()` declarations count toward `counts.passed`; assertions made
  * inside a `before`/`after` hook do not. Nothing here compensates for that -
@@ -104,8 +113,19 @@ const TEST_FILES = [
  */
 const DEFAULT_MIN_TESTS = 45;
 
-/** Overrides `DEFAULT_MIN_TESTS`, for subsetting the suite while developing. */
+/**
+ * Overrides `DEFAULT_MIN_TESTS`, for subsetting the suite while developing. It
+ * may lower the floor but never remove it - see `MINIMUM_MIN_TESTS`.
+ */
 const MIN_TESTS_ENVIRONMENT_KEY = 'MIN_TESTS';
+
+/**
+ * 1 - the smallest floor the override may set. A floor of zero would be met by
+ * a run that executed nothing, so accepting it would hand back the vacuous pass
+ * this file exists to prevent; `MIN_TESTS=1` is as permissive as subsetting is
+ * allowed to get, and it still requires at least one test to have passed.
+ */
+const MINIMUM_MIN_TESTS = 1;
 
 /** See guarantee 3 above: this is a correctness requirement, not a preference. */
 const TEST_CONCURRENCY = 1;
@@ -202,19 +222,156 @@ const VERSION_SEGMENT_PATTERN = /^(?:0|[1-9]\d*|[xX*])$/;
 /** An optional operator followed by a version token, e.g. `>=24.0.0`. */
 const COMPARATOR_PATTERN = /^(>=|<=|>|<|=|\^|~)?\s*(.+)$/;
 
+/** One prerelease identifier: alphanumerics and hyphens, and never empty. */
+const PRERELEASE_IDENTIFIER_PATTERN = /^[0-9A-Za-z-]+$/;
+
+/** A prerelease identifier that is purely numeric, with no leading zero. */
+const NUMERIC_IDENTIFIER_PATTERN = /^(?:0|[1-9]\d*)$/;
+
+/** A prerelease identifier made only of digits, leading zero or not. */
+const DIGITS_ONLY_PATTERN = /^\d+$/;
+
 /**
- * Parses a version token into a possibly partial triple.
+ * The lowest prerelease any triple can carry - semver's `-0`, since a numeric
+ * identifier sorts below every alphanumeric one and `0` is the smallest of
+ * them. Frozen because it is shared by every derived bound that uses it.
+ */
+const LOWEST_PRERELEASE = Object.freeze([0]);
+
+/**
+ * @typedef {object} VersionSpec A parsed version token, possibly partial.
+ * @property {number|null} major The major, or `null` for a wildcard.
+ * @property {number|null} minor The minor, or `null` when unspecified.
+ * @property {number|null} patch The patch, or `null` when unspecified.
+ * @property {Array<number|string>} prerelease The prerelease identifiers in
+ *   order, empty for a release version.
+ */
+
+/**
+ * @typedef {object} ConcreteVersion A version with every segment fixed.
+ * @property {number} major
+ * @property {number} minor
+ * @property {number} patch
+ * @property {Array<number|string>} prerelease Empty for a release version.
+ */
+
+/**
+ * @typedef {object} Comparator One primitive bound of a range.
+ * @property {string} operator One of `>=`, `>`, `<=`, `<`.
+ * @property {ConcreteVersion} version The bound compared against.
+ */
+
+/**
+ * Parses the prerelease suffix of a version - everything after the first `-`,
+ * with build metadata already removed - into the identifiers semver compares.
  *
- * A leading `v` is accepted, because `process.version` carries one. A
- * prerelease or build suffix is **ignored** rather than rejected: the guard
- * compares release triples, so `v25.0.0-nightly` is treated as `25.0.0` and
- * correctly falls outside `<25`.
+ * @param {string} text The suffix, e.g. `rc.1` or `nightly.20260917`.
+ * @returns {Array<number|string>|null} The identifiers in order, numeric ones
+ *   as numbers so they compare numerically, or `null` when the suffix is not a
+ *   legal prerelease: an empty identifier (`24.0.0-`, `24.0.0-rc..1`), a
+ *   character semver does not allow, a numeric identifier with a leading zero,
+ *   or one too large to compare exactly. Every one of those fails closed.
+ */
+const parsePrerelease = (text) => {
+  const identifiers = [];
+  for (const identifier of text.split('.')) {
+    if (!PRERELEASE_IDENTIFIER_PATTERN.test(identifier)) {
+      return null;
+    }
+    if (!DIGITS_ONLY_PATTERN.test(identifier)) {
+      identifiers.push(identifier);
+      continue;
+    }
+    // `rc.01` is invalid semver rather than a number to normalize, and a
+    // number beyond the safe range could not be compared reliably.
+    if (!NUMERIC_IDENTIFIER_PATTERN.test(identifier)) {
+      return null;
+    }
+    const value = Number.parseInt(identifier, 10);
+    if (!Number.isSafeInteger(value)) {
+      return null;
+    }
+    identifiers.push(value);
+  }
+  return identifiers;
+};
+
+/**
+ * Compares two prerelease identifiers by semver precedence: numeric against
+ * numeric compares numerically, numeric is always lower than alphanumeric, and
+ * alphanumeric against alphanumeric compares in ASCII order.
  *
- * @param {unknown} raw The token, e.g. `24.21.0`, `v24.21.0`, `24.x` or `24`.
- * @returns {{major: number, minor: (number|null), patch: (number|null)}|null}
- *   The triple with unspecified segments as `null`, or `null` when the token is
- *   not a version this guard can read. An all-wildcard token yields a `null`
- *   `major`, which callers treat as "any version".
+ * @param {number|string} left
+ * @param {number|string} right
+ * @returns {number} Negative, zero or positive.
+ */
+const compareIdentifiers = (left, right) => {
+  const leftIsNumeric = typeof left === 'number';
+  const rightIsNumeric = typeof right === 'number';
+  if (leftIsNumeric && rightIsNumeric) {
+    return left - right;
+  }
+  if (leftIsNumeric !== rightIsNumeric) {
+    return leftIsNumeric ? -1 : 1;
+  }
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+};
+
+/**
+ * Compares two prerelease lists at an equal `major.minor.patch`, by semver
+ * precedence: a version carrying a prerelease is **lower** than the same triple
+ * without one, identifiers are compared pairwise, and when every compared
+ * identifier is equal the shorter list is lower (`1.0.0-rc < 1.0.0-rc.1`).
+ *
+ * @param {Array<number|string>} left
+ * @param {Array<number|string>} right
+ * @returns {number} Negative, zero or positive.
+ */
+const comparePrerelease = (left, right) => {
+  if (left.length === 0 && right.length === 0) {
+    return 0;
+  }
+  if (left.length === 0) {
+    return 1;
+  }
+  if (right.length === 0) {
+    return -1;
+  }
+  const shared = Math.min(left.length, right.length);
+  for (let index = 0; index < shared; index += 1) {
+    const order = compareIdentifiers(left[index], right[index]);
+    if (order !== 0) {
+      return order;
+    }
+  }
+  return left.length - right.length;
+};
+
+/**
+ * Parses a version token into a possibly partial triple and its prerelease.
+ *
+ * A leading `v` is accepted, because `process.version` carries one. **Build
+ * metadata is discarded** (`+build.7`), because semver gives it no precedence -
+ * it is the only suffix that may be dropped. A **prerelease is kept** and
+ * compared (`-rc.1`, `-nightly.20260917`): npm's semver, the authority that
+ * reads `engines.node` everywhere else, sorts a prerelease below its own
+ * release and refuses it unless the range names a prerelease of the same
+ * triple. Discarding it here would let `v24.0.0-rc.1` pass a `>=24.0.0 <25`
+ * gate that npm rejects.
+ *
+ * A prerelease qualifies one exact triple, so it is **rejected** on a partial
+ * or wildcard token (`24-rc`, `24.x-rc`) rather than quietly dropped.
+ *
+ * @param {unknown} raw The token, e.g. `24.21.0`, `v24.21.0`, `24.x`, `24` or
+ *   `24.0.0-rc.1`.
+ * @returns {VersionSpec|null} The triple with unspecified segments as `null`
+ *   and an always-present `prerelease` list, empty for a release; or `null`
+ *   when the token is not a version this guard can read, which every caller
+ *   turns into a refusal rather than a pass. An all-wildcard token yields a
+ *   `null` `major`, which callers treat as "any version".
  */
 const parseVersionSpec = (raw) => {
   if (typeof raw !== 'string') {
@@ -224,7 +381,11 @@ const parseVersionSpec = (raw) => {
   if (trimmed === '') {
     return null;
   }
-  const core = trimmed.split(/[-+]/)[0];
+  // The first `-` opens the prerelease and any later one belongs to it, so the
+  // split is positional rather than a character class.
+  const withoutBuild = trimmed.split('+')[0];
+  const boundary = withoutBuild.indexOf('-');
+  const core = boundary === -1 ? withoutBuild : withoutBuild.slice(0, boundary);
   const segments = core.split('.');
   if (segments.length < 1 || segments.length > 3) {
     return null;
@@ -239,23 +400,36 @@ const parseVersionSpec = (raw) => {
     const wildcard = /^[xX*]$/.test(segment) || parsed.includes(null);
     parsed.push(wildcard ? null : Number.parseInt(segment, 10));
   }
+  const prerelease = boundary === -1 ? [] : parsePrerelease(withoutBuild.slice(boundary + 1));
+  if (prerelease === null) {
+    return null;
+  }
+  // `24-rc` and `24.x-rc` are not versions: there is no single triple for the
+  // prerelease to qualify, and npm's parser rejects them too.
+  if (prerelease.length > 0 && (parsed.length !== 3 || parsed.includes(null))) {
+    return null;
+  }
   return {
     major: parsed.length > 0 ? parsed[0] : null,
     minor: parsed.length > 1 ? parsed[1] : null,
     patch: parsed.length > 2 ? parsed[2] : null,
+    prerelease,
   };
 };
 
 /**
- * @param {{major: number, minor: (number|null), patch: (number|null)}} spec
- * @returns {{major: number, minor: number, patch: number}} The spec with
- *   unspecified segments zero-filled, which is how semver reads a bound such as
- *   `<25` (`<25.0.0`) or `>=24` (`>=24.0.0`).
+ * @param {VersionSpec} spec
+ * @returns {ConcreteVersion} The spec with unspecified segments zero-filled -
+ *   how semver reads `>=24` as `>=24.0.0` - and with its prerelease carried
+ *   through unchanged, so `>=24.0.0-rc.0` keeps meaning `rc.0` instead of
+ *   collapsing to `24.0.0`. A *derived* exclusive upper bound needs one further
+ *   refinement; see `withLowestPrerelease`.
  */
 const toConcrete = (spec) => ({
   major: spec.major === null ? 0 : spec.major,
   minor: spec.minor === null ? 0 : spec.minor,
   patch: spec.patch === null ? 0 : spec.patch,
+  prerelease: spec.prerelease,
 });
 
 /**
@@ -263,42 +437,65 @@ const toConcrete = (spec) => ({
  * its least specified segment. `24` yields `25.0.0`; `24.1` yields `24.2.0`;
  * `24.1.2` yields `24.1.3`.
  *
- * @param {{major: number, minor: (number|null), patch: (number|null)}} spec
- * @returns {{major: number, minor: number, patch: number}}
+ * @param {VersionSpec} spec
+ * @returns {ConcreteVersion} A release version: the bound is a triple, and any
+ *   prerelease it should exclude is applied by the caller.
  */
 const nextVersionAbove = (spec) => {
   if (spec.minor === null) {
-    return { major: spec.major + 1, minor: 0, patch: 0 };
+    return { major: spec.major + 1, minor: 0, patch: 0, prerelease: [] };
   }
   if (spec.patch === null) {
-    return { major: spec.major, minor: spec.minor + 1, patch: 0 };
+    return { major: spec.major, minor: spec.minor + 1, patch: 0, prerelease: [] };
   }
-  return { major: spec.major, minor: spec.minor, patch: spec.patch + 1 };
+  return { major: spec.major, minor: spec.minor, patch: spec.patch + 1, prerelease: [] };
 };
 
 /**
  * The exclusive upper bound of a caret range, following semver's rules for a
- * zero major: `^24.1.2` allows `<25.0.0`, `^0.3.1` allows `<0.4.0`, `^0.0.3`
- * allows `<0.0.4`.
+ * zero major: `^24.1.2` bounds at `25.0.0`, `^0.3.1` at `0.4.0` and `^0.0.3` at
+ * `0.0.4`.
  *
- * @param {{major: number, minor: (number|null), patch: (number|null)}} spec
- * @returns {{major: number, minor: number, patch: number}}
+ * @param {VersionSpec} spec
+ * @returns {ConcreteVersion} A release version, as `nextVersionAbove` returns.
  */
 const caretUpperBound = (spec) => {
   if (spec.major > 0 || spec.minor === null) {
-    return { major: spec.major + 1, minor: 0, patch: 0 };
+    return { major: spec.major + 1, minor: 0, patch: 0, prerelease: [] };
   }
   if (spec.minor > 0 || spec.patch === null) {
-    return { major: 0, minor: spec.minor + 1, patch: 0 };
+    return { major: 0, minor: spec.minor + 1, patch: 0, prerelease: [] };
   }
-  return { major: 0, minor: 0, patch: spec.patch + 1 };
+  return { major: 0, minor: 0, patch: spec.patch + 1, prerelease: [] };
 };
 
 /**
- * Compares two concrete triples.
+ * Lowers a derived exclusive upper bound to the first prerelease of its own
+ * triple - semver's `-0` suffix. This is what npm's desugaring does, and it is
+ * load-bearing: `24.x` becomes `>=24.0.0 <25.0.0-0`, and that `-0` is what puts
+ * `25.0.0-rc.1` outside the range. A plain `<25.0.0` would admit it, because a
+ * prerelease sorts below its own release.
  *
- * @param {{major: number, minor: number, patch: number}} left
- * @param {{major: number, minor: number, patch: number}} right
+ * It applies only to bounds this guard *derives*: a partial `<` or `<=`, a bare
+ * or `=`-prefixed partial, `^` and `~`. A bound written out in full (`<25.0.0`)
+ * is left exactly as declared, which is also what npm does.
+ *
+ * @param {ConcreteVersion} version The derived bound.
+ * @returns {ConcreteVersion} It, lowered to the first prerelease of that triple.
+ */
+const withLowestPrerelease = (version) => ({
+  major: version.major,
+  minor: version.minor,
+  patch: version.patch,
+  prerelease: LOWEST_PRERELEASE,
+});
+
+/**
+ * Compares two concrete versions by full semver precedence - triple first, then
+ * the prerelease, so `24.0.0-rc.1` is below `24.0.0`.
+ *
+ * @param {ConcreteVersion} left
+ * @param {ConcreteVersion} right
  * @returns {number} Negative, zero or positive, as `Array#sort` expects.
  */
 const compareVersions = (left, right) => {
@@ -308,23 +505,30 @@ const compareVersions = (left, right) => {
   if (left.minor !== right.minor) {
     return left.minor - right.minor;
   }
-  return left.patch - right.patch;
+  if (left.patch !== right.patch) {
+    return left.patch - right.patch;
+  }
+  return comparePrerelease(left.prerelease, right.prerelease);
 };
 
 /**
  * Expands one range token into the primitive comparators it means. Every
- * supported form reduces to `>=`, `>`, `<=` or `<` against a concrete triple,
+ * supported form reduces to `>=`, `>`, `<=` or `<` against a concrete version,
  * which is all the comparison below needs.
  *
  * Supported: `*`, `x`, a bare or `=`-prefixed version (exact when complete, a
- * range when partial), `>=`, `>`, `<=`, `<`, `^` and `~`. Anything else returns
- * `null` so the caller can **fail closed** - a guard that cannot read the
- * declared range must not report a pass.
+ * range when partial), `>=`, `>`, `<=`, `<`, `^` and `~`, each against a
+ * version token - `>` and `<` against a *wildcard* are not, for the reason in
+ * the body. Anything else returns `null` so the caller can **fail closed** - a
+ * guard that cannot read the declared range must not report a pass.
+ *
+ * The desugaring matches npm's, `-0` upper bounds included, so a prerelease
+ * runtime is judged by the same rules `npm install` would apply; see
+ * `withLowestPrerelease`.
  *
  * @param {string} token One whitespace-delimited token of a range.
- * @returns {Array<{operator: string, version: {major: number, minor: number, patch: number}}>|null}
- *   The comparators, an empty array for "any version", or `null` when the token
- *   is unsupported.
+ * @returns {Comparator[]|null} The comparators, an empty array for "any
+ *   version", or `null` when the token is unsupported.
  */
 const expandComparator = (token) => {
   const match = COMPARATOR_PATTERN.exec(token.trim());
@@ -337,8 +541,11 @@ const expandComparator = (token) => {
     return null;
   }
   if (spec.major === null) {
-    // `*`, `x` and `x.y.z` place no bound at all.
-    return [];
+    // `*`, `x` and `x.y.z` place no bound at all. An inequality against a
+    // wildcard is a different thing entirely - npm desugars `>x` and `<x` to
+    // `<0.0.0-0`, which nothing satisfies - so it is refused rather than read
+    // as "any version", which would invert its meaning.
+    return operator === '>' || operator === '<' ? null : [];
   }
   const concrete = toConcrete(spec);
   switch (operator) {
@@ -351,31 +558,35 @@ const expandComparator = (token) => {
         ? [{ operator: '>=', version: nextVersionAbove(spec) }]
         : [{ operator: '>', version: concrete }];
     case '<':
-      return [{ operator: '<', version: concrete }];
+      // `<24` and `<24.1` exclude the prereleases of their own bound too, which
+      // is the `-0` npm desugars them to; `<24.21.0` is taken as written.
+      return spec.patch === null
+        ? [{ operator: '<', version: withLowestPrerelease(concrete) }]
+        : [{ operator: '<', version: concrete }];
     case '<=':
       return spec.patch === null
-        ? [{ operator: '<', version: nextVersionAbove(spec) }]
+        ? [{ operator: '<', version: withLowestPrerelease(nextVersionAbove(spec)) }]
         : [{ operator: '<=', version: concrete }];
     case '^':
       return [
         { operator: '>=', version: concrete },
-        { operator: '<', version: caretUpperBound(spec) },
+        { operator: '<', version: withLowestPrerelease(caretUpperBound(spec)) },
       ];
     case '~':
       return [
         { operator: '>=', version: concrete },
         {
           operator: '<',
-          version: spec.minor === null
-            ? { major: spec.major + 1, minor: 0, patch: 0 }
-            : { major: spec.major, minor: spec.minor + 1, patch: 0 },
+          version: withLowestPrerelease(spec.minor === null
+            ? { major: spec.major + 1, minor: 0, patch: 0, prerelease: [] }
+            : { major: spec.major, minor: spec.minor + 1, patch: 0, prerelease: [] }),
         },
       ];
     case '=':
       return spec.patch === null
         ? [
           { operator: '>=', version: concrete },
-          { operator: '<', version: nextVersionAbove(spec) },
+          { operator: '<', version: withLowestPrerelease(nextVersionAbove(spec)) },
         ]
         : [
           { operator: '>=', version: concrete },
@@ -395,8 +606,8 @@ const expandComparator = (token) => {
  * fails the check loudly instead of quietly mis-reading the contract.
  *
  * @param {unknown} raw The `engines.node` value.
- * @returns {Array<Array<{operator: string, version: {major: number, minor: number, patch: number}}>>|null}
- *   The alternatives, or `null` when the range is unsupported.
+ * @returns {Comparator[][]|null} The alternatives, or `null` when the range is
+ *   unsupported.
  */
 const parseRange = (raw) => {
   if (typeof raw !== 'string') {
@@ -426,9 +637,11 @@ const parseRange = (raw) => {
 };
 
 /**
- * @param {{major: number, minor: number, patch: number}} version
- * @param {Array<{operator: string, version: {major: number, minor: number, patch: number}}>} comparators
- * @returns {boolean} Whether every comparator holds. An empty list holds.
+ * @param {ConcreteVersion} version
+ * @param {Comparator[]} comparators
+ * @returns {boolean} Whether every comparator holds by semver precedence. An
+ *   empty list holds. Precedence alone is not the whole rule for a prerelease
+ *   version; see `alternativeAdmitsPrerelease`.
  */
 const satisfiesComparators = (version, comparators) => comparators.every((comparator) => {
   const order = compareVersions(version, comparator.version);
@@ -447,7 +660,32 @@ const satisfiesComparators = (version, comparators) => comparators.every((compar
 });
 
 /**
- * Decides whether a runtime version falls inside a declared range.
+ * Applies node-semver's prerelease rule, exactly as npm does when
+ * `includePrerelease` is not set: a version that carries a prerelease is inside
+ * a range only where the alternative it satisfied **names** a prerelease of the
+ * same `major.minor.patch`. That is what keeps `24.0.0-rc.1` out of
+ * `>=24.0.0 <25` while letting it into `>=24.0.0-rc.0 <25`, and it keeps an
+ * unrelated nightly such as `24.9.0-pre` out of both.
+ *
+ * It is applied per alternative rather than across the range, because a
+ * prerelease opted into by one alternative says nothing about another.
+ *
+ * @param {ConcreteVersion} version The version under test, prerelease non-empty.
+ * @param {Comparator[]} comparators One alternative, already satisfied by
+ *   precedence.
+ * @returns {boolean} Whether that alternative admits this prerelease.
+ */
+const alternativeAdmitsPrerelease = (version, comparators) => comparators.some((comparator) => (
+  comparator.version.prerelease.length > 0
+  && comparator.version.major === version.major
+  && comparator.version.minor === version.minor
+  && comparator.version.patch === version.patch
+));
+
+/**
+ * Decides whether a runtime version falls inside a declared range, by the same
+ * rules npm's semver applies - precedence for a release version, and precedence
+ * plus the opt-in of `alternativeAdmitsPrerelease` for a prerelease one.
  *
  * @param {string} versionText A version, with or without a leading `v`.
  * @param {string} rangeText The range, as declared in `engines.node`.
@@ -471,7 +709,15 @@ const satisfiesRange = (versionText, rangeText) => {
     );
   }
   const version = toConcrete(spec);
-  return alternatives.some((comparators) => satisfiesComparators(version, comparators));
+  return alternatives.some((comparators) => {
+    if (!satisfiesComparators(version, comparators)) {
+      return false;
+    }
+    // A release version is inside as soon as every bound holds. A prerelease
+    // has to have been asked for as well, or an rc build of an in-range triple
+    // would pass a range that npm reads as excluding it.
+    return version.prerelease.length === 0 || alternativeAdmitsPrerelease(version, comparators);
+  });
 };
 
 /**
@@ -543,13 +789,20 @@ const readEngineRange = () => {
  * @returns {{version: string, range: string}} The version checked and the range
  *   it satisfied.
  * @throws {Error} When the runtime is outside the range, naming both the
- *   detected version and the requirement, or when either cannot be parsed.
+ *   detected version and the requirement - and, for an rc or nightly build,
+ *   the prerelease rule that excluded it, since its numbers alone look inside
+ *   the range and the refusal would otherwise read as a bug in this guard.
+ *   Also when either side cannot be parsed.
  */
 const assertRuntimeSupported = (version = process.version) => {
   const range = readEngineRange();
   if (!satisfiesRange(version, range)) {
+    const spec = parseVersionSpec(version);
+    const prereleaseNote = spec !== null && spec.prerelease.length > 0
+      ? ' - this runtime is a prerelease build, and a prerelease is inside a range only where the range itself names a prerelease of the same major.minor.patch, which is how npm reads engines.node'
+      : '';
     throw guardError(
-      `Node ${renderValue(version)} is outside the declared engines.node range "${range}", so no test was run - install the pinned runtime (see .nvmrc) and retry`,
+      `Node ${renderValue(version)} is outside the declared engines.node range "${range}"${prereleaseNote}, so no test was run - install the pinned runtime (see .nvmrc) and retry`,
       ERROR_CODE_ENGINE,
     );
   }
@@ -564,17 +817,25 @@ const assertRuntimeSupported = (version = process.version) => {
  * Resolves the minimum number of passing tests: `DEFAULT_MIN_TESTS` unless the
  * environment overrides it for local subsetting.
  *
- * The override is validated as a **non-negative integer** and rejected
- * otherwise, including the empty string. That strictness is the point: `''`
- * coerces to `0` and any other non-numeric value to `NaN`, and both would make
- * `passed >= MIN_TESTS` trivially or permanently satisfied - a guard that can
- * never fail.
+ * The override is validated as a **positive integer - at least 1** - and
+ * rejected otherwise, including the empty string. Every part of that rule is
+ * load-bearing:
+ *
+ *   - Zero is refused because `passed >= 0` holds for a run that executed
+ *     nothing, which is exactly the vacuous pass this file exists to prevent;
+ *     an override may narrow the floor for a subset, never remove it.
+ *   - The empty string is refused because it coerces to `0`, and any other
+ *     non-numeric text coerces to `NaN`, so both would make the comparison
+ *     trivially or permanently satisfied - a guard that can never fail.
+ *   - The match is anchored and digits-only, so `1e3`, ` 4.5`, `+5` and `-1`
+ *     are text, not numbers, here.
  *
  * @param {Record<string, (string|undefined)>} [environment] `process.env` by
  *   default; injectable so the rule is assertable without mutating the process.
- * @returns {number} The floor the run must clear.
- * @throws {Error} When the override is present but is not a non-negative
- *   integer, naming the offending value.
+ * @returns {number} The floor the run must clear, always 1 or more.
+ * @throws {Error} When the override is present but is not an integer of at
+ *   least 1, or is too large to compare against a test count, naming the
+ *   offending value in either case.
  */
 const resolveMinTests = (environment = process.env) => {
   const raw = environment === null || typeof environment !== 'object'
@@ -586,7 +847,7 @@ const resolveMinTests = (environment = process.env) => {
   const trimmed = typeof raw === 'string' ? raw.trim() : String(raw).trim();
   if (!/^\d+$/.test(trimmed)) {
     throw guardError(
-      `${MIN_TESTS_ENVIRONMENT_KEY} must be a non-negative integer: ${renderValue(raw)}`,
+      `${MIN_TESTS_ENVIRONMENT_KEY} must be a positive integer of at least 1: ${renderValue(raw)}`,
       ERROR_CODE_CONFIG,
     );
   }
@@ -594,6 +855,12 @@ const resolveMinTests = (environment = process.env) => {
   if (!Number.isSafeInteger(value)) {
     throw guardError(
       `${MIN_TESTS_ENVIRONMENT_KEY} is too large to compare against a test count: ${renderValue(raw)}`,
+      ERROR_CODE_CONFIG,
+    );
+  }
+  if (value < MINIMUM_MIN_TESTS) {
+    throw guardError(
+      `${MIN_TESTS_ENVIRONMENT_KEY} must be at least ${MINIMUM_MIN_TESTS}, because a floor of zero is satisfied by a run that executed no test at all: ${renderValue(raw)}`,
       ERROR_CODE_CONFIG,
     );
   }
@@ -709,13 +976,17 @@ const describeFailure = (event) => {
  *     consumer, and it deliberately does nothing with the events beyond letting
  *     them flow.
  *
- * Each file emits its own `test:summary`, and the aggregate arrives last with
- * no `file` property - which is how the two are told apart here.
+ * A file that ran emits its own `test:summary` carrying a `file`, and the
+ * cumulative summary arrives with no `file` property - which is how the two are
+ * told apart here. Both are kept and both are checked: the cumulative one is
+ * the only source of the verdict's counts, and the per-file ones are what shows
+ * every declared file actually ran (`auditFileSummaries`). Neither is allowed
+ * to stand in for the other.
  *
  * @param {string[]} files Absolute paths, already checked for existence.
  * @param {{runner?: Function}} [options] `runner` replaces `node:test`'s `run`;
  *   it exists so the verdict logic can be exercised without a real suite.
- * @returns {Promise<{aggregate: (object|null), last: (object|null), fileSummaries: object[], failures: Array<{name: string, file: string, message: string}>, failureTotal: number}>}
+ * @returns {Promise<{aggregate: (object|null), fileSummaries: object[], failures: Array<{name: string, file: string, message: string}>, failureTotal: number}>}
  *   Resolves once the run has ended.
  * @throws {Error} Rejects when the runner cannot be started or the stream
  *   fails, which is a guard failure rather than a test failure.
@@ -724,7 +995,6 @@ const runSuite = (files, options = {}) => new Promise((resolve, reject) => {
   const runner = typeof options.runner === 'function' ? options.runner : run;
   const state = {
     aggregate: null,
-    last: null,
     fileSummaries: [],
     failures: [],
     failureTotal: 0,
@@ -751,7 +1021,6 @@ const runSuite = (files, options = {}) => new Promise((resolve, reject) => {
   }
 
   stream.on('test:summary', (event) => {
-    state.last = event;
     const file = event === null || typeof event !== 'object' ? undefined : event.file;
     if (typeof file === 'string' && file !== '') {
       state.fileSummaries.push(event);
@@ -789,10 +1058,12 @@ const runSuite = (files, options = {}) => new Promise((resolve, reject) => {
  * ------------------------------------------------------------------------- */
 
 /**
- * Applies the guard to an aggregate summary. Exit 0 requires all three
- * conditions, and a missing summary is a failure in its own right.
+ * Applies the counts half of the guard to the **cumulative** summary: all three
+ * conditions must hold, and a missing summary is a failure in its own right
+ * rather than something another event can stand in for. The other half - that
+ * every declared file actually reported - is `auditFileSummaries`.
  *
- * @param {object|null|undefined} summary The aggregate `test:summary` payload.
+ * @param {object|null|undefined} summary The cumulative `test:summary` payload.
  * @param {number} minTests The floor from `resolveMinTests`.
  * @returns {{ok: boolean, reasons: string[], counts: (unknown|null)}} The
  *   verdict, with one reason per condition that did not hold.
@@ -829,6 +1100,62 @@ const evaluateRun = (summary, minTests) => {
   }
 
   return { ok: reasons.length === 0, reasons, counts };
+};
+
+/**
+ * Normalizes a path for comparison. The runner echoes back the exact string it
+ * was given, but that is not a contract worth depending on: a relative path, a
+ * different separator or - on Windows - a different case must still be
+ * recognized as the file that was declared.
+ *
+ * @param {string} filePath A declared path, or one reported by the runner.
+ * @returns {string} A key two spellings of the same file share.
+ */
+const summaryPathKey = (filePath) => {
+  const resolved = path.resolve(filePath);
+  // Windows paths are case-insensitive, so `C:\...` and `c:\...` are one file.
+  // Every other platform's are case-sensitive and must not be folded.
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * Requires **exactly one** per-file `test:summary` from every declared file.
+ *
+ * The aggregate alone is not sufficient evidence that the suite ran, and that
+ * was measured rather than assumed on v24.21.0: a test file that calls
+ * `process.exit(0)` part way through, and a test file that declares no test at
+ * all, each emit **no** per-file summary while still adding 1 to the
+ * aggregate's `passed` with `failed` at 0. A whole file can therefore fail to
+ * run behind a clean-looking total. Two summaries for one file are refused for
+ * the mirror-image reason: the total would then include that file twice.
+ *
+ * @param {string[]} files The declared suite, in order.
+ * @param {object[]} fileSummaries The per-file `test:summary` payloads
+ *   collected by `runSuite`, each carrying a non-empty `file`.
+ * @returns {string[]} One reason per file that did not report exactly one
+ *   summary, in suite order; empty when every declared file reported one.
+ */
+const auditFileSummaries = (files, fileSummaries) => {
+  const summariesPerFile = new Map();
+  for (const summary of fileSummaries) {
+    const file = summary === null || typeof summary !== 'object' ? undefined : summary.file;
+    if (typeof file !== 'string' || file === '') {
+      continue;
+    }
+    const key = summaryPathKey(file);
+    const already = summariesPerFile.get(key);
+    summariesPerFile.set(key, already === undefined ? 1 : already + 1);
+  }
+  const reasons = [];
+  for (const file of files) {
+    const seen = summariesPerFile.get(summaryPathKey(file));
+    if (seen === undefined) {
+      reasons.push(`${displayPath(file)} emitted no test:summary of its own, so that file did not run to completion`);
+    } else if (seen > 1) {
+      reasons.push(`${displayPath(file)} emitted ${seen} test:summary events, so its counts are reported more than once`);
+    }
+  }
+  return reasons;
 };
 
 /**
@@ -877,7 +1204,10 @@ const reportGuardFailure = (error) => {
  * @param {{files?: string[], environment?: Record<string, (string|undefined)>, version?: string, runner?: Function}} [options]
  *   Injection seams, all defaulted to the real thing: the declared suite,
  *   `process.env`, `process.version` and `node:test`'s `run`.
- * @returns {Promise<number>} `EXIT_SUCCESS` only when every condition held.
+ * @returns {Promise<number>} `EXIT_SUCCESS` only when the cumulative summary
+ *   cleared every condition of `evaluateRun` **and** every declared file
+ *   reported exactly one summary of its own; `EXIT_FAILURE` otherwise, with one
+ *   stderr line naming every reason.
  */
 const main = async (options = {}) => {
   try {
@@ -893,15 +1223,23 @@ const main = async (options = {}) => {
     writeOut(`${LOG_PREFIX}: running ${files.length} test file(s) at concurrency ${TEST_CONCURRENCY}, requiring at least ${minTests} passing test(s)`);
 
     const outcome = await runSuite(files, options);
-    const verdict = evaluateRun(outcome.aggregate === null ? outcome.last : outcome.aggregate, minTests);
+    // The verdict is the **cumulative** aggregate and nothing else. Falling
+    // back to the last per-file summary would let a single file's counts
+    // certify the whole suite, and `evaluateRun(null, ...)` already reports an
+    // absent aggregate as the failure it is.
+    const verdict = evaluateRun(outcome.aggregate, minTests);
+    // Whole-suite counts are necessary but not sufficient: a file that exits
+    // early or declares nothing contributes to them without running. See
+    // `auditFileSummaries`.
+    const coverage = auditFileSummaries(files, outcome.fileSummaries);
 
-    if (!verdict.ok) {
+    if (!verdict.ok || coverage.length > 0) {
       reportFailures(outcome);
-      writeErr(`${LOG_PREFIX}: FAIL - ${verdict.reasons.join('; ')}`);
+      writeErr(`${LOG_PREFIX}: FAIL - ${verdict.reasons.concat(coverage).join('; ')}`);
       return EXIT_FAILURE;
     }
 
-    writeOut(`${LOG_PREFIX}: PASS - ${formatCounts(verdict.counts)} (minimum ${minTests} passing, 0 failed, 0 cancelled)`);
+    writeOut(`${LOG_PREFIX}: PASS - ${formatCounts(verdict.counts)} (minimum ${minTests} passing, 0 failed, 0 cancelled, ${files.length} file(s) each summarized once)`);
     return EXIT_SUCCESS;
   } catch (error) {
     reportGuardFailure(error);
@@ -928,6 +1266,7 @@ module.exports = {
   assertTestFilesPresent,
   runSuite,
   evaluateRun,
+  auditFileSummaries,
   main,
 };
 
@@ -942,4 +1281,3 @@ if (require.main === module) {
     process.exitCode = EXIT_FAILURE;
   });
 }
-

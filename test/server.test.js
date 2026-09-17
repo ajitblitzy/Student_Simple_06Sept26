@@ -32,11 +32,13 @@
  *
  * WHAT IT DELIBERATELY DOES NOT DO
  * ---------------------------------------------------------------------------
- *   - **It writes nothing.** No `POST` is issued anywhere in this file, so the
- *     committed `activities.json` and the workbooks are read-only throughout
- *     and `git status --porcelain` is identical before and after a run. The one
- *     directory it creates (test 41) is an empty `fs.mkdtempSync` directory
- *     under the system temp root, removed in the same test's `finally`.
+ *   - **It writes nothing inside the checkout.** No `POST` is issued anywhere
+ *     in this file, so the committed `activities.json` and the workbooks are
+ *     read-only throughout and `git status --porcelain` is identical before and
+ *     after a run. The one directory it creates (test 41) is an
+ *     `fs.mkdtempSync` directory under the system temp root, holding the two
+ *     registry files that make relative-path resolution observable, and it is
+ *     removed in the same test's `finally`.
  *   - **It declares EXACTLY EIGHT top-level tests**, with no subtest, no
  *     `describe` and no `it`. Root `verify-tests.js` gates on
  *     `test:summary.counts.passed >= MIN_TESTS` with `MIN_TESTS` 45 = 33 + 8 +
@@ -47,7 +49,10 @@
  *     naming the case in every assertion message.
  *   - **It keeps no assertion in a hook.** Assertions made inside
  *     `before`/`after` do not count toward `counts.passed`. The single `after`
- *     here is a cleanup safety net and asserts nothing.
+ *     here is a cleanup safety net and asserts nothing; the one error it can
+ *     raise is a cleanup failure - a child it could not reap - which lands in
+ *     `counts.failed` rather than in `counts.passed`, so the eight-test total
+ *     stands either way.
  *   - **It never modifies `server.js`.** Where the module as built differs from
  *     what the plan predicted, the test adapts and says so in a comment - see
  *     test 39 on the internal `'listening'` listener.
@@ -61,6 +66,11 @@
  * `finally`, and a `holdPort` release in a `finally`. A second bind would fail
  * `EADDRINUSE` and surface as *cancelled* tests whose message names neither the
  * port nor the conflict.
+ *
+ * Release is tracked rather than assumed: `stop()` drops a child from
+ * `liveChildren` only once its `'close'` has actually arrived, so a process
+ * that outlives its own `SIGKILL` stays reachable by the safety-net `after`
+ * hook, which retries it and then fails the run with the port named.
  *
  * Every value asserted here was verified against this checkout on Node
  * v24.21.0 before being written down.
@@ -181,6 +191,59 @@ const LIBRARY_OPTIONS = Object.freeze({
  */
 const FOREIGN_CWD_PREFIX = 'server-entrypoint-cwd-';
 
+/**
+ * Test 41's two registry files, and why there are two.
+ *
+ * A missing registry is deliberately NON-FATAL - `lib/activityRepository.js`
+ * warns on stderr and serves the workbook-sourced activities alone (AAP 0.6.6).
+ * That is exactly what makes a mis-resolved `ACTIVITIES_DATA_PATH` invisible:
+ * a relative value resolved against the child's working directory finds
+ * nothing, and the response is byte-identical to a correctly resolved one. So
+ * the resolution is made externally distinguishable in both directions.
+ *
+ *   - **The decoy** is named `activities.json` and planted IN the foreign
+ *     working directory. `ACTIVITIES_DATA_PATH=activities.json` resolved
+ *     against that directory would load it and answer with two activities, so
+ *     the committed single-activity payload proves the value did NOT resolve
+ *     against `process.cwd()`. It holds a real record for a real student on
+ *     purpose: an invalid one would fail the load, and a load failure is a
+ *     weaker signal than a wrong payload.
+ *   - **The proof registry** sits OUTSIDE the checkout and is addressed by a
+ *     relative path computed from the entrypoint's directory. Its record can
+ *     only reach a response if that relative value resolved against the
+ *     entrypoint's directory, so its presence is the positive half of the
+ *     proof.
+ *
+ * Both live under `fs.mkdtempSync`, so nothing is written inside the checkout.
+ */
+const DECOY_REGISTRY_FILENAME = 'activities.json';
+const DECOY_ACTIVITY = 'Foreign Cwd Decoy Club';
+const PROOF_REGISTRY_FILENAME = 'registry-proof.json';
+const PROOF_ACTIVITY = 'Registry Path Proof Club';
+
+/**
+ * `S001`'s answer when the proof registry is the resolved registry: the
+ * workbook record first, then the registry record, per the ordering rule in
+ * AAP 0.5.3.
+ */
+const S001_WITH_PROOF_PAYLOAD = {
+  studentId: 'S001',
+  name: 'Aarav Sharma',
+  count: 2,
+  activities: [
+    { activity: 'Robotics Club', source: 'workbook' },
+    { activity: PROOF_ACTIVITY, source: 'registry' }
+  ]
+};
+
+/**
+ * The opening words of the warning `lib/activityRepository.js` writes when the
+ * resolved registry file is absent, quoted from the module as built. Its
+ * ABSENCE is what proves the resolved path existed, which is the other thing a
+ * served payload alone cannot show.
+ */
+const MISSING_REGISTRY_WARNING = 'Activity registry not found at';
+
 /* ---------------------------------------------------------------------------
  * The inline harness.
  *
@@ -225,8 +288,13 @@ const baseEnv = () => {
  *   exited: boolean,
  *   code: number|null,
  *   signal: string|null,
- *   spawnError: Error|null
+ *   spawnError: Error|null,
+ *   signalsSent: {signal: string, delivered: boolean}[],
+ *   stopFailure: string|null
  * }} A handle carrying the child and everything observed about it.
+ *   `signalsSent` and `stopFailure` are teardown bookkeeping: they are what
+ *   turns a child that outlived its own kill into a named failure instead of a
+ *   silently leaked process holding this file's port.
  */
 const spawnEntry = ({ env = {}, cwd } = {}) => {
   const child = spawn(process.execPath, [ENTRY], {
@@ -243,7 +311,9 @@ const spawnEntry = ({ env = {}, cwd } = {}) => {
     exited: false,
     code: null,
     signal: null,
-    spawnError: null
+    spawnError: null,
+    signalsSent: [],
+    stopFailure: null
   };
 
   child.stdout.setEncoding('utf8');
@@ -413,6 +483,22 @@ const waitForClose = (handle, timeoutMs) => new Promise((resolve) => {
 });
 
 /**
+ * Sends one signal and waits, bounded, for the child's `'close'`.
+ *
+ * The delivery flag `ChildProcess.kill` returns is kept on the handle: a
+ * `false` there says the signal never reached the process, which is a different
+ * diagnosis from a process that received it and ignored it.
+ *
+ * @param {ReturnType<typeof spawnEntry>} handle The child's handle.
+ * @param {NodeJS.Signals} signal The signal to send.
+ * @returns {Promise<boolean>} `true` once the child has closed.
+ */
+const signalAndAwaitClose = async (handle, signal) => {
+  handle.signalsSent.push({ signal, delivered: handle.child.kill(signal) });
+  return waitForClose(handle, CHILD_EXIT_TIMEOUT_MS);
+};
+
+/**
  * Stops a child and does not return until it is gone and its socket with it.
  *
  * `SIGTERM` first, then `SIGKILL` if the child overruns. On Windows libuv maps
@@ -422,19 +508,56 @@ const waitForClose = (handle, timeoutMs) => new Promise((resolve) => {
  * refusal assertion deterministic instead of a race with the kernel releasing
  * the listening socket.
  *
+ * THE BOOKKEEPING ORDER IS THE CONTRACT. The handle leaves `liveChildren` only
+ * once `handle.closed` is true, never on the mere intention to stop it: a
+ * handle dropped before closure is confirmed is a process this file can no
+ * longer reach and a `127.0.0.1:3000` the safety-net `after` hook can no longer
+ * release, which would cancel the next file's tests with a message naming
+ * neither the port nor the conflict.
+ *
+ * It therefore reports its terminal failure rather than throwing it. Every
+ * caller awaits `stop` from a `finally`, and an exception raised there would
+ * replace the assertion error that sent the test into cleanup - the failure
+ * would be reported as "could not kill a child" instead of as the behavioural
+ * defect that actually broke. The unreachable child stays tracked with its
+ * diagnosis on `handle.stopFailure`, and the `after` hook escalates it once
+ * every other child and holder has been dealt with.
+ *
  * @param {ReturnType<typeof spawnEntry>} handle The child's handle.
- * @returns {Promise<void>} Resolves once the child has closed, or after the
- *   escalated kill has been given its own deadline.
+ * @param {{signals?: NodeJS.Signals[]}} [options] `signals` is the escalation
+ *   ladder, in order; the `after` hook's retry passes `['SIGKILL']` alone
+ *   because a child that already outlived both signals will not answer a
+ *   second `SIGTERM` either.
+ * @returns {Promise<boolean>} `true` once the child has closed - which is also
+ *   when it has been untracked; `false` when the ladder was exhausted and the
+ *   process may still be alive, in which case `handle.stopFailure` names why.
  */
-const stop = async (handle) => {
-  liveChildren.delete(handle);
-  if (handle.closed) return;
+const stop = async (handle, { signals = ['SIGTERM', 'SIGKILL'] } = {}) => {
+  const untrack = () => {
+    liveChildren.delete(handle);
+    handle.stopFailure = null;
+    return true;
+  };
 
-  handle.child.kill('SIGTERM');
-  if (await waitForClose(handle, CHILD_EXIT_TIMEOUT_MS)) return;
+  if (handle.closed) return untrack();
 
-  handle.child.kill('SIGKILL');
-  await waitForClose(handle, CHILD_EXIT_TIMEOUT_MS);
+  // A spawn that never produced a process has nothing to kill and nothing to
+  // leak, so it is not held against the ladder below. `'close'` does follow
+  // `'error'` on this runtime, which is why this is a guard and not the path.
+  if (handle.spawnError !== null && handle.child.pid === undefined) return untrack();
+
+  for (const signal of signals) {
+    if (await signalAndAwaitClose(handle, signal)) return untrack();
+  }
+
+  const ladder = handle.signalsSent
+    .map(({ signal, delivered }) => `${signal} (delivered: ${delivered})`)
+    .join(', then ');
+  handle.stopFailure =
+    `the spawned entrypoint (pid ${handle.child.pid}) did not close within `
+      + `${CHILD_EXIT_TIMEOUT_MS} ms of each of ${ladder}, so it may still be running and `
+      + `may still hold ${HOST}:${DEFAULT_PORT}${describeChild(handle)}`;
+  return false;
 };
 
 /**
@@ -553,19 +676,45 @@ const closeServer = (server) => new Promise((resolve) => {
 });
 
 /**
- * Cleanup safety net, and nothing else: it asserts NOTHING, because assertions
- * made in a hook do not count toward `test:summary.counts.passed` and this file
- * promises exactly eight counted tests. Each test already stops its own child
- * and releases its own holder in a `finally`; this reaps whatever a thrown
- * assertion skipped, so a failure cannot leave port 3000 occupied for the next
- * file or the next run.
+ * Cleanup safety net: it asserts NOTHING, because assertions made in a hook do
+ * not count toward `test:summary.counts.passed` and this file promises exactly
+ * eight counted tests. Each test already stops its own child and releases its
+ * own holder in a `finally`; this reaps whatever a thrown assertion skipped, so
+ * a failure cannot leave port 3000 occupied for the next file or the next run.
+ *
+ * Anything still tracked here either never reached its `stop` or survived its
+ * escalation, because `stop` untracks a handle only on confirmed closure. Each
+ * one is retried with `SIGKILL`, every holder is released whatever the children
+ * did, and only then is an unreapable child reported - as a cleanup error, not
+ * as an assertion. That distinction is not cosmetic: verified on Node
+ * v24.21.0, a throwing top-level `after` hook is counted in
+ * `test:summary.counts.failed` and NOT in `counts.passed` (`{tests: 2,
+ * failed: 1, passed: 1}` for one passing test plus a throwing hook), so this
+ * fails the run loudly through `verify-tests.js`'s `failed === 0` condition
+ * without inflating the eight counted tests its `MIN_TESTS` guard gates on.
  */
 after(async () => {
+  const failures = [];
+
   for (const handle of [...liveChildren]) {
-    await stop(handle);
+    if (!(await stop(handle, { signals: ['SIGKILL'] }))) {
+      failures.push(handle.stopFailure);
+    }
   }
+
   for (const holder of [...liveHolders]) {
-    await holder.release();
+    try {
+      await holder.release();
+    } catch (error) {
+      failures.push(`a port holder could not be released: ${error.message}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} leaked test resource(s) could not be cleaned up, so `
+        + `${HOST}:${DEFAULT_PORT} may still be occupied: ${failures.join(' | ')}`
+    );
   }
 });
 
@@ -952,16 +1101,32 @@ test('an invalid port is a fatal configuration error and 0 binds an ephemeral po
 });
 
 /**
- * Host values that must be refused. An empty or whitespace-only host must
- * never become a silent bind to every interface: `listen(port, '')` binds
- * `0.0.0.0`, which would publish a service that authenticates nobody.
+ * Host values that must be refused, on BOTH paths that can supply one.
+ *
+ * An empty or whitespace-only host must never become a silent bind to every
+ * interface: `listen(port, '')` binds `0.0.0.0`, which would publish a service
+ * that authenticates nobody. Refusing it programmatically is only half the
+ * contract - `HOST` is read from the environment by every operator who runs
+ * `node server.js`, and an environment value that were ignored, or an empty one
+ * mistaken for "not set" and quietly replaced by the default, would leave the
+ * programmatic assertion green while the shipped entrypoint accepted it.
+ *
+ * `cliQuoted` is the rejected value as the CLI wrapper prints it, pinned as a
+ * literal rather than recomputed: `reportStartupFailure` collapses every run of
+ * whitespace in the diagnostic into a single space, so the whitespace-only host
+ * is reported as `" "` while the empty one is reported as `""`. Quoting is what
+ * makes an empty value visible at all.
  */
-const INVALID_HOSTS = ['', '   '];
+const INVALID_HOST_CASES = [
+  { value: '', cliQuoted: '""' },
+  { value: '   ', cliQuoted: '" "' }
+];
 
-// Test 41 - the host is fatal when empty, and both path options resolve against
-// the entrypoint's directory rather than the caller's working directory.
+// Test 41 - the host is fatal when empty, on the library path AND through the
+// real entrypoint's environment, and both path options resolve against the
+// entrypoint's directory rather than the caller's working directory.
 test('an empty host is fatal and relative paths resolve against the entrypoint directory', async () => {
-  for (const value of INVALID_HOSTS) {
+  for (const { value, cliQuoted } of INVALID_HOST_CASES) {
     const label = JSON.stringify(value);
     assert.throws(
       () => createServer({ ...LIBRARY_OPTIONS, host: value }),
@@ -981,6 +1146,55 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       },
       `host ${label}: createServer must refuse it rather than bind every interface`
     );
+
+    // The same rejection through the artifact an operator runs: `HOST` read
+    // from the environment, and the `require.main === module` wrapper turning
+    // the throw into one stderr line plus a non-zero exit code. Nothing binds,
+    // because configuration is resolved before any `listen`, so this cannot
+    // contend for the default port.
+    const rejected = spawnEntry({ env: { HOST: value } });
+    try {
+      assert.ok(
+        await waitForClose(rejected, CHILD_EXIT_TIMEOUT_MS),
+        `HOST=${label}: the entrypoint must exit within ${CHILD_EXIT_TIMEOUT_MS} ms`
+          + `${describeChild(rejected)}`
+      );
+      assert.equal(
+        rejected.signal,
+        null,
+        `HOST=${label}: the entrypoint must exit of its own accord, not on a signal, `
+          + `read ${rejected.signal}`
+      );
+      assert.ok(
+        rejected.code !== null && rejected.code !== 0,
+        `HOST=${label}: the entrypoint must exit non-zero, read ${rejected.code}`
+          + `${describeChild(rejected)}`
+      );
+      assert.equal(
+        rejected.stdout,
+        '',
+        `HOST=${label}: a refused host must print no banner, read ${JSON.stringify(rejected.stdout)}`
+      );
+      assert.match(
+        rejected.stderr,
+        /host/i,
+        `HOST=${label}: stderr must identify the host setting it rejected, `
+          + `read ${JSON.stringify(rejected.stderr)}`
+      );
+      assert.ok(
+        rejected.stderr.includes(cliQuoted),
+        `HOST=${label}: stderr must show the rejected value as ${cliQuoted}, `
+          + `read ${JSON.stringify(rejected.stderr)}`
+      );
+      assert.equal(
+        rejected.stderr.trimEnd().split('\n').length,
+        1,
+        `HOST=${label}: the wrapper must write exactly one diagnostic line, `
+          + `read ${JSON.stringify(rejected.stderr)}`
+      );
+    } finally {
+      await stop(rejected);
+    }
   }
 
   // Resolution asserted directly on the pure function. Both values are
@@ -1012,38 +1226,142 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       + `read ${JSON.stringify(config.activitiesDataPath)}`
   );
 
-  // End to end from a working directory that holds none of the project files.
-  // Resolution against `process.cwd()` would find nothing there, so a served
-  // payload proves the values resolved against the entrypoint's directory.
+  // End to end from a working directory that holds none of the project files,
+  // twice - once proving where a relative value did NOT resolve, once proving
+  // where it DID.
   const foreignCwd = fs.mkdtempSync(path.join(os.tmpdir(), FOREIGN_CWD_PREFIX));
-  const entry = spawnEntry({
-    cwd: foreignCwd,
-    env: { WORKBOOK_DIR: '.', ACTIVITIES_DATA_PATH: 'activities.json' }
-  });
+  const decoyRegistry = path.join(foreignCwd, DECOY_REGISTRY_FILENAME);
+  const proofRegistry = path.join(foreignCwd, PROOF_REGISTRY_FILENAME);
   try {
-    assert.deepEqual(
-      fs.readdirSync(foreignCwd),
-      [],
-      `the foreign working directory must be empty for this proof to mean anything, `
-        + `read ${JSON.stringify(fs.readdirSync(foreignCwd))}`
+    // A valid registry for a real student, so that loading it would succeed and
+    // show up as an extra activity rather than as a start-up failure.
+    fs.writeFileSync(
+      decoyRegistry,
+      `${JSON.stringify([{ studentId: 'S001', activity: DECOY_ACTIVITY }], null, 2)}\n`,
+      'utf8'
+    );
+    fs.writeFileSync(
+      proofRegistry,
+      `${JSON.stringify([{ studentId: 'S001', activity: PROOF_ACTIVITY }], null, 2)}\n`,
+      'utf8'
     );
 
-    await waitForBanner(entry);
-    const response = await httpRequest({ path: S001_PATH });
-    assert.equal(
-      response.status,
-      200,
-      `launched from ${foreignCwd}, GET ${S001_PATH} must answer 200, `
-        + `read ${response.status} with body ${JSON.stringify(response.text)}`
+    // Part 3a - relative values resolved against the entrypoint's directory:
+    // the committed workbooks are read (nothing readable sits in the working
+    // directory), and the committed `activities.json` is the registry rather
+    // than the identically named decoy one directory away.
+    const entry = spawnEntry({
+      cwd: foreignCwd,
+      env: { WORKBOOK_DIR: '.', ACTIVITIES_DATA_PATH: DECOY_REGISTRY_FILENAME }
+    });
+    try {
+      assert.deepEqual(
+        fs.readdirSync(foreignCwd).sort(),
+        [DECOY_REGISTRY_FILENAME, PROOF_REGISTRY_FILENAME].sort(),
+        `the foreign working directory must hold only this test's two registry files, `
+          + `read ${JSON.stringify(fs.readdirSync(foreignCwd))}`
+      );
+      assert.equal(
+        fs.readdirSync(foreignCwd).filter((name) => name.endsWith('.xlsx')).length,
+        0,
+        'the foreign working directory must hold no workbook, or a cwd-resolved '
+          + 'WORKBOOK_DIR could satisfy the request too'
+      );
+
+      await waitForBanner(entry);
+      const response = await httpRequest({ path: S001_PATH });
+      assert.equal(
+        response.status,
+        200,
+        `launched from ${foreignCwd}, GET ${S001_PATH} must answer 200, `
+          + `read ${response.status} with body ${JSON.stringify(response.text)}`
+      );
+      // Deep-strict on the WHOLE payload, not just `name`: the decoy holds a
+      // second activity for this very student, so a registry path resolved
+      // against the working directory would answer `count: 2` carrying
+      // `DECOY_ACTIVITY`. Equality with the committed single-activity payload
+      // is therefore the assertion that distinguishes the two resolutions,
+      // which a `name` check could not.
+      assert.deepEqual(
+        JSON.parse(response.text),
+        S001_PAYLOAD,
+        `launched from ${foreignCwd}, the committed workbooks and the committed registry `
+          + `must be the sources - a payload carrying ${JSON.stringify(DECOY_ACTIVITY)} would `
+          + `mean ACTIVITIES_DATA_PATH resolved against the working directory. `
+          + `Read ${JSON.stringify(response.text)}`
+      );
+      // The other half: a resolved path that does not exist is not an error,
+      // only a warning, so its absence is what proves the resolved registry
+      // path was found rather than merely harmless.
+      assert.ok(
+        !entry.stderr.includes(MISSING_REGISTRY_WARNING),
+        `launched from ${foreignCwd}, the resolved registry path must exist, so no `
+          + `${JSON.stringify(MISSING_REGISTRY_WARNING)} warning may be printed, `
+          + `read ${JSON.stringify(entry.stderr)}`
+      );
+      assert.equal(
+        entry.stderr,
+        '',
+        `launched from ${foreignCwd}, a healthy start must print nothing on stderr, `
+          + `read ${JSON.stringify(entry.stderr)}`
+      );
+    } finally {
+      await stop(entry);
+    }
+
+    // Part 3b - the positive proof for `ACTIVITIES_DATA_PATH`, which 3a can only
+    // establish negatively. The value is relative and addresses a registry
+    // OUTSIDE the checkout, computed from the entrypoint's directory, so its
+    // record can reach a response only if the value resolved there.
+    const relativeProofPath = path.relative(REPO_ROOT, proofRegistry);
+    const cwdResolvedCandidate = path.resolve(foreignCwd, relativeProofPath);
+    assert.ok(
+      !path.isAbsolute(relativeProofPath),
+      `the registry path under test must be relative for this proof to mean anything, `
+        + `read ${JSON.stringify(relativeProofPath)}`
+    );
+    assert.notEqual(
+      cwdResolvedCandidate,
+      proofRegistry,
+      `resolving ${JSON.stringify(relativeProofPath)} against the working directory must `
+        + `reach somewhere else, or the two resolutions would be indistinguishable`
     );
     assert.equal(
-      JSON.parse(response.text).name,
-      S001_PAYLOAD.name,
-      `launched from ${foreignCwd}, the committed workbooks must still be the source, `
-        + `read ${JSON.stringify(response.text)}`
+      fs.existsSync(cwdResolvedCandidate),
+      false,
+      `nothing may exist at ${cwdResolvedCandidate}, the path a cwd-relative resolution `
+        + `would reach, or a wrong resolution could still serve the proof record`
     );
+
+    const relativeEntry = spawnEntry({
+      cwd: foreignCwd,
+      env: { WORKBOOK_DIR: '.', ACTIVITIES_DATA_PATH: relativeProofPath }
+    });
+    try {
+      await waitForBanner(relativeEntry);
+      const response = await httpRequest({ path: S001_PATH });
+      assert.equal(
+        response.status,
+        200,
+        `with ACTIVITIES_DATA_PATH=${JSON.stringify(relativeProofPath)}, GET ${S001_PATH} `
+          + `must answer 200, read ${response.status} with body ${JSON.stringify(response.text)}`
+      );
+      assert.deepEqual(
+        JSON.parse(response.text),
+        S001_WITH_PROOF_PAYLOAD,
+        `with ACTIVITIES_DATA_PATH=${JSON.stringify(relativeProofPath)}, the record in `
+          + `${proofRegistry} must be served, which it can be only if the relative value `
+          + `resolved against ${REPO_ROOT}. Read ${JSON.stringify(response.text)}`
+      );
+      assert.ok(
+        !relativeEntry.stderr.includes(MISSING_REGISTRY_WARNING),
+        `with ACTIVITIES_DATA_PATH=${JSON.stringify(relativeProofPath)}, the resolved path `
+          + `must exist, read ${JSON.stringify(relativeEntry.stderr)}`
+      );
+    } finally {
+      await stop(relativeEntry);
+    }
   } finally {
-    await stop(entry);
     fs.rmSync(foreignCwd, { recursive: true, force: true });
   }
 });
