@@ -2,7 +2,6 @@
   "name": "student-simple-06sept26",
   "version": "1.0.0",
   "private": true,
-  "description": "HTTP service over the committed student workbooks, exposing extracurricular activity data keyed by Student ID.",
   "license": "Apache-2.0",
   "type": "commonjs",
   "main": "server.js",
