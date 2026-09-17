@@ -1,1 +1,969 @@
 # Student_Simple_06Sept26
+
+Student records for ten students live in three read-only spreadsheet workbooks, and a small Node.js
+listener sits in front of them. Until now that listener answered every method on every path with the
+same fixed plaintext greeting, and no code in the project opened a workbook or wrote anything at all.
+This release adds one feature: **students can add their own extracurricular activities.** Three things
+that did not exist before now do — an *intake surface*, the `/activities` namespace on the existing
+listener, through which a person uses an HTML form and a script uses the same endpoint; an *activity
+store*, the JSON document `activities.json`, because the repository had nowhere to put a submission
+and the workbook's single-valued `Extracurricular Activity` column could not receive one without
+destroying the value already in it; and a *link to Student ID*, carried on every record. That link is
+enforced by code in the request path, and it can only be enforced there: no workbook declares a key
+and none contains a data-validation part, so nothing in the data itself can uphold it. A submission
+whose Student ID is malformed, or well-formed but naming no student, is refused rather than stored.
+
+## Prerequisites
+
+- **Node.js 24 "Krypton" (Active LTS).** The development and evidence release is `v24.21.0` — every
+  measured value in this document was taken on it.
+- **`.nvmrc` holds `24.21.0`**, so a version manager that reads it selects the evidence release
+  automatically.
+- **`package.json` declares the supported range `engines.node = ">=24.21.0 <25.0.0"`.** Any 24.x at or
+  above the evidence release is supported. A different major is deliberately **not** claimed: the
+  ceiling is `<25.0.0` because nothing here has been verified against Node 25 or later, and moving to
+  a new major is a deliberate change to both files plus a re-run of the test suite.
+- **A version manager is optional.** `nvm` — or any manager that reads `.nvmrc` — only *selects* the
+  pinned release; it is a convenience, not a dependency of this project. Where the runtime is already
+  installed host-wide and `node --version` already prints `v24.21.0`, there is nothing left to select:
+  step 1 below is skipped in full and no version manager need be present at all. That is the case on
+  this project's own supported environment, which installs `v24.21.0` host-wide and deliberately ships
+  no version manager.
+
+Beyond that one runtime there are **no other prerequisites**: no version manager, no database, no
+cache, no message broker, no service to provision, no credential to obtain, and no package to install.
+The project declares **zero dependencies and zero devDependencies**; the feature uses only the
+runtime's built-in modules (`node:http`, `node:fs`, `node:path`, `node:zlib`) and the built-in test
+runner. There is no private registry, no authentication token, no `.npmrc`, and no internal or scoped
+package anywhere in this project — so there is no registry to configure and no credential step to
+perform.
+
+## Install, start, and test
+
+```bash
+# 1. Select the pinned runtime. Check what your shell already resolves first:
+
+node --version                  # already v24.21.0? skip to step 2 — nothing to select
+
+# Only if it is not, and only where a version manager that reads .nvmrc is installed:
+
+nvm install && nvm use          # selects 24.21.0
+node --version                  # must print v24.21.0
+
+# 2. Install dependencies. There are none, so nothing is downloaded.
+
+npm ci                          # frozen install against the committed lockfile
+
+# 3. Start the service.
+
+npm start                       # equivalently: node server.js
+                                # prints: Server running at http://127.0.0.1:3000/
+
+# 4. Run the tests.
+
+npm test                        # node --test --test-concurrency=1
+```
+
+Four notes separate these commands *working* from merely *appearing* to work:
+
+- **Step 1 is conditional; steps 2 to 4 are not.** A version manager selects a runtime, so it has
+  nothing to do once the pinned runtime is the one your shell resolves already — and it is
+  deliberately absent from this project's supported environment, where `v24.21.0` is the default. So
+  `nvm install && nvm use` answering `nvm: command not found` is **not** a failure of this project:
+  confirm `node --version` prints `v24.21.0` and go straight to `npm ci`. Install a version manager
+  only if you need to *change* which runtime your shell resolves.
+- **`npm install` generates the lockfile; `npm ci` consumes it.** `npm ci` *requires*
+  `package-lock.json` to exist and fails without it — it never creates one. The lockfile was generated
+  once, at implementation time, and is committed. With zero dependencies both commands download
+  nothing, and what `npm ci` checks is narrower than "the manifest and the lockfile agree": the
+  lockfile must be **present**, and its **dependency tree** must match the dependencies the manifest
+  declares. With none declared, the tree comparison has nothing to compare and the check reduces to
+  the presence one. **Root-metadata drift is not detected** — a bumped `version` or a widened
+  `engines` range with the lockfile left untouched still exits `0`, so a lockfile disagreeing with
+  those two fields is not what this command is going to tell you about. Re-run `npm install` after
+  editing either field; it rewrites the lockfile's copy of them and downloads nothing.
+- **The test command passes no positional argument.** Do not run `node --test test/`: on the pinned
+  runtime that treats `test/` as a module to load rather than as a directory to discover, exits `1`,
+  and runs no tests at all. Node discovers the test files itself, which is also why no shell glob is
+  needed and none is portable.
+- **There is no graceful-shutdown handler**, and the feature adds none. Stop the service with
+  `Ctrl-C`, exactly as before. Measured on Windows PowerShell 5.1 (`$Host.Name` = `ConsoleHost`),
+  that is all it takes: a single `Ctrl-C` in the console running `npm start` stops the service and
+  returns the ordinary prompt, with no `^C` echoed and nothing printed on the way out. The silence
+  is the design rather than a message that went missing — there is no signal or exit listener
+  anywhere in the service to print one. Two Windows specifics are worth knowing even so. First,
+  `npm start` reaches the service through a PowerShell *script* shim rather than an executable:
+  `npm` resolves to `npm.ps1`, whose last statement is `exit $LASTEXITCODE`. PowerShell's own
+  debugger can claim an interrupt while a script is on the call stack, so if `Ctrl-C` ever answers
+  with `Entering debug mode` or a `[DBG]:` prompt instead of your shell prompt, the service is
+  already going down and `q` leaves the debugger; `node server.js` has no shim in the way at all.
+  Second, for a scripted stop, where there is no console to press anything in, terminate whatever
+  owns the port:
+  `Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProcess`.
+
+## Endpoint contract
+
+The service listens on **`127.0.0.1:3000`** and is reachable **only from the local host**. That bind
+is a pair of hardcoded literals and is **unchanged by this feature** — a request to the host's
+routable address on port 3000 is refused while the identical loopback request succeeds.
+
+The feature adds three routes, all on that one listener and that one port:
+
+| Route | Accepts | Answers |
+| --- | --- | --- |
+| `GET /activities` | no body | `200`, `Content-Type: text/html; charset=utf-8` — an HTML submission form. No client-side JavaScript: the form posts natively, which is why its default encoding and this endpoint's accepted media type are the same thing |
+| `POST /activities` | `application/x-www-form-urlencoded` **or** `application/json`, with the two body fields `studentId` and `activity` | `201` with a `Location: /activities/{studentId}` header for a new activity; `200` carrying the existing record unchanged for a repeat |
+| `GET /activities/{studentId}` | no body | `200`, `Content-Type: application/json; charset=utf-8`, body `{"studentId":"S001","activities":[…]}`. This route **never** returns HTML |
+
+**Negotiation is on the request media type, not on `Accept`.** A form-encoded `POST` gets an HTML
+result page; a JSON `POST` gets a JSON body. The status codes are identical either way, so a script
+and a browser receive the same diagnosis in different clothing. A missing `Content-Type` on
+`POST /activities` is refused with `415` rather than guessed at.
+
+Both commands below submit the **same** activity, `(S001, Chess Club)`, because what they contrast is
+the two media types and not two different records. They are therefore a **sequence, not two
+independent examples**: whichever runs first against a fresh store creates the record and answers
+`201`, and the other then finds that composite key already present and answers `200` having written
+nothing.
+
+```bash
+# Form-encoded, as the browser form posts it
+curl -i -X POST http://127.0.0.1:3000/activities \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'studentId=S001' --data-urlencode 'activity=Chess Club'
+
+# JSON, as a script posts it — the same activity again, so this one is the idempotent repeat
+curl -i -X POST http://127.0.0.1:3000/activities \
+  -H 'Content-Type: application/json' \
+  -d '{"studentId":"S001","activity":"Chess Club"}'
+```
+
+Run top to bottom against a fresh store, the form command answers `201 Created` with
+`Location: /activities/S001` and — being form-encoded — an HTML confirmation page rather than JSON.
+The JSON command answers `201` with this body when it is the one that runs **first** against a fresh
+store:
+
+```json
+{
+  "created": true,
+  "record": {
+    "studentId": "S001",
+    "activity": "Chess Club",
+    "source": "submission",
+    "submittedAt": "2026-09-16T06:14:22.481Z"
+  }
+}
+```
+
+Run **second**, as the block above has it, that same command submits a composite key that already
+exists. Nothing is written, no `Location` header is sent, the status is `200 OK`, and the record
+returned is the one the first command stored — carrying its **original** `submittedAt`, not a new one:
+
+```json
+{
+  "created": false,
+  "record": {
+    "studentId": "S001",
+    "activity": "Chess Club",
+    "source": "submission",
+    "submittedAt": "2026-09-16T06:14:22.481Z"
+  }
+}
+```
+
+`created` is `true` for a `201` and `false` for a `200`. Every response that returns a record returns
+it in this shape, so a record seeded from the workbook arrives as
+`"source": "workbook"` with **no** `submittedAt`. To watch the JSON command create rather than repeat,
+submit a different activity, or point `ACTIVITY_STORE` at a store file that does not exist yet inside a
+directory that does — see **Configuration** below.
+
+### The authoritative response matrix
+
+Every JSON response is `application/json; charset=utf-8`; every HTML response is
+`text/html; charset=utf-8`.
+
+| Route and method | Status | Error code | Trigger | Extra headers |
+| --- | --- | --- | --- | --- |
+| `GET /activities` | `200` | — | the submission form (HTML) | — |
+| `HEAD /activities` | `200` | — | the form's headers, with no body | — |
+| `GET /activities/{id}` | `200` | — | `{"studentId":"S001","activities":[record,…]}` (JSON only) | — |
+| `HEAD /activities/{id}` | `200` | — | the read's headers, with no body | — |
+| `GET /activities/{id}` | `400` | `student_id_malformed` | path segment fails `/^S\d{3}$/` | — |
+| `GET /activities/{id}` | `404` | `student_not_found` | well-formed, absent from the key set | — |
+| `GET /activities/{id}` | `405` | `method_not_allowed` | any method other than `GET` or `HEAD` | `Allow: GET, HEAD` |
+| `POST /activities` | `201` | — | `{"created":true,"record":{…}}`, or the HTML confirmation page | `Location: /activities/{studentId}` |
+| `POST /activities` | `200` | — | `{"created":false,"record":{…}}`, or the HTML already-recorded page | — |
+| `POST /activities` | `400` | `malformed_json` | body is not parseable JSON | — |
+| `POST /activities` | `400` | `body_not_an_object` | JSON parses to `null`, an array, or a non-object | — |
+| `POST /activities` | `400` | `student_id_required` | `studentId` absent, `undefined`, or `null` | — |
+| `POST /activities` | `400` | `student_id_malformed` | `studentId` non-string, or fails `/^S\d{3}$/` | — |
+| `POST /activities` | `400` | `activity_invalid` | `activity` absent, non-string, empty after normalization, over 60 characters, or still carrying a control character after normalization (a tab is collapsed to a space, not refused — see [Normalization](#normalization)) | — |
+| `POST /activities` | `404` | `student_not_found` | well-formed `studentId` absent from the key set | — |
+| `POST /activities` | `413` | `payload_too_large` | body over 8,192 bytes | — |
+| `POST /activities` | `500` | `store_at_capacity` | the store is at a ceiling, so the record cannot be added — distinct from a write failure because the remedy is different | — |
+| `POST /activities` | `415` | `unsupported_media_type` | `Content-Type` missing, **declared more than once**, or neither accepted type | — |
+| any method other than `GET`, `HEAD` or `POST` on `/activities` | `405` | `method_not_allowed` | — | `Allow: GET, HEAD, POST` |
+| any namespace path resolving to no route | `404` | `not_found` | e.g. `/activities/S001/extra` | — |
+| any route | `500` | `reference_data_unavailable` | a workbook read failed | — |
+| any route | `500` | `store_unreadable` | the store failed load validation | — |
+| `POST /activities` | `500` | `store_write_failed` | a write or rename failed with the process alive | — |
+| any route | `500` | `internal_error` | an unexpected throw or rejection | — |
+
+Two details of the table are easy to misread. A path is resolved to a route **before** its method is
+considered, so `DELETE /activities/S001/extra` is `404 not_found` and not `405` — a `405` with an
+`Allow` header would claim the resource exists and merely refuses the verb. And a `405` always names
+the methods of the route actually addressed, so `POST /activities/S001` answers `Allow: GET, HEAD`
+rather than the namespace's `Allow: GET, HEAD, POST`.
+
+`HEAD` is answered wherever `GET` is, with the identical status and the identical headers —
+`Content-Length` included, announcing the size the `GET` body would have had — and no body at all.
+It does *not* stand in for `POST`: a `HEAD /activities` previews the form and never a submission, so
+it writes nothing and returns no `Location`, and every verb the `405` rows name is still refused. A
+`HEAD` on a malformed or unknown Student ID returns the same `400` or `404` a `GET` would, headers
+only, so the error envelope is announced by its content type and its length but is not carried —
+read the envelope itself with the `GET`.
+
+Only `POST /activities` with a **form-encoded** body renders HTML, and only for `201`, `200`, and the
+validation outcomes a person filling in the form can act on — `student_id_required`,
+`student_id_malformed`, `activity_invalid` and `student_not_found` — shown as the form re-displayed
+with the offending field flagged. Every other outcome returns the JSON envelope in both modes:
+`413` and `415` are both decided before the body's format is known, an unresolved route has no
+form context to re-display, and a `500` is a fault no amount of retyping fixes.
+
+**Cross-site request forgery is an accepted risk here, not a controlled one.** `POST /activities`
+changes stored state, and a page on any other site can contain a form whose action is this service —
+the browser that loads that page will send the request, and nothing here tells it apart from the
+real form's submission, because it *is* a real form submission, of somebody else's form. There is
+no authentication, session, cookie or token anywhere in the service, and the loopback bind is no
+defence against this particular case, because the browser making such a request is itself on the
+loopback host. No `Origin`, `Sec-Fetch-Site`, referer or token check is applied on any route, so
+where a request says it came from takes no part in any decision this service makes. What does
+decide a response is what the rows above describe: the route and method, the media type, the body
+and its Student ID, and the state of the store and the workbook behind it — which is why the same
+submission is `201` the first time and `200` when repeated. Every `curl` example in this document
+therefore works unchanged, and none of them needs a token or a prior `GET`.
+
+What makes that acceptable is the pair of conditions the attribution section below states — the
+listener is confined to loopback and every record in the data is synthetic — and both are
+load-bearing. Before this surface is exposed off-host or used with real student records, request
+forgery protection becomes a **prerequisite** alongside identity verification, and it belongs with
+an authenticated design rather than as a header check on an endpoint that establishes no identity.
+
+### The error envelope
+
+Every **JSON** error response carries the same two-key envelope — whichever route produced it, and
+whether or not the fault was one the feature anticipated:
+
+```json
+{ "error": "<code>", "message": "<fixed English sentence for that code>" }
+```
+
+`error` is the stable machine-readable code and is what a test should match on. `message` is a fixed
+sentence per code — not free text, not interpolated, and never carrying a stack trace, a filesystem
+path or any other internal detail. A JSON error body carries **no additional fields**, and in
+particular the offending Student ID is **not** echoed back into it.
+
+That includes `internal_error`, the one code answered by the rejection boundary in `server.js` rather
+than by the feature's own vocabulary. That boundary is reached only by a fault nothing anticipated, so
+its sentence is a literal about the outcome and never about the fault:
+
+```json
+{
+  "error": "internal_error",
+  "message": "The request could not be completed because of an unexpected internal error."
+}
+```
+
+The same fault is recorded server-side as one line of allow-listed fields, for example
+`request_handler_failed method=GET path=/activities/S001 error=Error code=-`. It carries the stable
+event code, the request method, the request **pathname** with the query string dropped, and the
+thrown value's name and code — never its message, its stack or its `cause`, because those name source
+and store paths and can carry record values. There are exactly **five distinct `500` codes** in
+total: `reference_data_unavailable`, `store_unreadable`, `store_at_capacity`, `store_write_failed`
+and `internal_error`. The last two are deliberately separate, because a submission refused for want
+of room and a submission refused by a broken disk call for different actions: a **retry** clears a
+write failure, and only **reclaiming room** clears a full store. The capacity section under
+Configuration says how much room there is, what warns you before it runs out, and how to reclaim it.
+
+**The envelope is a statement about JSON responses.** A form-encoded `POST /activities` whose outcome
+a person can act on answers with HTML instead, as the paragraph above sets out, and that page
+deliberately re-displays the submitted `studentId` and `activity` so the form can be corrected rather
+than retyped — every value it interpolates is HTML-escaped first. So the no-echo and no-extra-fields
+guarantees describe the JSON envelope; in HTML mode the submitted values are shown back by design, and
+a client that wants the envelope for every failure sends `application/json`.
+
+The request-body limit is **8,192 bytes, and it is inclusive** — a body of exactly 8,192 bytes is
+read, and 8,193 is refused with `413 payload_too_large`. A legitimate submission
+(`studentId=S001&activity=Photography+Club`) is under fifty bytes, so this is three orders of
+magnitude of headroom while still bounding the memory any one request can make the process hold. An
+oversized body is drained and refused; the process keeps serving.
+
+### Where the feature's reach begins and ends
+
+**Every path and method outside the `/activities` namespace still returns the pre-existing response,
+byte for byte:** `200`, `Content-Type: text/plain` (with no `charset` parameter), and the 34-byte body
+`Hello, World Welcome to Sharebot!\n`. The previously universal response is *narrowed*, not replaced —
+it remains the answer for `/`, `/index.html`, `/students/S001` and any other arbitrary path, on any
+method.
+
+The namespace predicate is segment-safe, and the consequence is worth stating explicitly:
+
+| Path | Belongs to the feature? | Result |
+| --- | --- | --- |
+| `/activities` | Yes | routed by method |
+| `/activities/` | Yes — a single trailing slash is stripped | routed by method, same as `/activities` |
+| `/activities?x=1` | Yes — the query string is excluded before matching | routed by method |
+| `/activities/S001` | Yes | routed by method |
+| **`/activities-old`** | **No** — not a segment boundary | the unchanged 34-byte plaintext greeting |
+| **`/activitieslist`** | **No** | the unchanged 34-byte plaintext greeting |
+| `/activities/S001/extra` | Yes, but resolves to no route | `404 not_found` |
+
+The two emphasised rows are the ones a loose route predicate would silently capture, which is why the
+test suite asserts them individually against the recorded response.
+
+### Attribution — read this before exposing the service
+
+The service has **no authentication, no authorization, and no session mechanism**, and this feature
+adds none. There is no credential, no token, no cookie, no principal and no role anywhere in the
+codebase. **A submission is attributed to a student by the Student ID the submitter types into the
+form or puts in the request body, and by nothing else.** That Student ID is self-asserted and is
+checked only for *existence*: the service confirms that `S001` is a real student, never that the
+submitter is `S001`.
+
+The consequence, stated plainly: **any process on the local host can submit an activity on behalf of
+any student, and can read back any student's activities.** That is acceptable here for exactly two
+reasons, and both are load-bearing — the listener is confined to loopback, and every record in the
+data is synthetic. Identity verification would become a **prerequisite**, not an improvement, before
+this surface is exposed off-host or used with real student records.
+
+## The activity data model
+
+Activity records are kept in a JSON document — `activities.json` by default — organised as a flat
+array:
+
+```json
+{
+  "schemaVersion": 1,
+  "activities": [
+    { "studentId": "S001", "activity": "Robotics Club", "source": "workbook" },
+    { "studentId": "S001", "activity": "Chess Club", "source": "submission",
+      "submittedAt": "2026-09-16T06:14:22.481Z" }
+  ]
+}
+```
+
+| Field | Type | Required | Rule |
+| --- | --- | --- | --- |
+| `studentId` | string | yes | matches `/^S\d{3}$/` **and** must exist in the key set below |
+| `activity` | string | yes | 1 to 60 characters after normalization; no control characters, a tab having already been collapsed to a space by [Normalization](#normalization) |
+| `source` | string | yes | `"submission"` or `"workbook"`. Server-set; **never** accepted from the client |
+| `submittedAt` | string | only when `source` is `"submission"` | ISO-8601 UTC, generated by the server; never accepted from the client. **Absent** on a seeded record |
+| `schemaVersion` | number | yes (document level) | the literal `1`. A document declaring any other version is refused rather than guessed at |
+
+Every one of these rules is enforced when the store is **loaded**, not only when a submission
+arrives — the store is a plain file a person can edit, so a document that breaks any of them is
+refused with `500 store_unreadable` and is **left exactly as found**, never silently overwritten or
+deduplicated. The shape is **exact**: a document or a record carrying any key outside the fields
+above is refused the same way, naming the unexpected key and, for a record, its index, rather than
+being dropped on load and then erased by the next write.
+
+### The Student ID rule
+
+`student_details.xlsx`, sheet `Student Details`, column A rows 2–11 is the **authority** for the key
+set. It currently holds `S001` through `S010`. All three workbooks agree today, but naming one
+authority removes the ambiguity of which to trust if they ever diverge.
+
+- A Student ID is the literal `S` followed by exactly three decimal digits, zero-padded. The format
+  is taken from the data, where all thirty Student ID cells across the three workbooks have that form.
+- A **malformed** ID — `s1`, `S1`, `S0012`, `ABC`, or a non-string — is `400 student_id_malformed`.
+- A **well-formed ID naming no student** — `S999` — is `404 student_not_found`.
+
+That split is deliberate: a syntactically wrong identifier is a malformed *request*, while a
+well-formed identifier with no matching student is a reference to a parent that does not exist.
+Separating them tells a submitter which of the two mistakes they made.
+
+**Enforcement is code in the request path, and can only be code.** No workbook declares a key, none
+contains a data-validation part, and a JSON file offers no constraint mechanism either. The three-way
+agreement of the Student ID sets is an observed regularity, not a rule the data can uphold. Calling
+Student ID a "primary key" therefore describes an intention; the mechanism is the validation that runs
+on every request before anything is persisted.
+
+That mechanism is **layered: three enforcement points, none of which relies on another having run.**
+
+1. The **request-time check** in the HTTP layer runs before the store is called at all. It is the only
+   one of the three that can turn a bad reference into the `400`/`404` split above.
+2. The **write guard** in the store re-checks the Student ID's format *and* its membership of the key
+   set before a record is appended, so a bad call cannot write a record the load check would then
+   refuse for good.
+3. The **load check** re-checks both properties for every record already in the document, on every
+   read, refusing the whole document with `500 store_unreadable` rather than serving one that names an
+   unknown student.
+
+The store revalidates on its own account because it is reachable by more than one caller and is backed
+by a file a person can edit. Its two checks answer with a `500`, though, never with the `400`/`404`
+split — that is why the request-time check is not optional even though the store repeats it, and why a
+hand-edited store naming `S999` is refused instead of returned.
+
+### Provenance: why `source` exists
+
+A label sitting in a workbook was not necessarily submitted by a student, and certainly not at the
+moment the workbook was generated. Giving such a record a `submittedAt` would fabricate provenance and
+make imported data indistinguishable from a real submission. So a seeded record is marked
+`"source": "workbook"` and carries **no** `submittedAt`, while a record that arrived through
+`POST /activities` is marked `"source": "submission"` and carries a server-generated timestamp. A
+seeded record can still be matched, so a student who submits a label they already hold still receives
+the idempotent `200` — what changes is that the response distinguishes a pre-existing import from
+their own earlier submission.
+
+### Cardinality and the store's key
+
+**A student may hold many activities.** The workbook column is single-valued; the store is a flat
+array of records precisely so it can represent the plural that column cannot.
+
+The store's own key is the **composite `(studentId, normalized activity label)`**, compared
+**case-insensitively**. `studentId` alone is the **foreign key** into `student_details.xlsx` — the
+link to the student — and is *not* the store's own identifier, because a student holds several
+records. No surrogate identifier is introduced: the composite is stable, human-readable and derivable
+from the submission itself.
+
+### Normalization
+
+Applied before a record is stored, in this order:
+
+- the **invisible formatting characters** are removed: U+00AD SOFT HYPHEN, U+180E MONGOLIAN VOWEL
+  SEPARATOR, U+200B–U+200F (the zero-width space, the zero-width non-joiner and joiner, and the
+  left-to-right and right-to-left marks), U+2060–U+2064 (the word joiner and the invisible math
+  operators) and U+FEFF. None of them is a space separator and none is a control character, so
+  without this step `Tennis Club` and `Tennis Club<ZWSP>` would be two activities that render
+  identically, and a label of nothing but zero-width characters would be stored as a record with
+  no visible content. They are removed rather than rejected because a paste from a web page or a
+  spreadsheet cell carries them unseen, and a refusal naming a character the submitter cannot see
+  is not actionable. The **direction controls** are deliberately *not* in that class —
+  U+202A–U+202E, U+2066–U+2069 and U+061C reorder visible text rather than padding it, so a label
+  carrying one is **accepted** and kept as submitted, and the served HTML wraps every interpolated
+  value in a `<bdi>` element so an unterminated override cannot reverse the sentence around it.
+  Variation selectors are kept for a related reason: they change how the character before them
+  renders, so dropping one would change the glyph the submitter chose;
+- the label is put into **Unicode NFC**, so a precomposed `é` and an `e` followed by a combining
+  acute are **one activity** rather than two records nobody can tell apart. Removal runs first on
+  purpose: a zero-width character sitting between a base and its combining mark blocks the
+  composition, so composing first would leave the accent decomposed;
+- leading and trailing **horizontal whitespace** is trimmed. Horizontal whitespace means every
+  Unicode space separator — U+0020 SPACE, U+00A0 NO-BREAK SPACE, U+2003 EM SPACE, U+3000
+  IDEOGRAPHIC SPACE and the rest of `\p{Zs}` — **plus U+0009 TAB**;
+- every run of internal horizontal whitespace is collapsed to a single ASCII space, so
+  `Chess<TAB>Club`, `Chess  Club` and `Chess Club` are one activity rather than three. The tab is
+  included because it is horizontal whitespace and nothing else inside a single-line label, and
+  because it is what a spreadsheet copy-paste produces — which is where this project's data comes
+  from;
+- any string **still** carrying a control character after the steps above, or U+2028 LINE SEPARATOR
+  or U+2029 PARAGRAPH SEPARATOR, is rejected as `400 activity_invalid`. A newline, a carriage
+  return, a vertical tab, a form feed, NUL, DEL and the C1 block are refused rather than laundered
+  into a space, because laundering a line terminator would let two visually identical labels dedupe
+  differently. A tab never reaches this rule: the collapse above has already replaced it, so no
+  stored label contains one;
+- the 1-to-60-character bound is enforced **after** every step above, and is measured in
+  **UTF-16 code units** — exactly how the form's `maxlength="60"` is evaluated, so the JSON API and
+  the native form agree on the boundary for every label, astral characters included. Measuring
+  after canonicalisation is what accepts sixty decomposed accents, which are 120 code units on the
+  wire and sixty once composed;
+- the submitted casing is **preserved** in the stored value, so `Chess Club` is stored as typed;
+- comparison for the composite key is **canonical and case-insensitive**, so `chess club`,
+  `Cafe<combining acute> Club` against `Café Club`, and `Chess Club<ZWSP>` are each recognised as
+  the activity already recorded and answered `200` rather than appended.
+
+A stored label that is **not** in this canonical form is refused when the store is read, as
+`500 store_unreadable`: the service only ever writes canonical labels, so a decomposed or
+zero-width-padded value in `activities.json` means the file was hand-edited, and accepting it would
+put a label in the store whose composite key differs from the same text written normally.
+
+**No closed vocabulary is imposed.** Any activity name is accepted. The existing column is
+unconstrained free text, and an enumeration invented here would reject a legitimate new club while
+claiming a constraint the data never carried. Canonical, case-insensitive deduplication is the
+mitigation for near-duplicates instead. The 60-character bound is generous against the data: the
+longest existing label, `Photography Club`, is sixteen characters.
+
+### Idempotency
+
+Re-submitting an existing composite key **changes nothing**: the store is not written, and the
+response is `200` carrying the existing record with its **original** `submittedAt` — or with
+`source: "workbook"` and no timestamp if it was seeded. A new composite key appends one record and
+responds `201`. The distinction lives in the status code, which is what makes it observable from
+outside the process, and it makes a retry after a failed write safe.
+
+### Relationship to the workbooks
+
+**`activities.json` is the current record for submitted activities.** When the store is first
+materialised it is **seeded** from the `Extracurricular Activity` column of `student_other_info.xlsx`,
+so it begins as a superset of what that column records and never becomes a second, disagreeing source
+of truth. A read of a student with no submissions therefore still returns their seeded label, and a
+read never creates the store file.
+
+**No workbook is ever written.** All three remain byte-identical. A consumer reading only the
+workbook therefore sees the pre-feature value, which stays true rather than becoming wrong; the store
+is where activities added after this release are found.
+
+**What the running feature actually reads.** Column A of `student_details.xlsx` for the key set, and
+columns A and C of `student_other_info.xlsx` — the Student ID beside the label, since a seeded record
+needs both — read together in a single pass the first time seed data is needed. Each workbook is
+opened, inflated and parsed at most once per process, and `student_academics.xlsx` is not read by the
+service at all; only the test suite's join assertion touches it.
+
+**No value outside those columns is ever extracted.** The reader is asked for those columns by name
+and walks the worksheet by position, so no other cell's text becomes a value: a student's name, date
+of birth, email, phone, city and academic record are never read out of the worksheet, never held as
+data, and never exposed by any endpoint. To be precise about the one thing that is unavoidable — the
+worksheet part is decompressed and decoded as a whole, because refusing a malformed or mis-encoded
+workbook means reading it — so those bytes do pass through the process; what does not happen is any
+of them being extracted, stored, logged or served.
+
+## Configuration
+
+`ACTIVITY_STORE` is the feature's **only configuration** variable — the one value that changes what
+the service does. Exactly one other environment value is read anywhere in this project, and it is not
+configuration: on Windows, `%SystemRoot%` locates the platform's own `icacls` so the store's
+permissions can be narrowed (see the staging bullets below). It names where the operating system
+keeps its files, it cannot alter the service's behaviour, and pointing it somewhere that does not
+hold that tool makes a write **refuse** rather than fall back to something weaker. The host and port
+remain literals and are configurable by nothing at all.
+
+- It **overrides the store path**.
+- It **defaults to `activities.json` beside the source**, next to `activity-store.js`.
+- A value that is **present but empty counts as unset**, so the default applies and the store lands
+  *inside* the checkout with nothing said about it. Worth knowing, because `ACTIVITY_STORE=` in a
+  launcher script reads like "no store path configured" and behaves like it, and the result is only
+  harmless because that one default name is among the patterns the ignore policy covers. Only a
+  genuinely empty value is read as unset: a whitespace-only value is **not** trimmed and **not**
+  treated as absent, it is taken literally as a relative path, so a stray space configures a store
+  file named for that space in the working directory.
+- The path is **resolved once at module load**, so changing the variable mid-process has no effect.
+  A relative value is interpreted against the working directory; an absolute path is recommended.
+- Its **directory must already exist and be writable**, or a submission that has to **persist a new
+  record** returns `500 store_write_failed`. The directory is not created for you. The failure is
+  scoped to that case: a submission repeating an existing composite key performs no write and still
+  returns `200` with the existing record — including a repeat of a seeded label while the store
+  file is still absent — and `GET /activities/{id}` never writes at all.
+- A write stages the whole document to **`${resolvedStorePath}.tmp`** and then renames it over the
+  target, so a reader sees either the previous document or the new one and never a partial write.
+  The staging path is *derived* from the resolved path, so the temp sibling follows `ACTIVITY_STORE`
+  wherever it points and always sits in the same directory — hence on the same filesystem, which is
+  what makes the rename atomic. With the default store path the staging file is `activities.json.tmp`.
+- **The publishing rename is held apart from the reads, because on Windows it has to be.** The call
+  behind `fs.rename` refuses with `EPERM` while *any* descriptor is open on the destination, and
+  `GET /activities/{id}` holds exactly such a descriptor while it reads the store. Measured on this
+  platform before the service coordinated the two: with submissions arriving at concurrency five,
+  one continuous reader had **37%** of them refused `500 store_write_failed` and four readers had
+  **98.5%** refused — valid submissions from known students, lost to nothing but another client
+  reading at the same moment, while every read succeeded. So a read now waits for a rename that is
+  already in flight, and a rename waits for the reads that are, **for the duration of that one
+  syscall and nothing else**. A read is still never queued behind another submission's load,
+  validation, serialization or staging write: that separation is the point of the design and it is
+  unchanged. With the coordination in place the same measurements refuse **none** of 200
+  submissions at nought, one, four and sixteen concurrent readers.
+- **A descriptor held by another process is retried, not coordinated.** Nothing in this process can
+  see an operator running `cat`, a backup agent or a virus scanner holding the store open, so the
+  rename is attempted up to **three** times with a short backoff before the write is refused —
+  the same bounded idiom as the staging-file creation above, and enough for a descriptor that
+  closes. A foreign process that holds the store open *continuously* will still see submissions
+  refused `500 store_write_failed`, with the previous document intact and a retry safe to issue.
+  Coordinating across processes would need file locking, which this single-instance service does
+  not have.
+- **No failure path leaves a staging file at rest.** A write that never completed removes it, a
+  descriptor that could not be closed removes it, and a publish refused after every attempt removes
+  it. So the only `.tmp` that can exist beside the store belongs to a write in flight, or to a
+  process that died mid-write — and that one is still never read, only cleared and re-created by
+  the next write.
+- The staging file is **created exclusively and never truncated in place**. The open is
+  `O_CREAT | O_EXCL | O_WRONLY`, plus `O_NOFOLLOW` on the platforms that define it — it is
+  `undefined` on Windows, where exclusive creation already refuses to open anything that exists,
+  link or not — with mode `0600`. So a file, a symbolic link or a hard link already sitting at the
+  staging path is never opened and never truncated: the name is unlinked, which removes *that name*
+  and never the file a link points at, and the staging file is re-created, for at most three attempts
+  before the write is refused as `500 store_write_failed` with the previous document left intact. The
+  opened descriptor is then proved to be a regular file carrying exactly one name — and, where the
+  platform has the concept, owned by the account running the service — the bytes are written through
+  that same descriptor, and only then is it renamed over the store. Because a stale staging file is
+  removed and re-created rather than truncated, it can no longer donate its permissions to the
+  document that becomes the store.
+- **The staged file is restricted to its owner before a single byte of the document is written**, by
+  whichever mechanism the platform actually honours, and the rename carries that restriction onto the
+  store. So at the moment the file is at its widest it is also empty, and the store is never
+  published wider than the staging file was.
+  - Where the **mode** is the access control, the file is `chmod`ed to `0600` through the descriptor,
+    so the umask cannot loosen it.
+  - **On Windows the mode is not the access control and cannot be made into it.** The platform
+    derives only the read-only attribute from a mode, and a created file otherwise inherits the ACL
+    of the directory it was created in — so the service **replaces that inherited list** on the
+    staged file with a single entry granting full control to the file's owner, using the platform's
+    own `icacls` (located by absolute path under `%SystemRoot%\System32`, never by searching `PATH`).
+    Without this the store landed with `Authenticated Users: Modify` and `Users: Modify` in the
+    default configuration, which let every local account not just read submitted student data but
+    **rewrite** it — and a rewritten document is served straight back out of
+    `GET /activities/{id}`, or forces `500 store_unreadable` on every read. Note that `fs.stat`
+    still reports mode `0666` there for any regular file whatever its real permissions are: on that
+    platform the **ACL is the answer** and the mode is not, so `icacls <store>` — not a mode — is
+    what shows a store's permissions.
+  - **A restriction that cannot be applied refuses the write.** A missing or unrunnable tool, one
+    that times out, or one that exits non-zero — which is how a filesystem that cannot hold an ACL
+    at all would present — returns `500 store_write_failed` with the previous document intact and
+    nothing left staged, and the submission may safely be retried. The service does not publish a
+    document whose permissions it could not narrow.
+  - A store **left behind with wider permissions** — by an earlier build, or by an operator who
+    created the file by hand — is narrowed by the **next write that replaces it**, and its records
+    are carried across unchanged. Reads never change a file's permissions, so until that write the
+    file keeps whatever it was given; `icacls <store>` is how to check, and one submission is how to
+    fix it.
+- The **store directory is still the operator's to get right**, and the setup below restricts it
+  explicitly. The service now narrows the files it creates, but nothing it can do from inside makes
+  a shared parent directory private: who may *create*, *replace* or *delete* names beside the store —
+  including its staging sibling — is decided by that directory, not by the store's own permissions.
+- The store is **bounded, and no bound ever rewrites the file**. A store that is not a regular file,
+  that exceeds **2 MiB**, or that holds more than **5,000** activity records is refused with
+  `500 store_unreadable`, and in every one of those cases the file is left exactly as found — never
+  truncated, repaired or overwritten — so a hand edit that trips a ceiling is still there to correct.
+  A submission that would push the document past 5,000 records **or past 2 MiB once serialized** is
+  refused with `500 store_at_capacity` — its own code, not the generic `store_write_failed`, so a full
+  store is distinguishable from a broken disk — before anything is staged, and the previous document
+  stays intact and readable; an idempotent repeat of an activity already recorded appends nothing and
+  still returns `200`, and reads keep working throughout. The write-side byte check is not redundant with
+  the record count: the 60-character label bound counts UTF-16 code units while the ceiling counts
+  UTF-8 bytes, so a document inside the record ceiling can still serialize past 2 MiB, and without
+  the check one accepted submission could publish a store that every later request refused. **The
+  service therefore never publishes a document its own loader would refuse on size** — because it
+  measures the bytes it is about to write, not because the two numbers are assumed to agree. Both
+  ceilings sit orders of magnitude above the ten-student workload the feature is for: they bound a
+  runaway, and cannot refuse a legitimate document.
+- It **may not name a protected file of this project**. The configured value is canonicalized once
+  at load — a relative form is resolved first — and both it and the derived `.tmp` sibling are
+  compared against every tracked file: the three `.xlsx` workbooks, `LICENSE`, and the project's own
+  source, test and configuration files. What makes two names compare as one file depends on whether
+  the candidate already exists, and **the platform is not assumed either way**. A candidate that
+  exists is compared by **real-path identity** — the filesystem's own answer to which file this is,
+  which collapses an 8.3 short name, the on-disk casing, a symbolic link, a junction and a mapped
+  drive, with no case rule involved at all. Case folding applies **only** to the fallback for a
+  candidate that does not exist yet — the ordinary case for a store about to be created, where there
+  is nothing on disk to interrogate — and **only when a runtime probe reports that the filesystem
+  holding this project folds case**: the probe flips the case of the module's own file name and asks
+  whether that name still resolves beside it. A platform rule would be wrong in both directions here,
+  which is why it is measured rather than assumed: case-*sensitive* APFS and ReFS volumes exist, and a
+  case-insensitive volume can be mounted under Linux. So a case variant of a protected name is
+  refused where the filesystem itself treats the two names as one file, and a genuinely distinct name
+  is not refused for merely resembling one. A protected destination is refused at module load,
+  before any store read or write, with a `RangeError` carrying `code: 'E_STORE_PATH_PROTECTED'` that
+  names `ACTIVITY_STORE` and the protected file, so the service fails fast at startup instead of
+  renaming a store document over student data. **Started directly, the service reports that as two
+  stderr lines and nothing else** — `server error: E_STORE_PATH_PROTECTED`, then the sentence naming
+  the file it resolved to and telling you to point the variable outside the repository — with nothing
+  on stdout, exit status `1`, and **no stack trace**: the same one-line-plus-exit disposition a
+  refused bind gets. A program that loads the module itself receives that `RangeError` unchanged and
+  decides for itself what to report. The check exists because a write is a `rename`
+  **over** the target: a mistyped variable would not append to a workbook or to `LICENSE`, it would
+  replace it. `activities.json` and `activities.json.tmp` are of course still accepted — they are
+  the default.
+- The store is **deliberately untracked**. `.gitignore` covers `activities.json` and
+  `activities.json.tmp`, and the store must **never** be committed: committed bytes remain
+  recoverable from history indefinitely, so a real student record committed here could not be erased
+  without rewriting history.
+
+Create a **private** scratch directory **outside the checkout**, owned by the account that runs the
+service, and point the store at it. On POSIX, `mktemp -d` beneath a root the operator already owns is
+the form to copy: it returns a unique name nobody else can have pre-created, at mode `0700`.
+
+```bash
+RUN="$(mktemp -d "${XDG_RUNTIME_DIR:-$HOME}/student-simple-activities.XXXXXX")"
+chmod 700 "$RUN"          # mktemp -d already gives 0700; stated so a substituted directory keeps it
+ACTIVITY_STORE="$RUN/activities.json" npm start
+```
+
+On Windows PowerShell, use a unique directory under the user profile — not a shared one — created
+fresh, with inheritance broken and access granted to the current user alone:
+
+```powershell
+$Run = Join-Path $env:LOCALAPPDATA "student-simple-activities-$([guid]::NewGuid().ToString('n'))"
+New-Item -ItemType Directory -Path $Run | Out-Null
+icacls $Run /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
+$env:ACTIVITY_STORE = Join-Path $Run 'activities.json'
+npm start
+```
+
+The braces in `${env:USERNAME}` are load-bearing: written as `"$env:USERNAME:(OI)(CI)F"` the trailing
+colon is parsed as part of the variable path, the user name interpolates away, and `icacls` is handed
+a grant that never restricts anything.
+
+To see what a store actually carries, ask for its list rather than its mode — `icacls <store>`. After
+a submission it holds exactly one entry, granting full control to the file's owner and inheriting
+nothing, whatever the directory around it allows:
+
+```powershell
+icacls (Join-Path $Run 'activities.json')     # one entry: OWNER RIGHTS:(F)
+```
+
+**A shared, fixed temporary path is not an acceptable store directory** — not
+`/tmp/student-simple-activities`, not `/var/tmp/student-simple-activities`, not
+`C:\Temp\student-simple-activities`, and not any other predictable name beneath a world-writable root.
+Such a name is guessable, so another local principal can be there first: pre-create the directory and
+read every record written into it, or leave a symbolic link or a junction at that name and decide
+where the store and its staging sibling actually land. The service never writes *through* a link at
+the staging path — it removes that name and creates its own file, as above — but nothing it can do
+from inside makes a world-writable parent directory private.
+
+Using a path outside the working tree is the recommended form. A store configured *inside* the
+checkout under a name other than the two the ignore policy covers would be staged by default, which
+is how submitted data reaches a commit by accident.
+
+The **host and port remain hardcoded literals** — `127.0.0.1` and `3000` — and are **not**
+configurable by any environment variable, flag or config file. That is a recognised gap, deliberately
+left out of scope for this change: externalising them is a worthwhile improvement but is not what was
+asked for, and widening the bind would expose an unauthenticated write endpoint.
+
+**What that means in practice: only one instance can run at a time, and the second one to start does
+not.** When something already holds `127.0.0.1:3000`, `npm start` writes **nothing** to stdout — no
+readiness line, because that line lives inside the listen callback and the bind never succeeded —
+writes exactly one line to stderr, `server error: EADDRINUSE`, and exits `1`. There is no stack
+trace and no retry: the service did not start, and that single line is the whole diagnosis. The
+remedy is to find the holder and release it, then start again:
+
+```bash
+lsof -iTCP:3000 -sTCP:LISTEN            # POSIX; or: ss -ltnp 'sport = :3000'
+```
+
+```powershell
+Get-NetTCPConnection -LocalPort 3000 -State Listen | Select-Object OwningProcess
+```
+
+On a host shared with other checkouts or other work the port is therefore a **take-turns resource**:
+wait for it, rather than assuming a failure to start is a fault in the service. The same applies to
+`npm test`, whose `test/lifecycle.test.js` needs the literal port exclusively — see **Testing** below.
+
+A program that needs the service on some other port can `require('./server')` and call
+`listen` itself: the export exists for exactly that, and loading the module binds nothing. That is a
+composition seam for a caller, **not** a supported way to reconfigure the service — `npm start` always
+uses the literals above, and the readiness line is printed only by direct execution, since it sits
+inside the `require.main === module` guard.
+
+### Capacity limits, and what to do when the store fills up
+
+The store holds at most **5,000 activity records** and **2 MiB**, and those numbers are a bound on a
+runaway rather than a quota on a class of students. The workload this feature is for — ten students
+with a handful of activities each — is about **11 records and 2 KB**, three orders of magnitude inside
+either ceiling, so no ordinary use of the service can approach them.
+
+**Where the ceiling actually is, in time.** A saturating client submits **several hundred distinct
+activities per second into a small store and steadily fewer as the document grows** — measured on this
+class of machine at roughly 440 per second when the store is nearly empty and under 100 per second
+near the ceiling, because every submission reads, validates and rewrites the whole document. Averaged
+over the whole climb that fills the store in about **26 seconds**, so this is a limit a script reaches
+and a person never does. Once it is full, every genuinely new activity is refused with
+`500 store_at_capacity`; everything that does not grow the document keeps working exactly as before:
+
+| At the record ceiling | Result |
+| --- | --- |
+| `POST /activities` with a new activity | `500 store_at_capacity`, nothing staged, the document unchanged |
+| `POST /activities` repeating an activity already recorded | `200` with the existing record — a repeat appends nothing, so capacity cannot refuse it |
+| `GET /activities/{id}` | `200`, the full list, as always |
+| `GET /activities`, and every path outside the namespace | `200`, unaffected |
+
+**You are warned before you get there.** When the document first crosses **4,500 records** — ninety
+per cent of the ceiling — the service writes exactly one line to standard error and then stays quiet,
+so a filling store is not something you first learn about from a refusal:
+
+```
+activity-store: {"event":"store_capacity_warning","records":4500,"ceiling":5000}
+```
+
+The line is written once per crossing, not once per submission, and it re-arms if the count later
+falls back below the band, so a store that is pruned and fills again warns again.
+
+**Reclaiming room is an operator action, by design.** This service intentionally offers no way to
+edit, delete, bulk-import or export an activity, so there is no in-product eviction, rotation or
+archival, and none is planned. The remedy is to prune the store file:
+
+1. Read `activities.json` — it is plain UTF-8 JSON, indented, and safe to open with any text tool.
+2. Remove the records you no longer need from the `activities` array. Keep the document **valid**:
+   `schemaVersion` must stay `1`, every remaining record must keep its exact `studentId`, `activity`,
+   `source` and — for a `submission` only — `submittedAt` fields, labels must stay in normalized form
+   (trimmed, single spaces), and no two remaining records may share a Student ID and label compared
+   case-insensitively. A document that breaks any of those is refused on load with
+   `500 store_unreadable`, naming what is wrong, and is **never** rewritten for you.
+3. Save it. **No restart is needed** — the store is read from disk on every request, so the next one
+   sees the pruned document immediately.
+
+Removing the file entirely is also valid: the next read answers from the workbook seed, and the next
+submission materialises a fresh document from it. That discards every submitted activity, which is
+exactly what it sounds like, so copy the file somewhere first if the records matter.
+
+### What the service costs as the store grows
+
+The store is deliberately **never cached**: every request reads it from disk, parses it and validates
+every record in it, which is what makes a hand edit visible immediately and a lost update impossible.
+The cost of that is real and grows with the document, so it is stated here rather than left to be
+discovered. Measured on this project's runtime:
+
+| Store | Read latency, one client | Read throughput | Longest single stretch of CPU per request |
+| --- | --- | --- | --- |
+| 11 records / 2 KB — the real workload | ~0.4 ms | thousands per second | ~0.6 ms |
+| 4,900 records / 828 KB — near the ceiling | ~11 ms | ~90 per second | ~2.6 ms |
+
+Two consequences worth planning around. **Read throughput falls roughly linearly with the size of the
+document**, because the whole of it is read and validated per request; at the ceiling the service
+answers reads in the region of a hundred per second rather than thousands, and adding concurrent
+clients past that point adds latency rather than throughput, as it must for a single-threaded process.
+And **no single request monopolises the process**: record validation hands the event loop back
+whenever it has run for a quarter of a millisecond, and a submission hands it back before serializing,
+so a request that touches no store at all — `GET /`, or the form — stays responsive while large
+documents are being read and written. That bound is the reason the numbers above are the whole story:
+a big store makes its own route slower and leaves the rest of the service alone.
+
+If you need read throughput at the ceiling that this shape cannot give, the answer is a different
+storage design — an index, pagination or a cached document — and each of those is a deliberate
+exclusion of this project rather than a tuning knob it left unturned.
+
+## Testing
+
+```bash
+npm test                        # node --test --test-concurrency=1
+```
+
+The runner is the **built-in `node:test` with `node:assert`**, so the suite adds **no dependency** —
+which is what keeps the zero-dependency posture true and keeps an installed `node_modules/` out of the
+repository.
+
+**Why concurrency is pinned to `1`.** `port = 3000` is a single unshareable literal in `server.js`
+with no override, and the test runner executes each test file in a separate process. Two files both
+binding that port collide with `EADDRINUSE` and a non-zero exit. Only `test/lifecycle.test.js`
+actually needs the literal port; `test/activities.test.js` binds port `0` and takes whatever ephemeral
+port it is given. The suite is small enough that serialising the whole run is the simpler correct
+setting.
+
+**Port 3000 must be free** before the suite runs. `test/lifecycle.test.js` performs a `node:net`
+pre-flight probe that binds `127.0.0.1:3000` and immediately closes it; if the port is held the run
+fails fast and names the port and the error code, instead of surfacing an environment problem as a
+confusing assertion failure deep inside the suite. The probe runs in that file's `before` hook, so a
+held port fails that one group and cancels the cases behind it while the two port-free files still
+run and report normally, and `npm test` exits non-zero overall. Nothing in the code needs changing in
+that case: release whatever holds the port and run the suite again.
+
+The three test files and their division of labour:
+
+| File | Port | Asserts |
+| --- | --- | --- |
+| `test/store.test.js` | **none** — reads and writes a temporary store via `ACTIVITY_STORE`, so it is safely parallel | store behaviour: seeding and all three initial states, normalization, composite-key dedupe, the load-validation refusals, the workbook reader's supported format subset, the write mechanics (atomic replacement, a configured store path and its derived temp sibling, a stale temp file, concurrent submissions, recovery after a transient write fault), and the four workbook invariants |
+| `test/activities.test.js` | **ephemeral** — creates its own server on port `0` and closes it afterwards, so it contends for nothing | every feature-originated row of the response matrix, one named case each and in both request modes where HTML applies: the form's content type, `201` with `Location`, the idempotent `200` with its original `submittedAt`, a seeded record's `source`, read-back, the route-correct `Allow`, the `413` boundary at 8,192 and 8,193 bytes, the validation precedence order, and a `<script>` label served escaped |
+| `test/lifecycle.test.js` | **the literal `3000`** — spawns `node server.js`, so it must run serially | process behaviour: the readiness line emitted exactly once with its exact text, `GET /` byte for byte against the recorded sha256, each namespace-boundary lookalike individually, and each of the service's three failure dispositions as the exact bytes it writes — the `EADDRINUSE` refusal of a second instance, the startup refusal of a protected `ACTIVITY_STORE`, and a refused store write the process survives |
+
+**The tests must run on the same host as the service.** The loopback bind refuses off-host requests,
+so a split runner-and-service topology is impossible and a container-published port would not reach
+the listener either.
+
+Machine-readable evidence is a separate, self-contained command. `EVIDENCE_ROOT` must be set by the
+caller to a writable directory **outside the checkout**, and is deliberately **not** defaulted,
+because the correct location differs per environment and a wrong default is how artifacts end up in
+the working tree.
+
+The command **verifies that rather than trusting it**, and it fails closed. It compares **filesystem
+identity** — device and inode, not path strings — and refuses to run if the evidence root is the
+worktree, sits anywhere beneath it, or is a shared directory such as `/tmp` itself. Identity is the
+load-bearing detail, because one directory can be named in more than one way: where the filesystem
+compares paths case-insensitively, `/TMP/...` and `/tmp/...` reach the same directory while the shell
+hands back whichever spelling the caller typed, and a symlink reaches it under a third name again. A
+string comparison lets every one of those through. Every refusal happens *before* any directory is
+created, because creating one inside the checkout is itself the contamination.
+
+That refusal is the containment mechanism: the ignore policy covers `coverage/` and `*.log`, but it
+deliberately carries **no pattern for a JUnit report**, so a run pointed at the checkout would
+otherwise leave a stageable `results.xml` behind. Run directories are retained for inspection, so
+prune `EVIDENCE_ROOT` on whatever schedule suits.
+
+```bash
+set -euo pipefail
+: "${EVIDENCE_ROOT:?set EVIDENCE_ROOT to a writable directory outside the checkout}"
+
+# Identity key for an existing directory: device:inode where the filesystem reports
+# it, otherwise the case-folded physical path. Comparing path strings is not enough.
+# A case-insensitive filesystem resolves /TMP/... and /tmp/... to one directory, and
+# the shell returns whichever spelling the caller typed, so the same directory can
+# arrive as two different strings and a string compare would wave the second through.
+fold() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+dirkey() {
+  local phys key
+  phys="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  key="$(stat -Lc '%d:%i' "$phys" 2>/dev/null || true)"
+  case "$key" in
+    ''|*:0) key="fold:$(fold "$phys")" ;;
+  esac
+  printf '%s\n' "$key"
+}
+
+worktree="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
+worktree_key="$(dirkey "$worktree")"
+if [ -z "$worktree_key" ]; then
+  echo "cannot identify the worktree; refusing to guess" >&2; exit 1
+fi
+
+# EVIDENCE_ROOT need not exist yet, so split it into its nearest existing ancestor
+# and the remainder. ${base%/} keeps a root-level remainder from becoming "//var/tmp".
+base="$EVIDENCE_ROOT"; rest=""
+while [ ! -d "$base" ]; do
+  rest="/$(basename "$base")$rest"
+  parent="$(dirname "$base")"
+  if [ "$parent" = "$base" ]; then
+    echo "EVIDENCE_ROOT has no existing ancestor: $EVIDENCE_ROOT" >&2; exit 1
+  fi
+  base="$parent"
+done
+base="$(cd "$base" && pwd -P)"
+base_key="$(dirkey "$base")"
+evidence="${base%/}$rest"
+if [ -z "$evidence" ]; then evidence="/"; fi
+
+# Refuse the worktree itself and anything beneath it. Two tests, because neither
+# alone is enough: the identity key settles "is this the very same directory",
+# including through a symlink, and the case-folded prefix settles "is this beneath
+# it" for the alias spellings `pwd -P` hands back verbatim. On a case-sensitive
+# host the fold can only ever over-refuse, which is the safe direction here.
+inside=no
+if [ "$base_key" = "$worktree_key" ]; then inside=yes; fi
+case "$(fold "$base")/" in "$(fold "$worktree")"/*) inside=yes ;; esac
+if [ "$inside" = yes ]; then
+  echo "refusing: EVIDENCE_ROOT resolves inside the worktree ($worktree)" >&2; exit 1
+fi
+
+# Refuse a shared directory itself; each run needs a private directory of its own.
+# The folded-string test catches one that does not exist yet (so it has no inode);
+# the key test catches an alias of one that does, such as /TMP for /tmp.
+evidence_fold="$(printf '%s' "$evidence" | tr '[:upper:]' '[:lower:]')"
+for shared in / /tmp /var/tmp /dev/shm "${HOME:-}"; do
+  [ -n "$shared" ] || continue
+  shared_fold="$(printf '%s' "$shared" | tr '[:upper:]' '[:lower:]')"
+  if [ "$evidence_fold" = "$shared_fold" ]; then
+    echo "refusing: EVIDENCE_ROOT is the shared directory $shared" >&2; exit 1
+  fi
+  if [ -z "$rest" ] && [ -d "$shared" ] && [ "$(dirkey "$shared")" = "$base_key" ]; then
+    echo "refusing: EVIDENCE_ROOT is the shared directory $shared" >&2; exit 1
+  fi
+done
+
+mkdir -p "$evidence"
+RUN="$(mktemp -d "$evidence/testrun-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+node --test --test-concurrency=1 --experimental-test-coverage \
+     --test-reporter=spec  --test-reporter-destination=stdout \
+     --test-reporter=junit --test-reporter-destination="$RUN/results.xml"
+echo "evidence retained in $RUN"
+```
+
+The timestamped `mktemp -d` template guarantees a fresh directory even for two runs in the same
+second, so one run never overwrites another's results. A coverage gate must assert that `server.js`
+appears as a **row** in the per-file table, not merely that a percentage cleared. The reason is that
+an **include pattern matching no file the suite loads in-process** prints an empty file table and an
+"all files 100.00" summary and still **exits zero** — even with a line threshold demanded, since a
+threshold on nothing is met. A gate reading only the percentage would therefore pass a run that
+measured none of the file. The pattern can miss for a plain reason or a subtle one: it can name a
+file nothing loads, or it can be quoted such that the shell passes the quote characters through as
+part of the pattern, which is the same failure wearing a different hat.
+
+The delivered suite does not itself fall into this. Both `test/activities.test.js` and
+`test/lifecycle.test.js` `require('../server')`, so `server.js` is always loaded in the runner's own
+process and always produces a real row — the gate is satisfiable, not aspirational. That row
+*understates* the testing: `test/lifecycle.test.js` exercises the direct-execution paths in a
+spawned `node server.js` child, and the parent runner does not collect a child's execution. Coverage
+figures here are meaningful for the in-process seam and should be read as a floor.

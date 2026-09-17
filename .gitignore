@@ -1,0 +1,23 @@
+# Untracked by design: runtime output of the service and its tests, installed
+# dependencies, and local environment files.
+
+# Runtime activity store and its atomic-write staging sibling: submitted data
+# linked to Student IDs, written by the service, never committed, never
+# pre-created. Exact names, never an `activities*` glob: such a glob could not
+# un-track the committed activities.js and activity-store.js - ignore rules do
+# not apply to a path already in the index - but it would keep any new untracked
+# `activities*` path out of `git status` and out of a pathspec `git add .`,
+# which skips ignored files without saying so. Default in-tree names only;
+# ACTIVITY_STORE can move both outside the checkout.
+activities.json
+activities.json.tmp
+
+# Dependency-install output.
+node_modules/
+
+# Test-coverage output and captured log files.
+coverage/
+*.log
+
+# Local environment files.
+.env*
