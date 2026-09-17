@@ -1,61 +1,51 @@
 'use strict';
 
 /**
- * test/server.test.js - eight tests against the entrypoint that actually ships.
+ * test/server.test.js - eight tests against the entrypoint as it ships.
  *
- * WHY THIS FILE EXISTS
- * ---------------------------------------------------------------------------
  * This is the ONLY file in the suite that spawns `node server.js` or binds the
- * default port `127.0.0.1:3000`. Everything else is exercised in-process on an
+ * default port `127.0.0.1:3000`; everything else runs in-process on an
  * ephemeral port with injected dependencies, which is fast and hermetic but
- * proves nothing about the artifact an operator runs. Two things are only
- * observable here:
+ * proves nothing about the artifact an operator runs. Four things are only
+ * observable here: the startup banner, the greeting's exact bytes, the whole
+ * module graph answering one request with nothing injected or stubbed, and the
+ * two bind-conflict contracts - the `require.main === module` wrapper writes
+ * one stderr line and sets a non-zero exit code, while `start()` rejects and
+ * leaves its caller alive. Those two get a test each, because a single test
+ * covering both would leave the other free to regress.
  *
- *   1. **The scanned baseline survived.** Before this feature, `server.js`
- *      answered every request with `200`, `Content-Type: text/plain` and the
- *      34-byte body `Hello, World Welcome to Sharebot!\n`, and logged
- *      `Server running at http://127.0.0.1:3000/`. Tests 34 and 35 pin the
- *      banner and those bytes under the real process. The greeting's
- *      "Sharebot" wording disagrees with the project name and is preserved
- *      DELIBERATELY - assert it verbatim, never "fix" it.
- *   2. **The whole stack is wired together.** Test 36 is the only assertion
- *      that runs the entrypoint, the dispatcher, `lib/activityRoutes.js`,
- *      `lib/activityRepository.js`, `lib/studentDirectory.js`,
- *      `lib/workbook.js` and the committed workbooks in one process with
- *      nothing injected.
+ * The greeting's "Sharebot" wording disagrees with the project name and is
+ * preserved DELIBERATELY - assert it verbatim, never "fix" it.
  *
- * Tests 38 and 39 are deliberately two tests, because the CLI wrapper and the
- * library entry point have different contracts: the `require.main === module`
- * wrapper writes one stderr line and sets a non-zero exit code, while `start()`
- * rejects and leaves its caller alive. Asserting only one would leave the other
- * free to regress.
+ * The loopback bind is a real boundary, not a nominal one. A DNS rebinding
+ * attack reaches a loopback service through a browser, so the request arrives
+ * locally and only the `Host` authority it must carry distinguishes it; the
+ * cases below exercise that gate under the real entrypoint - a rebound
+ * authority refused on the greeting, on both read routes and on the append
+ * route, a supported loopback authority still served, and the configuration
+ * that governs a wider bind.
  *
- * WHAT IT DELIBERATELY DOES NOT DO
+ * WHAT CONSTRAINS EVERYTHING BELOW
  * ---------------------------------------------------------------------------
  *   - **It writes nothing inside the checkout.** No `POST` is issued anywhere
  *     in this file, so the committed `activities.json` and the workbooks are
  *     read-only throughout and `git status --porcelain` is identical before and
- *     after a run. The one directory it creates (test 41) is an
- *     `fs.mkdtempSync` directory under the system temp root, holding the two
- *     registry files that make relative-path resolution observable, and it is
- *     removed in the same test's `finally`.
+ *     after a run. The one directory it creates is an `fs.mkdtempSync`
+ *     directory under the system temp root, holding the two registry files that
+ *     make relative-path resolution observable, and it is removed in the same
+ *     test's `finally`.
  *   - **It declares EXACTLY EIGHT top-level tests**, with no subtest, no
- *     `describe` and no `it`. Root `verify-tests.js` gates on
- *     `test:summary.counts.passed >= MIN_TESTS` with `MIN_TESTS` 45 = 33 + 8 +
- *     4, and `README.md` documents `MIN_TESTS=46 npm test` exiting 1 as the
- *     proof that the guard is live. Subtests and `it`s count toward `passed`,
- *     so one extra here would inflate the total and void that proof. Tests 40
- *     and 41 therefore carry their several cases in tables inside one body,
- *     naming the case in every assertion message.
+ *     `describe` and no `it`. Root `verify-tests.js` gates the run on the
+ *     number of tests that passed, and subtests and `it`s count toward that
+ *     total, so one extra here would inflate a number recorded outside this
+ *     file. A test covering several cases therefore carries them in a table
+ *     inside one body, naming the case in every assertion message.
  *   - **It keeps no assertion in a hook.** Assertions made inside
- *     `before`/`after` do not count toward `counts.passed`. The single `after`
+ *     `before`/`after` do not count toward the passed total. The single `after`
  *     here is a cleanup safety net and asserts nothing; the one error it can
  *     raise is a cleanup failure - a child it could not reap - which lands in
- *     `counts.failed` rather than in `counts.passed`, so the eight-test total
- *     stands either way.
- *   - **It never modifies `server.js`.** Where the module as built differs from
- *     what the plan predicted, the test adapts and says so in a comment - see
- *     test 39 on the internal `'listening'` listener.
+ *     the run's failure count rather than in its passed count, so the
+ *     eight-test total stands either way.
  *
  * PORT EXCLUSIVITY
  * ---------------------------------------------------------------------------
@@ -71,9 +61,6 @@
  * `liveChildren` only once its `'close'` has actually arrived, so a process
  * that outlives its own `SIGKILL` stays reachable by the safety-net `after`
  * hook, which retries it and then fails the run with the port named.
- *
- * Every value asserted here was verified against this checkout on Node
- * v24.21.0 before being written down.
  */
 
 const { test, after } = require('node:test');
@@ -85,48 +72,31 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
-// The library entry points under test. Requiring the entrypoint is safe and
-// binds nothing: `listen` sits behind `require.main === module`, which is the
-// lifecycle reversal that makes this file's in-process assertions possible.
+// The library entry points under test. Requiring the entrypoint binds nothing:
+// `listen` sits behind `require.main === module`, so these can be driven
+// in-process.
 const { resolveConfig, createServer, start } = require('../server');
 
 /* ---------------------------------------------------------------------------
- * The baseline contract, written as literals.
+ * The preserved contract, written as literals.
  *
  * These are pinned values, not derived ones. Deriving the byte length from the
  * greeting, or the banner from the host and port, would make the assertion
  * agree with whatever the code does - which is the opposite of what a
- * backward-compatibility test is for.
+ * backward-compatibility test is for. `127.0.0.1:3000` is also this file's
+ * exclusive resource, and `REPO_ROOT` is where the entrypoint, the workbooks
+ * and the committed registry sit.
  * ------------------------------------------------------------------------- */
 
-/** The entrypoint this file spawns and requires. */
 const ENTRY = path.join(__dirname, '..', 'server.js');
-
-/** The checkout root - where `server.js`, the workbooks and the registry sit. */
 const REPO_ROOT = path.dirname(ENTRY);
-
-/** The loopback default from baseline line 3. */
 const HOST = '127.0.0.1';
-
-/** The default port from baseline line 4, and this file's exclusive resource. */
 const DEFAULT_PORT = 3000;
-
-/** Baseline line 9, byte for byte. The trailing newline is part of it. */
 const GREETING = 'Hello, World Welcome to Sharebot!\n';
-
-/** The greeting's length in bytes, pinned as a literal rather than computed. */
 const GREETING_BYTE_LENGTH = 34;
-
-/** The greeting as bytes, for the byte-identical comparison in test 35. */
 const GREETING_BYTES = Buffer.from(GREETING, 'utf8');
-
-/** Baseline lines 12-14: the startup banner, and this file's readiness signal. */
 const BANNER = 'Server running at http://127.0.0.1:3000/';
-
-/** The greeting's media type, from baseline line 8. */
 const TEXT_MEDIA_TYPE = 'text/plain';
-
-/** The media type of every JSON route. */
 const JSON_MEDIA_TYPE = 'application/json';
 
 /**
@@ -142,29 +112,62 @@ const S001_PAYLOAD = {
   activities: [{ activity: 'Robotics Club', source: 'workbook' }]
 };
 
+/** The roster route, the second read surface an unchecked authority exposed. */
+const ACTIVITIES_PATH = '/api/activities';
+
+/** The committed registry, asserted byte-unchanged after every rebound `POST`. */
+const REGISTRY_PATH = path.join(REPO_ROOT, 'activities.json');
+
+/* ---------------------------------------------------------------------------
+ * The authority contract, written as literals for the same reason the greeting
+ * is: an assertion derived from the implementation agrees with whatever the
+ * implementation does.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The authority a rebound browser origin presents: the attacker's own name,
+ * which is the one field the attack cannot change. Reaching this service with
+ * it is the whole of the DNS-rebinding exposure, so every route is probed with
+ * it.
+ */
+const REBOUND_AUTHORITY = `attacker.example:${DEFAULT_PORT}`;
+
+/** A loopback authority the service answers for, spelled the other legitimate way. */
+const LOCALHOST_AUTHORITY = `localhost:${DEFAULT_PORT}`;
+
+/** `421 Misdirected Request` - a parseable authority this server does not serve. */
+const STATUS_MISDIRECTED_REQUEST = 421;
+
+/** `400` - a `Host` header that is present but unusable. */
+const STATUS_BAD_REQUEST = 400;
+
+/** The two authority refusals, body included, since both sentences are fixed. */
+const MISDIRECTED_BODY = '{"error":{"code":"MISDIRECTED_REQUEST",'
+  + '"message":"Request authority is not served by this server"}}';
+const INVALID_HOST_BODY = '{"error":{"code":"INVALID_HOST",'
+  + '"message":"Host header must be a single valid authority"}}';
+
 /* ---------------------------------------------------------------------------
  * Deadlines. Every wait in this file is bounded, so a failure is a readable
  * assertion rather than a suite that hangs until the runner is killed.
  * ------------------------------------------------------------------------- */
 
-/** How long the entrypoint has to print its banner. */
 const READY_TIMEOUT_MS = 5000;
-
-/** How long a child has to exit, and to finish draining its streams. */
 const CHILD_EXIT_TIMEOUT_MS = 5000;
-
-/** How long a request has to produce a complete response. */
 const REQUEST_TIMEOUT_MS = 5000;
-
-/** How long a connection probe waits before reporting it never settled. */
 const PROBE_TIMEOUT_MS = 2000;
 
 /**
  * The environment variables the feature reads. They are stripped from every
  * child's environment and then re-applied per test, so no value can leak in
  * from the shell that launched the suite or out of one test into the next.
+ *
+ * `ALLOWED_HOSTS` belongs here for a sharper reason than tidiness: an ambient
+ * value would widen the authority policy of every child, so a rebound-authority
+ * assertion could pass or fail on the shell's environment rather than on the
+ * code.
  */
-const FEATURE_ENV_KEYS = ['PORT', 'HOST', 'ACTIVITIES_DATA_PATH', 'WORKBOOK_DIR'];
+const FEATURE_ENV_KEYS = ['PORT', 'HOST', 'ACTIVITIES_DATA_PATH', 'WORKBOOK_DIR', 'ALLOWED_HOSTS'];
 
 /**
  * Pinned options for every in-process `createServer`/`start` call.
@@ -182,39 +185,34 @@ const LIBRARY_OPTIONS = Object.freeze({
 });
 
 /**
- * `fs.mkdtempSync` prefix for test 41's foreign working directory.
- *
- * Deliberately NOT the `student-activities-` prefix `test/activities.test.js`
- * uses and `test/workbooks.test.js` scans for: this file's temp directory is
- * its own to create and remove, and sharing the prefix would couple two files
- * that have no other relationship.
+ * `fs.mkdtempSync` prefix for the foreign working directory the path-resolution
+ * test launches from. Deliberately NOT the `student-activities-` prefix the
+ * other test files create and scan for: this directory is this file's own to
+ * create and remove, and sharing a prefix would couple two files that have no
+ * other relationship.
  */
 const FOREIGN_CWD_PREFIX = 'server-entrypoint-cwd-';
 
 /**
- * Test 41's two registry files, and why there are two.
+ * The two registry files the path-resolution proof needs.
  *
- * A missing registry is deliberately NON-FATAL - `lib/activityRepository.js`
- * warns on stderr and serves the workbook-sourced activities alone (AAP 0.6.6).
- * That is exactly what makes a mis-resolved `ACTIVITIES_DATA_PATH` invisible:
- * a relative value resolved against the child's working directory finds
- * nothing, and the response is byte-identical to a correctly resolved one. So
- * the resolution is made externally distinguishable in both directions.
+ * A missing registry is deliberately NON-FATAL: `lib/activityRepository.js`
+ * warns on stderr and serves the workbook-sourced activities alone. That is
+ * what would otherwise make a mis-resolved `ACTIVITIES_DATA_PATH` invisible - a
+ * relative value resolved against the child's working directory finds nothing,
+ * and the response is byte-identical to a correctly resolved one. Two files
+ * make the resolution externally distinguishable in both directions, and both
+ * live under `fs.mkdtempSync` so nothing is written inside the checkout:
  *
  *   - **The decoy** is named `activities.json` and planted IN the foreign
  *     working directory. `ACTIVITIES_DATA_PATH=activities.json` resolved
  *     against that directory would load it and answer with two activities, so
  *     the committed single-activity payload proves the value did NOT resolve
- *     against `process.cwd()`. It holds a real record for a real student on
- *     purpose: an invalid one would fail the load, and a load failure is a
- *     weaker signal than a wrong payload.
- *   - **The proof registry** sits OUTSIDE the checkout and is addressed by a
- *     relative path computed from the entrypoint's directory. Its record can
- *     only reach a response if that relative value resolved against the
- *     entrypoint's directory, so its presence is the positive half of the
- *     proof.
- *
- * Both live under `fs.mkdtempSync`, so nothing is written inside the checkout.
+ *     against `process.cwd()`. Its record is valid on purpose: an invalid one
+ *     would fail the load, which is a weaker signal than a wrong payload.
+ *   - **The proof registry** sits OUTSIDE the checkout, addressed by a relative
+ *     path computed from the entrypoint's directory, so its record can reach a
+ *     response only if that value resolved against the entrypoint's directory.
  */
 const DECOY_REGISTRY_FILENAME = 'activities.json';
 const DECOY_ACTIVITY = 'Foreign Cwd Decoy Club';
@@ -223,8 +221,7 @@ const PROOF_ACTIVITY = 'Registry Path Proof Club';
 
 /**
  * `S001`'s answer when the proof registry is the resolved registry: the
- * workbook record first, then the registry record, per the ordering rule in
- * AAP 0.5.3.
+ * workbook record first, then the registry record.
  */
 const S001_WITH_PROOF_PAYLOAD = {
   studentId: 'S001',
@@ -248,23 +245,14 @@ const MISSING_REGISTRY_WARNING = 'Activity registry not found at';
  * The inline harness.
  *
  * All of it lives here rather than in a helper module because every `.js` file
- * inside a directory named `test/` is executed as a test by default discovery -
- * verified: a plain `test/helper.js` ran and was counted as a passing test,
+ * inside a directory named `test/` is executed as a test by default discovery,
  * which would inflate the count `verify-tests.js` gates on. Nothing in this
  * section asserts anything; assertions belong to the eight test bodies.
  * ------------------------------------------------------------------------- */
 
-/** Children still running, so the safety-net `after` can reap a leak. */
 const liveChildren = new Set();
-
-/** Port holders still listening, so the same hook can release a leak. */
 const liveHolders = new Set();
 
-/**
- * A copy of this process's environment with every feature variable removed.
- *
- * @returns {Record<string, string>} The sanitized environment.
- */
 const baseEnv = () => {
   const env = { ...process.env };
   for (const key of FEATURE_ENV_KEYS) {
@@ -504,24 +492,23 @@ const signalAndAwaitClose = async (handle, signal) => {
  * `SIGTERM` first, then `SIGKILL` if the child overruns. On Windows libuv maps
  * both onto `TerminateProcess`, so the child dies at once and reports
  * `code === null` with `signal === 'SIGTERM'`; nothing here asserts on that,
- * only that `'close'` arrived. Awaiting `'close'` is what makes test 37's
- * refusal assertion deterministic instead of a race with the kernel releasing
+ * only that `'close'` arrived. Awaiting `'close'` is what makes a port probe
+ * after a shutdown deterministic instead of a race with the kernel releasing
  * the listening socket.
  *
  * THE BOOKKEEPING ORDER IS THE CONTRACT. The handle leaves `liveChildren` only
  * once `handle.closed` is true, never on the mere intention to stop it: a
  * handle dropped before closure is confirmed is a process this file can no
  * longer reach and a `127.0.0.1:3000` the safety-net `after` hook can no longer
- * release, which would cancel the next file's tests with a message naming
- * neither the port nor the conflict.
+ * release.
  *
- * It therefore reports its terminal failure rather than throwing it. Every
- * caller awaits `stop` from a `finally`, and an exception raised there would
- * replace the assertion error that sent the test into cleanup - the failure
- * would be reported as "could not kill a child" instead of as the behavioural
- * defect that actually broke. The unreachable child stays tracked with its
- * diagnosis on `handle.stopFailure`, and the `after` hook escalates it once
- * every other child and holder has been dealt with.
+ * A terminal failure is therefore reported on the handle rather than thrown.
+ * Every caller awaits `stop` from a `finally`, where an exception would replace
+ * the assertion error that sent the test into cleanup - the failure would read
+ * as "could not kill a child" instead of as the behavioural defect that
+ * actually broke. The unreachable child stays tracked with its diagnosis on
+ * `handle.stopFailure`, and the `after` hook escalates it once every other
+ * child and holder has been dealt with.
  *
  * @param {ReturnType<typeof spawnEntry>} handle The child's handle.
  * @param {{signals?: NodeJS.Signals[]}} [options] `signals` is the escalation
@@ -542,8 +529,7 @@ const stop = async (handle, { signals = ['SIGTERM', 'SIGKILL'] } = {}) => {
   if (handle.closed) return untrack();
 
   // A spawn that never produced a process has nothing to kill and nothing to
-  // leak, so it is not held against the ladder below. `'close'` does follow
-  // `'error'` on this runtime, which is why this is a guard and not the path.
+  // leak, so it is untracked without being held against the ladder below.
   if (handle.spawnError !== null && handle.child.pid === undefined) return untrack();
 
   for (const signal of signals) {
@@ -563,10 +549,24 @@ const stop = async (handle, { signals = ['SIGTERM', 'SIGKILL'] } = {}) => {
 /**
  * Issues one request and reads the whole response.
  *
- * The body is kept as a `Buffer` because test 35 compares bytes, not a decoded
- * string: a byte-for-byte guarantee cannot be asserted through a transcoding.
+ * The body is kept as a `Buffer` because the greeting is compared as bytes, not
+ * as a decoded string: a byte-for-byte guarantee cannot survive a transcoding.
  *
- * @param {{method?: string, path: string, port?: number}} options The request.
+ * `headers` exists for the authority assertions and is the mechanism that makes
+ * them possible at all: an explicit `Host` REPLACES the one the client would
+ * derive from the connection, which is precisely what a rebound browser origin
+ * does - it connects to `127.0.0.1` while naming the attacker's authority.
+ * Verified on the pinned runtime: supplying `Host` suppresses the automatic
+ * header rather than adding a second one, so `req.rawHeaders` still carries
+ * exactly one. An empty or duplicated value cannot be sent this way - the
+ * client substitutes its own - which is what `rawRequest` below is for.
+ *
+ * @param {{
+ *   method?: string,
+ *   path: string,
+ *   port?: number,
+ *   headers?: Record<string, string>
+ * }} options The request.
  * @returns {Promise<{
  *   status: number,
  *   headers: Record<string, string|string[]|undefined>,
@@ -574,22 +574,25 @@ const stop = async (handle, { signals = ['SIGTERM', 'SIGKILL'] } = {}) => {
  *   text: string
  * }>} The response.
  */
-const httpRequest = ({ method = 'GET', path: requestPath, port = DEFAULT_PORT }) =>
+const httpRequest = ({ method = 'GET', path: requestPath, port = DEFAULT_PORT, headers }) =>
   new Promise((resolve, reject) => {
-    const request = http.request({ host: HOST, port, path: requestPath, method }, (response) => {
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('error', reject);
-      response.on('end', () => {
-        const body = Buffer.concat(chunks);
-        resolve({
-          status: response.statusCode,
-          headers: response.headers,
-          body,
-          text: body.toString('utf8')
+    const request = http.request(
+      { host: HOST, port, path: requestPath, method, headers, agent: false },
+      (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('error', reject);
+        response.on('end', () => {
+          const body = Buffer.concat(chunks);
+          resolve({
+            status: response.statusCode,
+            headers: response.headers,
+            body,
+            text: body.toString('utf8')
+          });
         });
-      });
-    });
+      }
+    );
 
     request.setTimeout(REQUEST_TIMEOUT_MS, () => {
       request.destroy(
@@ -602,6 +605,61 @@ const httpRequest = ({ method = 'GET', path: requestPath, port = DEFAULT_PORT })
     request.on('error', reject);
     request.end();
   });
+
+/**
+ * Writes one request onto a raw socket and returns the response bytes.
+ *
+ * Needed because an HTTP client refuses to send the malformed authorities the
+ * gate must refuse: `http.request` substitutes its own `Host` for an empty
+ * value and will not emit a second `Host` line, and it never speaks HTTP/1.0.
+ * Those three cases are only reachable by writing the request line and headers
+ * directly.
+ *
+ * The socket is read to close - every authority refusal declares
+ * `Connection: close`, so the server ends the connection itself - and the wait
+ * is bounded so a missing response is a readable failure rather than a hang.
+ *
+ * @param {string} raw The complete request, CRLF-delimited.
+ * @param {number} [port] The port to connect to.
+ * @returns {Promise<{statusLine: string, status: number, text: string, raw: string}>}
+ *   The response's status line, parsed status, body and full bytes.
+ */
+const rawRequest = (raw, port = DEFAULT_PORT) => new Promise((resolve, reject) => {
+  const socket = net.connect({ host: HOST, port });
+  let received = '';
+  let settled = false;
+
+  const settle = (outcome, value) => {
+    if (settled) return;
+    settled = true;
+    socket.removeAllListeners();
+    socket.destroy();
+    outcome(value);
+  };
+
+  socket.setTimeout(REQUEST_TIMEOUT_MS, () => settle(
+    reject,
+    new Error(
+      `no response to the raw request within ${REQUEST_TIMEOUT_MS} ms; `
+        + `read ${JSON.stringify(received)}`
+    )
+  ));
+  socket.on('connect', () => socket.write(raw));
+  socket.on('data', (chunk) => {
+    received += chunk.toString('utf8');
+  });
+  socket.on('error', (error) => settle(reject, error));
+  socket.on('close', () => {
+    const statusLine = received.split('\r\n')[0];
+    const separatorAt = received.indexOf('\r\n\r\n');
+    settle(resolve, {
+      statusLine,
+      status: Number(statusLine.split(' ')[1]),
+      text: separatorAt === -1 ? '' : received.slice(separatorAt + 4),
+      raw: received
+    });
+  });
+});
 
 /**
  * Occupies a port so a bind conflict can be provoked deliberately.
@@ -665,19 +723,13 @@ const probeConnection = (port) => new Promise((resolve) => {
   socket.once('connect', () => settle('CONNECTED'));
 });
 
-/**
- * Closes a server this file started in-process.
- *
- * @param {import('http').Server} server The listening server.
- * @returns {Promise<void>} Resolves once it has stopped listening.
- */
 const closeServer = (server) => new Promise((resolve) => {
   server.close(() => resolve());
 });
 
 /**
  * Cleanup safety net: it asserts NOTHING, because assertions made in a hook do
- * not count toward `test:summary.counts.passed` and this file promises exactly
+ * not count toward the suite's passed-test total and this file promises exactly
  * eight counted tests. Each test already stops its own child and releases its
  * own holder in a `finally`; this reaps whatever a thrown assertion skipped, so
  * a failure cannot leave port 3000 occupied for the next file or the next run.
@@ -685,11 +737,9 @@ const closeServer = (server) => new Promise((resolve) => {
  * Anything still tracked here either never reached its `stop` or survived its
  * escalation, because `stop` untracks a handle only on confirmed closure. Each
  * one is retried with `SIGKILL`, every holder is released whatever the children
- * did, and only then is an unreapable child reported - as a cleanup error, not
- * as an assertion. That distinction is not cosmetic: verified on Node
- * v24.21.0, a throwing top-level `after` hook is counted in
- * `test:summary.counts.failed` and NOT in `counts.passed` (`{tests: 2,
- * failed: 1, passed: 1}` for one passing test plus a throwing hook), so this
+ * did, and only then is an unreapable child reported - by throwing, which is a
+ * cleanup error rather than an assertion. That distinction matters: a throwing
+ * hook lands in the run's failure count and not in its passed count, so it
  * fails the run loudly through `verify-tests.js`'s `failed === 0` condition
  * without inflating the eight counted tests its `MIN_TESTS` guard gates on.
  */
@@ -719,12 +769,9 @@ after(async () => {
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 34-37 - the spawned entrypoint.
+ * The spawned entrypoint.
  * ------------------------------------------------------------------------- */
 
-// Test 34 - the banner is both a preserved behaviour and this file's readiness
-// signal, which is exactly why its format was kept verbatim rather than
-// reformatted when `listen` moved behind the entry-point check.
 test('the entrypoint prints the baseline startup banner as its first stdout line', async () => {
   const entry = spawnEntry();
   try {
@@ -752,11 +799,10 @@ test('the entrypoint prints the baseline startup banner as its first stdout line
   }
 });
 
-// Test 35 - the backward-compatibility guarantee, and the only externally
-// observable contract the repository made before this feature. Asserted on
-// bytes rather than on a decoded string, because "34 bytes, byte for byte" is
-// the promise. The "Sharebot" wording is preserved deliberately.
-test('GET / still answers the byte-identical 34-byte baseline greeting', async () => {
+// The authority cases live on `/` on purpose: it is the one path that predates
+// the feature, so "the gate refuses a rebound origin" and "the gate refuses
+// nothing an ordinary client sends" have to be true at the same time.
+test('GET / still answers the byte-identical 34-byte baseline greeting to a served authority', async () => {
   const entry = spawnEntry();
   try {
     await waitForBanner(entry);
@@ -783,16 +829,174 @@ test('GET / still answers the byte-identical 34-byte baseline greeting', async (
       GREETING_BYTE_LENGTH,
       `the greeting must be ${GREETING_BYTE_LENGTH} bytes, read ${response.body.length}`
     );
+
+    // The rebinding case itself. The connection is to `127.0.0.1` - exactly as
+    // a rebound browser's would be, which is why no bind address can refuse it
+    // - while the authority names the attacker. It must be refused before the
+    // route runs, and the refusal must carry none of the greeting.
+    const rebound = await httpRequest({ path: '/', headers: { Host: REBOUND_AUTHORITY } });
+    assert.equal(
+      rebound.status,
+      STATUS_MISDIRECTED_REQUEST,
+      `Host: ${REBOUND_AUTHORITY} must be refused with ${STATUS_MISDIRECTED_REQUEST}, `
+        + `read ${rebound.status} with body ${JSON.stringify(rebound.text)}`
+    );
+    assert.equal(
+      rebound.headers['content-type'],
+      JSON_MEDIA_TYPE,
+      `a refused authority must answer ${JSON_MEDIA_TYPE}, `
+        + `read ${JSON.stringify(rebound.headers['content-type'])}`
+    );
+    assert.equal(
+      rebound.text,
+      MISDIRECTED_BODY,
+      `the refusal must be the fixed envelope, read ${JSON.stringify(rebound.text)}`
+    );
+    assert.equal(
+      rebound.headers.connection,
+      'close',
+      `a refused authority must declare Connection: close, `
+        + `read ${JSON.stringify(rebound.headers.connection)}`
+    );
+    assert.ok(
+      !rebound.text.includes('Sharebot'),
+      `a refused authority must not receive the greeting, read ${JSON.stringify(rebound.text)}`
+    );
+
+    // The other half: every authority a legitimate client can present on this
+    // bind is still served, so the gate is a boundary rather than an outage.
+    const named = await httpRequest({ path: '/', headers: { Host: LOCALHOST_AUTHORITY } });
+    assert.equal(
+      named.status,
+      200,
+      `Host: ${LOCALHOST_AUTHORITY} is a supported loopback authority and must answer 200, `
+        + `read ${named.status} with body ${JSON.stringify(named.text)}`
+    );
+    assert.ok(
+      named.body.equals(GREETING_BYTES),
+      `Host: ${LOCALHOST_AUTHORITY} must receive the greeting byte for byte, `
+        + `read ${JSON.stringify(named.text)}`
+    );
+
+    // The port is part of the authority, not decoration: a loopback host on a
+    // port this process is not listening on was addressed at something else.
+    // `%d` is a real port number, so the value is well-formed - what fails is
+    // the comparison against the port actually bound.
+    const wrongPort = await httpRequest({ path: '/', headers: { Host: `${HOST}:${DEFAULT_PORT + 1}` } });
+    assert.equal(
+      wrongPort.status,
+      STATUS_MISDIRECTED_REQUEST,
+      `Host: ${HOST}:${DEFAULT_PORT + 1} must be refused on a server bound to ${DEFAULT_PORT}, `
+        + `read ${wrongPort.status}`
+    );
+
+    // A portless authority means the scheme default, port 80, which this
+    // service is not on.
+    const portless = await httpRequest({ path: '/', headers: { Host: HOST } });
+    assert.equal(
+      portless.status,
+      STATUS_MISDIRECTED_REQUEST,
+      `Host: ${HOST} implies port 80 and must be refused on ${DEFAULT_PORT}, `
+        + `read ${portless.status}`
+    );
+
+    // Userinfo is not part of an authority, and a value carrying it is unusable
+    // rather than merely unrecognised - hence 400, not 421.
+    const userinfo = await httpRequest({
+      path: '/',
+      headers: { Host: `admin@${HOST}:${DEFAULT_PORT}` }
+    });
+    assert.equal(
+      userinfo.status,
+      STATUS_BAD_REQUEST,
+      `Host: admin@${HOST}:${DEFAULT_PORT} must be a ${STATUS_BAD_REQUEST}, read ${userinfo.status}`
+    );
+    assert.equal(
+      userinfo.text,
+      INVALID_HOST_BODY,
+      `an unusable authority must be the fixed INVALID_HOST envelope, `
+        + `read ${JSON.stringify(userinfo.text)}`
+    );
+
+    // Brackets delimit an IPv6 literal, so their contents must be one. `[::1]`
+    // is a supported loopback authority and is served; the two malformed forms
+    // are refused rather than repaired, because a parser that normalized them -
+    // stripping that trailing dot, say - would make a value that is not an
+    // address match the loopback set.
+    const bracketedCases = [
+      {
+        host: `[::1]:${DEFAULT_PORT}`,
+        status: 200,
+        why: '::1 is a supported loopback authority on the bound port'
+      },
+      {
+        host: `[::1.]:${DEFAULT_PORT}`,
+        status: STATUS_BAD_REQUEST,
+        why: '::1. is not an IPv6 literal, and a trailing dot must not be normalized off one'
+      },
+      {
+        host: `[not:ipv6]:${DEFAULT_PORT}`,
+        status: STATUS_BAD_REQUEST,
+        why: 'a colon inside brackets is not evidence of an address'
+      }
+    ];
+    for (const { host, status, why } of bracketedCases) {
+      const result = await httpRequest({ path: '/', headers: { Host: host } });
+      assert.equal(
+        result.status,
+        status,
+        `Host: ${host} must answer ${status} because ${why}; read ${result.status} with body `
+          + `${JSON.stringify(result.text)}`
+      );
+    }
+
+    // Three cases an HTTP client will not send, so they go on the wire directly.
+    // Each names what the gate decided and why that is the right decision.
+    const rawCases = [
+      {
+        label: 'an HTTP/1.0 request asserting no authority',
+        raw: 'GET / HTTP/1.0\r\n\r\n',
+        status: 200,
+        // It names no origin, so there is none to be misdirected from, and a
+        // browser cannot produce it: `Host` is a forbidden header name, so the
+        // rebinding vehicle always lands in one of the cases above.
+        why: 'a request that asserts no authority is served under the server\'s own'
+      },
+      {
+        label: 'an HTTP/1.0 request asserting a rebound authority',
+        raw: `GET / HTTP/1.0\r\nHost: ${REBOUND_AUTHORITY}\r\n\r\n`,
+        status: STATUS_MISDIRECTED_REQUEST,
+        why: 'asserting an authority subjects it to the policy, whatever the protocol version'
+      },
+      {
+        label: 'an empty Host value',
+        raw: 'GET / HTTP/1.1\r\nHost: \r\n\r\n',
+        status: STATUS_BAD_REQUEST,
+        why: 'an asserted-but-empty authority is unusable; the runtime passes it through'
+      },
+      {
+        label: 'two Host header lines',
+        raw: `GET / HTTP/1.1\r\nHost: ${HOST}:${DEFAULT_PORT}\r\nHost: ${REBOUND_AUTHORITY}\r\n\r\n`,
+        status: STATUS_BAD_REQUEST,
+        // `req.headers.host` reports only the first, so a gate that trusted it
+        // would judge one authority while the bytes carry two.
+        why: 'two Host lines make the authority ambiguous (RFC 9112 3.2), and the runtime allows them'
+      }
+    ];
+    for (const { label, raw, status, why } of rawCases) {
+      const result = await rawRequest(raw);
+      assert.equal(
+        result.status,
+        status,
+        `${label}: must answer ${status} because ${why}; read ${JSON.stringify(result.statusLine)} `
+          + `with body ${JSON.stringify(result.text)}`
+      );
+    }
   } finally {
     await stop(entry);
   }
 });
 
-// Test 36 - the new functionality under the artifact that ships. This is the
-// only assertion in the suite that proves the entrypoint, the dispatcher,
-// `lib/activityRoutes.js`, `lib/activityRepository.js`,
-// `lib/studentDirectory.js`, `lib/workbook.js` and the committed workbooks are
-// wired together, with nothing injected and nothing stubbed.
 test('the activity route answers from the committed workbooks under the real entrypoint', async () => {
   const entry = spawnEntry();
   try {
@@ -810,21 +1014,92 @@ test('the activity route answers from the committed workbooks under the real ent
       `GET ${S001_PATH} must answer ${JSON_MEDIA_TYPE}, `
         + `read ${JSON.stringify(response.headers['content-type'])}`
     );
-    // `assert/strict`'s deepEqual is deep-strict, so an extra or missing key
-    // fails here too: no directory column beyond `Name` may reach a payload.
     assert.deepEqual(
       JSON.parse(response.text),
       S001_PAYLOAD,
       `GET ${S001_PATH} must answer the committed S001 payload, read ${JSON.stringify(response.text)}`
+    );
+
+    // The same three capabilities through a rebound authority. This is what the
+    // gate is for: without it, the payload just asserted - a student's name,
+    // their activities, and every Student ID on the roster - is readable by any
+    // page that rebound a DNS name at this loopback service.
+    const registryBefore = fs.readFileSync(REGISTRY_PATH);
+    for (const target of [S001_PATH, ACTIVITIES_PATH]) {
+      const refused = await httpRequest({ path: target, headers: { Host: REBOUND_AUTHORITY } });
+      assert.equal(
+        refused.status,
+        STATUS_MISDIRECTED_REQUEST,
+        `GET ${target} with Host: ${REBOUND_AUTHORITY} must be refused with `
+          + `${STATUS_MISDIRECTED_REQUEST}, read ${refused.status} with body `
+          + `${JSON.stringify(refused.text)}`
+      );
+      assert.equal(
+        refused.text,
+        MISDIRECTED_BODY,
+        `GET ${target}: the refusal must be the fixed envelope, read ${JSON.stringify(refused.text)}`
+      );
+      // The refusal is asserted to carry no data, not merely a different status:
+      // a body leaking the name or an identifier would be the same exposure at a
+      // different status code.
+      for (const secret of ['Aarav Sharma', 'S001', 'Robotics Club']) {
+        assert.ok(
+          !refused.text.includes(secret),
+          `GET ${target} with a rebound authority must leak nothing, but the body named `
+            + `${JSON.stringify(secret)}: ${JSON.stringify(refused.text)}`
+        );
+      }
+    }
+
+    // The append route, the one capability that writes. The probe deliberately
+    // carries the WRONG media type, so the request is unwritable by
+    // construction: with the gate it is refused as a misdirected authority, and
+    // without the gate it would reach the route and be refused as an
+    // unsupported media type. Either way nothing can be persisted, and the
+    // status distinguishes the two outcomes exactly - which is what proves the
+    // gate runs BEFORE dispatch rather than somewhere inside it.
+    const reboundPost = await httpRequest({
+      method: 'POST',
+      path: S001_PATH,
+      headers: { Host: REBOUND_AUTHORITY, 'Content-Type': 'text/plain' }
+    });
+    assert.equal(
+      reboundPost.status,
+      STATUS_MISDIRECTED_REQUEST,
+      `POST ${S001_PATH} with Host: ${REBOUND_AUTHORITY} must be refused with `
+        + `${STATUS_MISDIRECTED_REQUEST} before the route sees it - a 415 would mean the `
+        + `authority was checked after dispatch. Read ${reboundPost.status} with body `
+        + `${JSON.stringify(reboundPost.text)}`
+    );
+    assert.ok(
+      fs.readFileSync(REGISTRY_PATH).equals(registryBefore),
+      `the committed registry ${REGISTRY_PATH} must be byte-unchanged by a refused POST`
+    );
+
+    // The control for that comparison: the identical request from a served
+    // authority DOES reach the route, and is refused there on its media type.
+    // Without this, a gate that refused every POST would pass the assertion
+    // above for the wrong reason.
+    const servedPost = await httpRequest({
+      method: 'POST',
+      path: S001_PATH,
+      headers: { Host: `${HOST}:${DEFAULT_PORT}`, 'Content-Type': 'text/plain' }
+    });
+    assert.equal(
+      servedPost.status,
+      415,
+      `POST ${S001_PATH} from a served authority must reach the route and be refused on its `
+        + `media type (415), read ${servedPost.status} with body ${JSON.stringify(servedPost.text)}`
+    );
+    assert.ok(
+      fs.readFileSync(REGISTRY_PATH).equals(registryBefore),
+      `the committed registry ${REGISTRY_PATH} must be byte-unchanged by this test`
     );
   } finally {
     await stop(entry);
   }
 });
 
-// Test 37 - the port is this file's shared resource, so its release is asserted
-// rather than assumed. Awaiting `'close'` inside `stop` is what makes the
-// refusal deterministic instead of a race with the kernel.
 test('the default port is released once the entrypoint has shut down', async () => {
   const entry = spawnEntry();
   let stopped = false;
@@ -858,17 +1133,11 @@ test('the default port is released once the entrypoint has shut down', async () 
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 38-39 - both bind-conflict paths.
- *
- * The CLI wrapper and the library entry point answer the same failure
- * differently on purpose, so each contract gets its own test. Asserting only
- * one would leave the other free to regress into the baseline's behaviour,
- * where a bind failure surfaced as an unhandled `'error'` event whose message
- * named neither the address nor the cause.
+ * Both bind-conflict paths, one test each: a single test covering both would
+ * leave the other free to regress into an unhandled `'error'` event whose
+ * message names neither the address nor the cause.
  * ------------------------------------------------------------------------- */
 
-// Test 38 - the `require.main === module` wrapper: one diagnostic line on
-// stderr plus a non-zero exit code, and no banner.
 test('the CLI path reports a bind conflict on stderr and exits non-zero', async () => {
   const holder = await holdPort(DEFAULT_PORT);
   let entry = null;
@@ -913,22 +1182,17 @@ test('the CLI path reports a bind conflict on stderr and exits non-zero', async 
   }
 });
 
-// Test 39 - the library path: `start()` REJECTS, never exits the process.
+// `start()` REJECTS on a bind conflict rather than exiting the process, and
+// `server.js` attaches the `http.Server` whose bind failed to the rejected
+// error as a non-enumerable `server` property, so its leftover listener state
+// is asserted directly on that handle.
 //
-// Listener route taken: the PREFERRED one. `server.js` attaches the failed
-// `http.Server` to the rejected error as a non-enumerable `server` property, so
-// the handle is reachable through the documented API and the leftover-state
-// assertion can be made directly on it.
-//
-// One adaptation, per the standing instruction to adapt to the module as built
-// rather than change it: the plan predicted `listenerCount('listening') === 0`,
-// but that is unreachable for an `http.Server` on this runtime. A FRESH
-// `http.createServer()` already carries one internal `'listening'` listener -
-// Node's own `setupConnectionsTracking`, attached by the constructor (a plain
-// `net.Server` carries none). Verified on Node v24.21.0: fresh count 1, count
-// after a failed bind 1. The assertion therefore compares against a fresh
-// server's count, which is what "our one-shot listener was removed" actually
-// means and stays true if Node changes its internals.
+// The `'listening'` count is compared against a freshly constructed
+// `http.createServer()` rather than against zero, because an `http.Server`
+// carries one internal `'listening'` listener attached by its own constructor
+// (a plain `net.Server` carries none). Equality with a fresh server is what
+// "start()'s one-shot listener was removed" means, and it holds whatever Node
+// does with its internals.
 test('the library path rejects a bind conflict and leaves the caller intact', async () => {
   const holder = await holdPort(DEFAULT_PORT);
   try {
@@ -936,9 +1200,6 @@ test('the library path rejects a bind conflict and leaves the caller intact', as
     let sentinel = 'the statement after the rejection never ran';
 
     await assert.rejects(
-      // `start` builds the real directory and repository from the committed
-      // workbooks and reads the committed `activities.json` - read-only, and no
-      // `POST` is issued anywhere in this file, so nothing is written.
       async () => { await start({ ...LIBRARY_OPTIONS, port: DEFAULT_PORT }); },
       (error) => {
         failure = error;
@@ -956,8 +1217,6 @@ test('the library path rejects a bind conflict and leaves the caller intact', as
       `start() must reject when ${HOST}:${DEFAULT_PORT} is already held`
     );
 
-    // The calling process is still executing: `start` never called
-    // `process.exit`, and the failure did not escape as an uncaught event.
     sentinel = 'the caller survived the rejection';
     assert.equal(
       sentinel,
@@ -995,10 +1254,9 @@ test('the library path rejects a bind conflict and leaves the caller intact', as
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 40-41 - the configuration contract.
- *
- * Several cases each, held in tables inside ONE test body so the file's
- * counted-test total stays at eight. Every assertion message names its case.
+ * The configuration contract. Both tests below carry several cases in a table
+ * inside ONE body, so the file's counted-test total stays at eight, and every
+ * assertion message names its case.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -1012,8 +1270,24 @@ test('the library path rejects a bind conflict and leaves the caller intact', as
  */
 const INVALID_PORTS = ['abc', '70000', '1.5', '3000abc', ''];
 
-// Test 40 - every invalid port is fatal and names itself; `0` is accepted and
-// means "let the kernel choose", which is what the in-process suite relies on.
+/**
+ * A rejected port that carries the three things a diagnostic must never pass
+ * through to a terminal or a log reader: `ESC [ 2 J` (the sequence that clears a
+ * screen), CR LF (which would end the record and start one the caller wrote),
+ * and U+202E (a right-to-left override, which reorders everything after it
+ * without being a control character or whitespace at all).
+ *
+ * Environment values are operator-supplied text, not a closed alphabet, and this
+ * is the one line printed when startup fails - so the sink is what has to be
+ * safe (CWE-117). Kept under the 64-character cap the message applies to an
+ * interpolated value, so the assertions below see the whole value rather than a
+ * truncation of it.
+ */
+const HOSTILE_PORT = '\u001b[2J3000\r\nFORGED: server.js: ready\u202e';
+
+/** Every code point the neutralized diagnostic must not contain verbatim. */
+const RAW_LOG_UNSAFE_PATTERN = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+
 test('an invalid port is a fatal configuration error and 0 binds an ephemeral port', async () => {
   for (const value of INVALID_PORTS) {
     const label = JSON.stringify(value);
@@ -1072,6 +1346,89 @@ test('an invalid port is a fatal configuration error and 0 binds an ephemeral po
     await stop(rejected);
   }
 
+  // The library error keeps the value VERBATIM: neutralization belongs to the
+  // sink that prints it, not to the message, so a caller catching this error can
+  // still compare it against what it passed in.
+  assert.throws(
+    () => createServer({ ...LIBRARY_OPTIONS, port: HOSTILE_PORT }),
+    (error) => {
+      assert.equal(
+        error.code,
+        'SERVER_CONFIG_INVALID',
+        `the hostile port must be a configuration error, read ${JSON.stringify(error.code)}`
+      );
+      assert.ok(
+        error.message.includes('\u001b') && error.message.includes('\u202e'),
+        'the thrown message must carry the rejected value verbatim, read '
+          + `${JSON.stringify(error.message)}`
+      );
+      return true;
+    },
+    'createServer must refuse a port carrying terminal and bidi controls'
+  );
+
+  // The same value through the artifact an operator runs, which is where the
+  // controls would land on a terminal. The wrapper must escape the whole detail
+  // before writing it, so nothing in the value can repaint the screen, reorder
+  // the sentence that rejected it, or forge a second diagnostic line.
+  const hostile = spawnEntry({ env: { PORT: HOSTILE_PORT } });
+  try {
+    assert.ok(
+      await waitForClose(hostile, CHILD_EXIT_TIMEOUT_MS),
+      `PORT=<hostile>: the entrypoint must exit within ${CHILD_EXIT_TIMEOUT_MS} ms`
+        + `${describeChild(hostile)}`
+    );
+    assert.ok(
+      hostile.code !== null && hostile.code !== 0,
+      `PORT=<hostile>: the entrypoint must exit non-zero, read ${hostile.code}`
+        + `${describeChild(hostile)}`
+    );
+    assert.equal(
+      hostile.stdout,
+      '',
+      `PORT=<hostile>: no banner may be printed, read ${JSON.stringify(hostile.stdout)}`
+    );
+    assert.equal(
+      hostile.stderr.trimEnd().split('\n').length,
+      1,
+      'PORT=<hostile>: the wrapper must write exactly one diagnostic line, read '
+        + `${JSON.stringify(hostile.stderr)}`
+    );
+    assert.equal(
+      RAW_LOG_UNSAFE_PATTERN.test(hostile.stderr.trimEnd()),
+      false,
+      'PORT=<hostile>: no control, format or separator code point may survive into '
+        + `the diagnostic, read ${JSON.stringify(hostile.stderr)}`
+    );
+    for (const escaped of ['\\u001b', '\\u000d', '\\u000a', '\\u202e']) {
+      assert.ok(
+        hostile.stderr.includes(escaped),
+        `PORT=<hostile>: ${escaped} must appear escaped in the diagnostic, read `
+          + `${JSON.stringify(hostile.stderr)}`
+      );
+    }
+    assert.ok(
+      hostile.stderr.startsWith('server.js: '),
+      'PORT=<hostile>: the diagnostic must still be the wrapper\'s own line, read '
+        + `${JSON.stringify(hostile.stderr)}`
+    );
+    assert.equal(
+      hostile.stderr.includes('\nFORGED'),
+      false,
+      'PORT=<hostile>: no line may begin with caller-supplied text, read '
+        + `${JSON.stringify(hostile.stderr)}`
+    );
+    // Neutralized, not discarded: the operator still sees which value was
+    // rejected, which is why the port digits inside it survive.
+    assert.ok(
+      hostile.stderr.includes('3000'),
+      'PORT=<hostile>: the readable part of the rejected value must survive, read '
+        + `${JSON.stringify(hostile.stderr)}`
+    );
+  } finally {
+    await stop(hostile);
+  }
+
   // The accepted case. `0` is preserved through resolution rather than
   // normalized away, so the configured value and the bound value differ.
   const ephemeral = await start({ ...LIBRARY_OPTIONS, port: 0 });
@@ -1122,10 +1479,38 @@ const INVALID_HOST_CASES = [
   { value: '   ', cliQuoted: '" "' }
 ];
 
-// Test 41 - the host is fatal when empty, on the library path AND through the
-// real entrypoint's environment, and both path options resolve against the
-// entrypoint's directory rather than the caller's working directory.
-test('an empty host is fatal and relative paths resolve against the entrypoint directory', async () => {
+/**
+ * Authority allowlist entries that must be refused at startup, and why each
+ * one matters rather than being pedantry.
+ *
+ * An entry the policy cannot parse is worse than useless: it would sit in the
+ * configuration looking like permission while matching nothing, so an operator
+ * would widen the bind, believe an authority was named, and get a service that
+ * refuses every request - or, with a looser parser, one that admitted more than
+ * the entry says. Both are startup failures instead.
+ */
+const INVALID_ALLOWED_HOSTS = [
+  { value: '', why: 'an empty entry names no authority' },
+  { value: '   ', why: 'a whitespace-only entry names no authority' },
+  { value: 'app example', why: 'an authority cannot contain whitespace' },
+  { value: 'app.example:70000', why: 'a port must be inside 0-65535' },
+  { value: 'app.example:https', why: 'a port must be decimal digits' },
+  { value: 'admin@app.example', why: 'userinfo is not part of an authority' },
+  { value: 'http://app.example', why: 'a scheme is not part of an authority' },
+  { value: 'app.example/activities', why: 'a path is not part of an authority' },
+  { value: '[::1', why: 'an unclosed bracket is not an authority' },
+  { value: 'app.example:1:2', why: 'two ports are ambiguous' },
+  // Brackets promise an IPv6 literal. An entry that does not hold one could
+  // never match a request authority, so it would sit in the configuration
+  // looking like permission while permitting nothing.
+  { value: '[not:ipv6]', why: 'a bracketed value must be an IPv6 literal' },
+  { value: '[::1.]', why: 'a malformed literal must not be repaired into a valid one' }
+];
+
+/** A named authority that is nothing like a loopback spelling. */
+const NAMED_AUTHORITY = 'activities.internal';
+
+test('an empty or unlisted wider host is fatal and relative paths resolve against the entrypoint directory', async () => {
   for (const { value, cliQuoted } of INVALID_HOST_CASES) {
     const label = JSON.stringify(value);
     assert.throws(
@@ -1147,11 +1532,6 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       `host ${label}: createServer must refuse it rather than bind every interface`
     );
 
-    // The same rejection through the artifact an operator runs: `HOST` read
-    // from the environment, and the `require.main === module` wrapper turning
-    // the throw into one stderr line plus a non-zero exit code. Nothing binds,
-    // because configuration is resolved before any `listen`, so this cannot
-    // contend for the default port.
     const rejected = spawnEntry({ env: { HOST: value } });
     try {
       assert.ok(
@@ -1197,8 +1577,156 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
     }
   }
 
-  // Resolution asserted directly on the pure function. Both values are
-  // relative, and both must land beside `server.js`.
+  // A bind beyond loopback with no authority named. `0.0.0.0` is the value the
+  // README warns about: it publishes the service to a network that
+  // authenticates nobody, and a published socket that answers for every
+  // authority is reachable by a rebound browser origin. It must fail while the
+  // server is being BUILT - nothing may listen first.
+  assert.throws(
+    () => createServer({ ...LIBRARY_OPTIONS, host: '0.0.0.0' }),
+    (error) => {
+      assert.equal(
+        error.code,
+        'SERVER_CONFIG_INVALID',
+        `host 0.0.0.0 with no allowlist must be a configuration error, `
+          + `read ${JSON.stringify(error.code)}`
+      );
+      assert.match(
+        error.message,
+        /ALLOWED_HOSTS/,
+        `the message must name the setting that would permit it, `
+          + `read ${JSON.stringify(error.message)}`
+      );
+      return true;
+    },
+    'a wildcard bind with no authority allowlist must be refused'
+  );
+
+  // The same bind, with the authority it will answer for named, is accepted -
+  // the rule is "name them", not "never widen". `createServer` does not listen,
+  // so asserting this publishes nothing.
+  const widened = createServer({
+    ...LIBRARY_OPTIONS,
+    host: '0.0.0.0',
+    allowedHosts: `${NAMED_AUTHORITY}:${DEFAULT_PORT}`
+  });
+  assert.deepEqual(
+    widened.config.allowedHosts,
+    [`${NAMED_AUTHORITY}:${DEFAULT_PORT}`],
+    `a named allowlist must reach the resolved configuration, `
+      + `read ${JSON.stringify(widened.config.allowedHosts)}`
+  );
+  assert.equal(
+    widened.listening,
+    false,
+    'createServer must not listen, so this assertion may not publish a socket'
+  );
+
+  // And through the artifact an operator runs, because `HOST` is read from the
+  // environment by every `node server.js`. Nothing binds: configuration is
+  // resolved before any `listen`, so this cannot contend for the default port.
+  const widenedCli = spawnEntry({ env: { HOST: '0.0.0.0' } });
+  try {
+    assert.ok(
+      await waitForClose(widenedCli, CHILD_EXIT_TIMEOUT_MS),
+      `HOST=0.0.0.0: the entrypoint must exit within ${CHILD_EXIT_TIMEOUT_MS} ms`
+        + `${describeChild(widenedCli)}`
+    );
+    assert.ok(
+      widenedCli.code !== null && widenedCli.code !== 0,
+      `HOST=0.0.0.0: the entrypoint must exit non-zero rather than publish the service, `
+        + `read ${widenedCli.code}${describeChild(widenedCli)}`
+    );
+    assert.equal(
+      widenedCli.stdout,
+      '',
+      `HOST=0.0.0.0: no banner may be printed, read ${JSON.stringify(widenedCli.stdout)}`
+    );
+    assert.match(
+      widenedCli.stderr,
+      /ALLOWED_HOSTS/,
+      `HOST=0.0.0.0: stderr must name the setting that would permit the bind, `
+        + `read ${JSON.stringify(widenedCli.stderr)}`
+    );
+  } finally {
+    await stop(widenedCli);
+  }
+
+  // Every allowlist entry is validated at startup, so a rule that could never
+  // match is a failure rather than a false sense of permission.
+  for (const { value, why } of INVALID_ALLOWED_HOSTS) {
+    const label = JSON.stringify(value);
+    assert.throws(
+      () => resolveConfig({ ...LIBRARY_OPTIONS, allowedHosts: [value] }),
+      (error) => {
+        assert.equal(
+          error.code,
+          'SERVER_CONFIG_INVALID',
+          `allowedHosts ${label}: must be a configuration error, read ${JSON.stringify(error.code)}`
+        );
+        return true;
+      },
+      `allowedHosts ${label} must be refused: ${why}`
+    );
+  }
+
+  // Entries are canonicalized once, by the same parser the `Host` header goes
+  // through, so a listed authority and a request authority cannot disagree on
+  // case, spacing or IPv6 bracketing.
+  assert.deepEqual(
+    resolveConfig({
+      ...LIBRARY_OPTIONS,
+      allowedHosts: ` ${NAMED_AUTHORITY.toUpperCase()} , app.example:8080 , [::1]:8080 `
+    }).allowedHosts,
+    [NAMED_AUTHORITY, 'app.example:8080', '[::1]:8080'],
+    'a comma-separated allowlist must be trimmed, lower-cased and kept in order'
+  );
+
+  // The allowlist admits what it names, on a real server. An entry carrying no
+  // port matches the name on whatever port the service is on, which is the
+  // reverse-proxy case; an authority nobody named is still refused.
+  const named = await start({
+    ...LIBRARY_OPTIONS,
+    port: 0,
+    allowedHosts: [NAMED_AUTHORITY]
+  });
+  try {
+    const namedPort = named.address().port;
+    const admitted = await httpRequest({
+      path: '/',
+      port: namedPort,
+      headers: { Host: NAMED_AUTHORITY }
+    });
+    assert.equal(
+      admitted.status,
+      200,
+      `Host: ${NAMED_AUTHORITY} is on the allowlist and must be served, read ${admitted.status}`
+    );
+    const unlisted = await httpRequest({
+      path: '/',
+      port: namedPort,
+      headers: { Host: REBOUND_AUTHORITY }
+    });
+    assert.equal(
+      unlisted.status,
+      STATUS_MISDIRECTED_REQUEST,
+      `Host: ${REBOUND_AUTHORITY} is not on the allowlist and must be refused, `
+        + `read ${unlisted.status}`
+    );
+    // The implicit loopback set survives alongside an explicit allowlist: an
+    // allowlist adds authorities, it does not replace the ones a loopback bind
+    // already answers for.
+    const loopback = await httpRequest({ path: '/', port: namedPort });
+    assert.equal(
+      loopback.status,
+      200,
+      `${HOST}:${namedPort} must still be served when an allowlist is configured, `
+        + `read ${loopback.status}`
+    );
+  } finally {
+    await closeServer(named);
+  }
+
   const config = resolveConfig({
     host: HOST,
     port: 0,
@@ -1226,9 +1754,9 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       + `read ${JSON.stringify(config.activitiesDataPath)}`
   );
 
-  // End to end from a working directory that holds none of the project files,
-  // twice - once proving where a relative value did NOT resolve, once proving
-  // where it DID.
+  // End to end from a working directory that holds none of the project files:
+  // once proving where a relative value did NOT resolve, once proving where it
+  // DID.
   const foreignCwd = fs.mkdtempSync(path.join(os.tmpdir(), FOREIGN_CWD_PREFIX));
   const decoyRegistry = path.join(foreignCwd, DECOY_REGISTRY_FILENAME);
   const proofRegistry = path.join(foreignCwd, PROOF_REGISTRY_FILENAME);
@@ -1246,10 +1774,10 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       'utf8'
     );
 
-    // Part 3a - relative values resolved against the entrypoint's directory:
-    // the committed workbooks are read (nothing readable sits in the working
-    // directory), and the committed `activities.json` is the registry rather
-    // than the identically named decoy one directory away.
+    // The negative half: relative values resolved against the entrypoint's
+    // directory, so the committed workbooks are read (nothing readable sits in
+    // the working directory) and the committed `activities.json` is the
+    // registry rather than the identically named decoy one directory away.
     const entry = spawnEntry({
       cwd: foreignCwd,
       env: { WORKBOOK_DIR: '.', ACTIVITIES_DATA_PATH: DECOY_REGISTRY_FILENAME }
@@ -1309,10 +1837,10 @@ test('an empty host is fatal and relative paths resolve against the entrypoint d
       await stop(entry);
     }
 
-    // Part 3b - the positive proof for `ACTIVITIES_DATA_PATH`, which 3a can only
-    // establish negatively. The value is relative and addresses a registry
-    // OUTSIDE the checkout, computed from the entrypoint's directory, so its
-    // record can reach a response only if the value resolved there.
+    // The positive half, which the case above can only establish negatively:
+    // the value is relative and addresses a registry OUTSIDE the checkout,
+    // computed from the entrypoint's directory, so its record can reach a
+    // response only if the value resolved there.
     const relativeProofPath = path.relative(REPO_ROOT, proofRegistry);
     const cwdResolvedCandidate = path.resolve(foreignCwd, relativeProofPath);
     assert.ok(

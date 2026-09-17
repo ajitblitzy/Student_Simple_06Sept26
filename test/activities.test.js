@@ -1,89 +1,51 @@
 'use strict';
 
 /**
- * test/activities.test.js - the evidence that the extracurricular-activity
- * feature works, exercised in-process on an ephemeral port.
+ * Tests for the extracurricular-activity feature, exercised in-process against
+ * the composition root in `server.js` on an ephemeral port, so the wiring under
+ * test is the wiring that ships.
  *
- * WHY THIS FILE EXISTS
- * ---------------------------------------------------------------------------
- * The feature was derived from data the repository already carried but never
- * reached: `Extracurricular Activity` in column C of `student_other_info.xlsx`
- * and `Student ID` in column A of all three workbooks. Functionality without
- * evidence is unproven, so this file is that evidence - three JSON endpoints,
- * several activities per student, the write path, and referential integrity
- * enforced against the student directory.
+ * Every in-process server is constructed with BOTH dependencies injected, so
+ * its own resolved `activitiesDataPath` is never opened and the repository it
+ * is handed writes to a throwaway registry under `os.tmpdir()` rather than to
+ * the committed `activities.json`. Expectations for the committed dataset are
+ * read out of the workbooks (`Student Details!A2:B11`, `Other Info!A2:A11`/
+ * `C2:C11`) through `studentDirectory.load` and `activityRepository.load`.
+ * Cases the real data cannot reach - a student holding no activity, a label
+ * collision that folds case, a corrupt source, a writer that fails - are built
+ * through the `fromRows`, `fromData` and `writeFile` seams rather than a new
+ * binary fixture, which is why those seams exist. `Chess Club` and the name
+ * given to `S009` in the case-folding fixture are synthetic, and no assertion
+ * treats either as a workbook value.
  *
- * WHERE THE ASSERTED VALUES COME FROM
- * ---------------------------------------------------------------------------
- * Three provenances, kept distinct on purpose:
- *   - Committed data. Every student, name, activity and roster expectation for
- *     the real dataset was read out of the workbooks (`Student Details!A2:B11`,
- *     `Other Info!A2:A11`/`C2:C11`), never invented: `S001` is `Aarav Sharma`
- *     holding `Robotics Club`, `S003` is `Rohan Iyer` holding `Football Team`,
- *     and the roster is the eight groups those ten rows produce.
- *   - The wire contract. Statuses, error codes, the fixed error sentences, the
- *     `Allow` values, the media types and the 8 KiB body cap are the contract
- *     the feature promises, so they are written out here verbatim rather than
- *     derived from the data.
- *   - Synthetic values, never claimed to be workbook data. `Chess Club` is an
- *     activity no student holds, which is what makes it usable both as a
- *     request value - a filter that must match nothing, an activity a write may
- *     add - and inside injected fixtures. `Ishaan Nair` is a name given to
- *     `S009` in the case-folding fixture only (the workbook's own `S009` is
- *     `Arjun Kapoor`, a value this file deliberately does not depend on, so the
- *     fixture cannot be mistaken for the committed row).
- *
- * WHAT IT RUNS AGAINST
- * ---------------------------------------------------------------------------
- * `start()` from `server.js` - the single composition root - so the wiring
- * under test is the wiring that ships. What EVERY in-process server has in
- * common is registry isolation: each is constructed with BOTH dependencies
- * injected, so the server's own resolved `activitiesDataPath` is never opened,
- * and the repository it is handed writes to a throwaway registry under
- * `os.tmpdir()` rather than to the committed `activities.json`. How that
- * repository is built differs by case:
- *   - Committed-data cases build it with `studentDirectory.load` and
- *     `activityRepository.load` - production code reading the production
- *     workbooks - and change nothing but that registry path.
- *   - Otherwise-unreachable cases substitute it through
- *     `studentDirectory.fromRows`, `activityRepository.fromData` and its
- *     `writeFile` seam: a student holding no activity, a label collision that
- *     folds case, a registry or directory fault, and a writer that fails. Those
- *     use synthetic rows rather than a new binary fixture, which is the whole
- *     reason the seams exist.
- *
- * NON-NEGOTIABLE PROPERTIES OF THIS FILE
- * ---------------------------------------------------------------------------
+ * Standing constraints, every one of them load-bearing:
  *   - EXACTLY 33 top-level tests, with no subtest, no `describe` and no `it`.
- *     Root `verify-tests.js` gates on `test:summary.counts.passed >= MIN_TESTS`
- *     with `MIN_TESTS` 45 = 33 + 8 + 4, and `README.md` documents
- *     `MIN_TESTS=46 npm test` exiting 1 as the proof that the guard is live.
- *     Subtests and `it`s count toward `passed`, so one extra declaration here
- *     would inflate the total and void that proof. Every multi-case behaviour
- *     is therefore a `for...of` case table inside ONE test body, with the case
- *     named in each assertion message so a failure stays diagnosable.
+ *     `verify-tests.js` gates the run on `test:summary.counts.passed` reaching
+ *     `MIN_TESTS`, 45 = 33 + 8 + 4, and subtests and `it`s count toward that
+ *     total, so one extra declaration here raises the floor the guard enforces
+ *     without anyone choosing to. Multi-case behaviour is therefore a
+ *     `for...of` case table inside ONE test body, with the case named in each
+ *     assertion message so a failure stays diagnosable.
  *   - Every server binds `port: 0`. `test/server.test.js` is the suite's only
- *     binder of the default port; a second binder would fail `EADDRINUSE` and
- *     surface as *cancelled* tests naming neither the port nor the conflict.
- *   - Nothing is written inside the working tree. Every test that writes points
+ *     binder of the default port; a second binder fails `EADDRINUSE`, which
+ *     surfaces as *cancelled* tests naming neither the port nor the conflict.
+ *   - Nothing is written inside the working tree: a test that writes points
  *     `activitiesDataPath` at its own `fs.mkdtempSync` directory under
- *     `os.tmpdir()`, and the single `after` hook removes all of them - which is
- *     what keeps `git status --porcelain` identical across a run and what
- *     `test/workbooks.test.js` asserts when it looks for leftovers.
- *   - No assertion lives in a hook, because hook assertions do not count
+ *     `os.tmpdir()`, and the single `after` hook removes every one of them,
+ *     which is what keeps `git status --porcelain` identical across a run and
+ *     what the fixture suite's leftover check looks for.
+ *   - No assertion lives in a hook, because a hook's assertions do not count
  *     toward `counts.passed`. Hooks do setup and cleanup only.
  *   - No child process is spawned here; that belongs to `test/server.test.js`.
  *   - Zero dependencies: `node:` built-ins and the modules under test.
  *   - Every wait is bounded. `request` and `startServer` both carry deadlines,
  *     so a response that is never ended or a `listen` that never settles fails
- *     with what it was waiting for named instead of hanging the runner.
+ *     naming what it waited for instead of hanging the runner.
  *
- * The error contract is deterministic by design - one fixed sentence per code,
- * with the offending value interpolated after a colon - so the sentences are
- * asserted verbatim. A "contains" assertion would let a message drift. The
- * media type is held to the same standard: `Content-Type` is parsed to its
- * media type and compared exactly, because a substring test is satisfied by
- * `foo/application/jsonp`.
+ * Error sentences and media types are asserted exactly: the contract fixes one
+ * sentence per code, with the offending value interpolated after a colon, and a
+ * substring test would let a message drift or accept `foo/application/jsonp` as
+ * JSON.
  */
 
 const { test, before, after } = require('node:test');
@@ -99,22 +61,15 @@ const studentDirectory = require('../lib/studentDirectory');
 const activityRepository = require('../lib/activityRepository');
 const { readWorksheetRows } = require('../lib/workbook');
 
-/* ---------------------------------------------------------------------------
- * Constants: the wire contract, the committed data, and the harness.
- * ------------------------------------------------------------------------- */
-
-/** The checkout root, where the workbooks sit beside `server.js`. */
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 /**
- * A short, stable token naming THIS checkout, derived from the absolute path of
- * its root so that two working trees of this repository never share it.
- *
- * Twelve hex characters of a SHA-256 over the root path: long enough that a
- * collision between two checkouts is not a practical concern, short enough to
- * keep a temporary directory name readable. The path is lower-cased first
- * because Windows path comparison is case-insensitive, so the same tree reached
- * through a differently-cased path must still yield the same token.
+ * A short, stable token naming THIS checkout, so two working trees of this
+ * repository never share a temporary-directory namespace. Twelve hex characters
+ * of a SHA-256 over the root path: a collision is not a practical concern, and
+ * the directory name stays readable. The path is lower-cased first because
+ * Windows path comparison is case-insensitive, so the same tree reached through
+ * a differently-cased path yields the same token.
  */
 const CHECKOUT_TOKEN = crypto
   .createHash('sha256')
@@ -125,35 +80,27 @@ const CHECKOUT_TOKEN = crypto
 /**
  * The `fs.mkdtempSync` prefix for every throwaway registry directory.
  *
- * `os.tmpdir()` is HOST-WIDE, and up to 64 separate checkouts of this
- * repository run their suites side by side under that one temp root, so a bare
- * `student-activities-` prefix would put every one of them in a single
- * namespace - and `test/workbooks.test.js` fails its run if an entry with this
- * prefix survives there. Embedding `CHECKOUT_TOKEN` makes the namespace private
- * to this working tree, so a directory this file is legitimately mid-write on
- * can never fail a sibling checkout's suite, nor its suite fail this one's.
+ * `os.tmpdir()` is HOST-WIDE and many checkouts of this repository can run
+ * their suites under that one temp root at once, so embedding `CHECKOUT_TOKEN`
+ * keeps the namespace private to this working tree: a directory this file is
+ * legitimately mid-write on can never fail a sibling checkout's leftover check,
+ * nor its directories fail this one's.
  *
  * `test/workbooks.test.js` derives the same value from the same input with the
- * identical expression. It has to be derived rather than shared: a helper
- * module cannot hold it - every `.js` file inside a directory named `test/` is
- * executed as a test by default discovery - and the two files run in separate
- * child processes, so a path computed from `__dirname` is the only thing they
- * can be relied on to agree about. The derivation MUST STAY IN STEP WITH
- * `test/workbooks.test.js`: changing it here without changing it there turns
- * that file's leftover check into one that can never fail.
+ * identical expression, and the two MUST STAY IN STEP - changing it here alone
+ * turns that file's leftover check into one that can never fail. It has to be
+ * derived rather than shared: a helper module cannot hold it, because every
+ * `.js` file inside a directory named `test/` is executed as a test, and the
+ * two files run in separate processes.
  */
 const TEMP_PREFIX = `student-activities-${CHECKOUT_TOKEN}-`;
 
-/** The registry filename every temporary directory holds. */
 const REGISTRY_FILENAME = 'activities.json';
 
-/** The shipped registry state, and the seed every write test starts from. */
 const EMPTY_REGISTRY = '[]\n';
 
-/** Loopback only, and never the default port - see the header. */
 const LOOPBACK_HOST = '127.0.0.1';
 
-/** The ephemeral-port selector. `resolveConfig` preserves `0` deliberately. */
 const EPHEMERAL_PORT = 0;
 
 const JSON_MEDIA_TYPE = 'application/json';
@@ -173,29 +120,26 @@ const STATUS_PAYLOAD_TOO_LARGE = 413;
 const STATUS_UNSUPPORTED_MEDIA_TYPE = 415;
 const STATUS_INTERNAL_ERROR = 500;
 
-/** The routes under test, written out so a typo cannot become a `404` pass. */
+/** `503` for a queue that will drain, `507` for a quota that will not. */
+const STATUS_SERVICE_UNAVAILABLE = 503;
+const STATUS_INSUFFICIENT_STORAGE = 507;
+
 const ROOT_PATH = '/';
 const ACTIVITIES_PATH = '/api/activities';
 const S001_PATH = '/api/students/S001/activities';
 const S003_PATH = '/api/students/S003/activities';
 const S999_PATH = '/api/students/S999/activities';
 
-/** The baseline greeting, byte for byte, including the trailing newline. */
 const GREETING = 'Hello, World Welcome to Sharebot!\n';
 
-/** 34 - asserted as the `Content-Length` of `HEAD /`. */
 const GREETING_BYTE_LENGTH = Buffer.byteLength(GREETING);
 
-/** The 8 KiB body cap `lib/activityRoutes.js` enforces. */
 const MAX_BODY_BYTES = 8192;
 
-/** Comfortably over the cap, in a single `req.end()` write. */
 const OVERSIZE_BODY_BYTES = 9000;
 
-/** One character over the 64-character activity limit. */
 const OVERLONG_ACTIVITY = 'x'.repeat(65);
 
-/** Error codes, as `lib/activityRoutes.js` and `server.js` emit them. */
 const CODE_INVALID_STUDENT_ID = 'INVALID_STUDENT_ID';
 const CODE_MALFORMED_JSON = 'MALFORMED_JSON';
 const CODE_INVALID_ACTIVITY = 'INVALID_ACTIVITY';
@@ -208,19 +152,41 @@ const CODE_PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE';
 const CODE_UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE';
 const CODE_INTERNAL_ERROR = 'INTERNAL_ERROR';
 
-/** The fixed sentences that carry no interpolated value. */
+/**
+ * The three codes that report a **bound** on the write path rather than a fault
+ * in the request: the write queue is full, or a quota has been reached.
+ */
+const CODE_WRITE_QUEUE_FULL = 'ACTIVITY_WRITE_QUEUE_FULL';
+const CODE_STUDENT_ACTIVITY_LIMIT_REACHED = 'STUDENT_ACTIVITY_LIMIT_REACHED';
+const CODE_REGISTRY_FULL = 'ACTIVITY_REGISTRY_FULL';
+
 const MESSAGE_MALFORMED_JSON = 'Request body is not valid JSON';
 const MESSAGE_INVALID_ACTIVITY = 'activity must be a string of 1 to 64 characters';
 const MESSAGE_PAYLOAD_TOO_LARGE = `Request body exceeds ${MAX_BODY_BYTES} bytes`;
 const MESSAGE_UNSUPPORTED_MEDIA_TYPE = `Content-Type must be ${JSON_MEDIA_TYPE}`;
 const MESSAGE_INTERNAL_ERROR = 'Could not persist the activity record';
+const MESSAGE_WRITE_QUEUE_FULL = 'Too many activity writes are in flight; retry shortly';
+const MESSAGE_REGISTRY_FULL = 'The activity registry has reached its configured capacity';
+
+/**
+ * The one bound sentence that interpolates a value - the normalized identifier,
+ * and deliberately not the configured ceiling, which is operator configuration
+ * a client can do nothing with.
+ *
+ * @param {string} studentId The normalized identifier.
+ * @returns {string} The `507 STUDENT_ACTIVITY_LIMIT_REACHED` sentence.
+ */
+const messageStudentActivityLimit = (studentId) =>
+  `Student ${studentId} has reached the maximum number of recorded activities`;
+
+/** `Retry-After` on the `503`, in seconds, as a header value. */
+const RETRY_AFTER_SECONDS = '1';
 
 /** `Allow` values: exact and ordered, because the order is part of the contract. */
 const ALLOW_ROOT = 'GET, HEAD';
 const ALLOW_ACTIVITIES = 'GET, HEAD';
 const ALLOW_STUDENT_ACTIVITIES = 'GET, HEAD, POST';
 
-/** Fatal-load discriminators raised by the modules under test. */
 const CODE_DIRECTORY_INVALID = 'STUDENT_DIRECTORY_INVALID';
 const CODE_REPOSITORY_INVALID = 'ACTIVITY_REPOSITORY_INVALID';
 const CODE_WORKBOOK_READ_FAILED = 'WORKBOOK_READ_FAILED';
@@ -246,16 +212,14 @@ const S003_ACTIVITY = 'Football Team';
 
 /**
  * An activity `S003` does not hold, used wherever a write must succeed. `S004`
- * holds `Music Club` in the workbook column, which is exactly why it works
- * here: record identity is the `(studentId, activityKey)` pair, so the same
- * activity name is free for every student who does not already hold it.
+ * holds it in the workbook column, which is no obstacle: record identity is the
+ * `(studentId, activityKey)` pair, so an activity name is free for every
+ * student who does not already hold it.
  */
 const NEW_ACTIVITY = 'Music Club';
 
-/** An activity absent from the workbook column, for the injected cases. */
 const UNUSED_ACTIVITY = 'Chess Club';
 
-/** The committed per-student answer for `S001`, with the registry empty. */
 const S001_PAYLOAD = {
   studentId: 'S001',
   name: S001_NAME,
@@ -264,9 +228,9 @@ const S001_PAYLOAD = {
 };
 
 /**
- * The complete committed roster: eight groups in `activityKey` ascending order,
- * ten records in total, with `Robotics Club` and `Debate Society` holding the
- * two multi-member groups the reverse lookup exists for.
+ * The committed roster: eight groups in `activityKey` ascending order over ten
+ * records, two of them holding more than one member - the case the reverse
+ * lookup exists for.
  */
 const FULL_ROSTER = [
   { activity: 'Coding Club', count: 1, studentIds: ['S005'] },
@@ -279,15 +243,14 @@ const FULL_ROSTER = [
   { activity: 'Robotics Club', count: 2, studentIds: ['S001', 'S009'] }
 ];
 
-/** Eight groups over ten records - both asserted, because both can drift. */
 const EXPECTED_GROUP_COUNT = 8;
 const EXPECTED_RECORD_COUNT = 10;
 
 /**
- * Directory columns the feature parses and then discards. Neither the names nor
- * the distinctive values of `S001`'s row may appear in any payload. Only
- * distinctive strings are listed: the `Age` value `20` is deliberately absent
- * because a bare numeral collides with unrelated digits and would flap.
+ * Directory columns the feature parses and then discards: neither these names
+ * nor the distinctive values of `S001`'s row may appear in any payload. Only
+ * distinctive strings are listed - the `Age` value `20` is left out because a
+ * bare numeral collides with unrelated digits and would flap.
  */
 const EXCLUDED_COLUMN_NAMES = [
   'Gender',
@@ -310,69 +273,84 @@ const EXCLUDED_VALUES = [
 
 /**
  * The suffix the atomic writer gives its scratch file: it writes
- * `<registry>.tmp` beside the target and renames that over the registry, and
- * removes it again when a write fails. The literal is `TEMPORARY_SUFFIX` in
- * `lib/activityRepository.js` and is duplicated here because the module does
- * not export it; test 22 reproduces that exact path, so the two MUST STAY IN
- * STEP - a rename there with no change here would leave test 22 asserting the
- * absence of a file production never creates.
+ * `<registry>.tmp` beside the target, renames that over the registry, and
+ * removes it again when a write fails. The literal is private to
+ * `lib/activityRepository.js`, so this duplicate MUST STAY IN STEP with it - a
+ * rename there alone would leave the write-failure case asserting the absence
+ * of a file production never creates.
  */
 const REGISTRY_TEMPORARY_SUFFIX = '.tmp';
+
+/**
+ * The mode the atomic writer creates that scratch file with: owner read and
+ * write, nothing else. It is `TEMPORARY_FILE_MODE` in
+ * `lib/activityRepository.js`, duplicated here for the same reason as the
+ * suffix - the module exports neither.
+ *
+ * A rename installs the scratch inode on the registry, so this is also the mode
+ * a **newly created** registry ends up with, while a registry that already
+ * exists keeps its own mode. Both are asserted by the failed-write test.
+ */
+const REGISTRY_TEMPORARY_FILE_MODE = 0o600;
+
+/** A mode a registry might plausibly carry, used to prove preservation. */
+const REGISTRY_PRESERVED_MODE = 0o640;
+
+/**
+ * Whether POSIX permission bits mean anything on this host.
+ *
+ * Windows does not derive access from mode bits: `fs.statSync().mode` reports
+ * `0o666` for any writable file however it was created, so a mode assertion
+ * there would test the platform rather than the writer. The exclusive-creation
+ * and no-follow assertions that matter most run everywhere; only the mode
+ * comparisons are gated.
+ */
+const MODE_BITS_ARE_MEANINGFUL = process.platform !== 'win32';
+
+/** The sentinel a decoy file holds, so a clobbering write is unmistakable. */
+const DECOY_CONTENTS = 'decoy: this file must never be written by a registry write\n';
 
 /**
  * Deadlines. Every wait in this file is bounded, because an unbounded one turns
  * a server regression - a response that is never ended, a `listen` that never
  * settles - into a test process that hangs instead of a failure naming what it
- * was waiting for. Both values are orders of magnitude above the real figures
- * on this host (a whole 33-test run is roughly 300 ms, and a load reads two
- * 6 KB workbooks), so neither can fire on a merely busy machine.
+ * was waiting for. Both sit far above anything these routes and loads need, so
+ * neither can fire on a merely busy machine.
  */
 const REQUEST_DEADLINE_MS = 10000;
+
+/**
+ * How long the saturation case waits for the write queue to report itself full.
+ * It is reached as soon as the blocked writer is entered, so this is a
+ * diagnosis deadline rather than a delay anything normally waits out.
+ */
+const SATURATION_DEADLINE_MS = 5000;
 const START_DEADLINE_MS = 15000;
 
-/* ---------------------------------------------------------------------------
- * Inline harness. No assertion appears below this line until the first test.
- * ------------------------------------------------------------------------- */
-
-/** Every listening server this file started, closed by the `after` hook. */
 const servers = [];
 
 /**
  * Set the moment the `after` hook begins draining `servers`. The array is
- * drained exactly once, so anything that arrives afterwards would never be
- * closed - a late bind has to close itself instead, and this flag is how it
- * knows to.
+ * drained exactly once, so a server arriving afterwards would never be closed:
+ * a late bind closes itself instead, and this flag is how it knows to.
  */
 let teardownStarted = false;
 
-/** Every temporary directory this file created, removed by the `after` hook. */
 const tempDirs = [];
 
 /**
- * The read-only server shared by the tests that never write. Built in `before`
- * because building it eleven times would read the workbooks eleven times for
- * data that cannot change under a running process.
+ * The read-only server shared by the tests that never write, built once in
+ * `before`: rebuilding it per test would re-read the workbooks for data that
+ * cannot change under a running process.
  */
 let sharedServer = null;
 
-/**
- * Creates a throwaway directory under the system temp root and remembers it for
- * cleanup. Nothing this file writes ever lands inside the checkout.
- *
- * @returns {string} The absolute path of the new directory.
- */
 const mkTemp = () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PREFIX));
   tempDirs.push(directory);
   return directory;
 };
 
-/**
- * Seeds an empty registry file in its own temporary directory, which is the
- * state `activities.json` ships in.
- *
- * @returns {string} The absolute path of the seeded registry file.
- */
 const seedRegistry = () => {
   const file = path.join(mkTemp(), REGISTRY_FILENAME);
   fs.writeFileSync(file, EMPTY_REGISTRY, 'utf8');
@@ -404,9 +382,8 @@ const withDeadline = (promise, milliseconds, description) => {
 };
 
 /**
- * Closes a listening server and resolves once it is closed. Idle keep-alive
- * sockets would otherwise hold `close()` open, and dropping them is what lets
- * the runner exit without `--test-force-exit`.
+ * Closes a listening server. Idle keep-alive sockets would hold `close()` open,
+ * so dropping them is what lets the runner exit without `--test-force-exit`.
  *
  * @param {import('node:http').Server} server A listening server.
  * @returns {Promise<void>} Resolves when the server has closed.
@@ -421,14 +398,12 @@ const closeServer = (server) => new Promise((resolve) => {
  * root and remembers it for cleanup.
  *
  * Ownership of a late bind is settled on the underlying promise, because the
- * deadline can fail this call while `listen` is still in flight. Three
- * outcomes, and none of them leaves a listening handle behind:
- *   - it resolves in time, and the server joins `servers` for the `after` hook;
- *   - it resolves after this call gave up, or after teardown has already
- *     drained `servers`, and closes itself - `unref()` first, so the handle
- *     cannot hold the event loop open for even the moment `close()` takes;
- *   - it rejects, and the same handler absorbs the rejection, which would
- *     otherwise surface as an unhandled rejection detached from any test.
+ * deadline can fail this call while `listen` is still in flight, and no outcome
+ * may leave a listening handle behind. A bind that lands in time joins
+ * `servers` for the `after` hook; one that lands after this call gave up, or
+ * after teardown drained `servers`, closes itself - `unref()` first, so it
+ * cannot hold the event loop open for the moment `close()` takes; a rejection
+ * is absorbed there rather than surfacing detached from any test.
  *
  * @param {object} options Overrides passed straight to `start`, typically an
  *   injected `directory` and `repository`.
@@ -469,17 +444,17 @@ const startServer = async (options) => {
  * `agent: false` opts out of the global agent's connection pooling, so no
  * keep-alive socket outlives the request and `server.close()` cannot stall.
  *
- * A request-side `'error'` is only fatal while no response has been seen: an
- * early rejection (`413`, `415`, `404` before the body is read) is answered
- * while the client may still be writing, which can surface as `ECONNRESET` or
- * `EPIPE` on the write side. Failing on that would replace the assertion the
- * test is actually making with an unrelated socket error.
+ * A request-side `'error'` is only fatal while no response has been seen: a
+ * request rejected before its body is read is answered while the client may
+ * still be writing, which surfaces as `ECONNRESET` or `EPIPE` on the write
+ * side, and failing on that would replace the assertion the test is making
+ * with an unrelated socket error.
  *
  * The wait is bounded by `REQUEST_DEADLINE_MS`. A handler that accepts the
  * connection and never ends its response - or ends the headers and never the
- * body - would otherwise stall this promise forever and take the whole test
- * process with it; the deadline destroys the socket and fails with the method
- * and path named, which is a diagnosis rather than a hang.
+ * body - would otherwise stall this promise and take the test process with it;
+ * the deadline destroys the socket and fails with the method and path named,
+ * which is a diagnosis rather than a hang.
  *
  * @param {import('node:http').Server} server A listening server.
  * @param {{method?: string, path: string, headers?: object, body?: string}} options
@@ -550,12 +525,6 @@ const request = (server, options) => new Promise((resolve, reject) => {
   else req.end(settings.body);
 });
 
-/**
- * Parses a response body as JSON.
- *
- * @param {{text: string}} res A resolved response.
- * @returns {unknown} The parsed body.
- */
 const json = (res) => JSON.parse(res.text);
 
 /**
@@ -609,15 +578,6 @@ const assertMediaType = (res, expected, label) => {
  */
 const errorBody = (code, message) => ({ error: { code, message } });
 
-/**
- * Issues a `POST` with an explicit body and media type.
- *
- * @param {import('node:http').Server} server A listening server.
- * @param {string} target The request path.
- * @param {string} body The raw request body.
- * @param {string} [contentType] The media type, `application/json` by default.
- * @returns {Promise<object>} The resolved response.
- */
 const postRaw = (server, target, body, contentType) => request(server, {
   method: METHOD_POST,
   path: target,
@@ -625,14 +585,6 @@ const postRaw = (server, target, body, contentType) => request(server, {
   body
 });
 
-/**
- * Issues a `POST` whose body is the JSON serialization of `payload`.
- *
- * @param {import('node:http').Server} server A listening server.
- * @param {string} target The request path.
- * @param {unknown} payload The value to serialize as the body.
- * @returns {Promise<object>} The resolved response.
- */
 const postJson = (server, target, payload) => postRaw(server, target, JSON.stringify(payload));
 
 /**
@@ -653,24 +605,52 @@ const realDeps = (registryPath) => {
 };
 
 /**
- * Seeds a registry, wires the real dependencies to it and starts a server -
- * the setup every write test needs in its own isolation.
- *
- * @returns {Promise<{server: object, registryPath: string}>} The server and the
- *   registry file it will rewrite.
+ * Seeds a registry, wires the real dependencies to it and starts a server. The
+ * dependency pair comes back alongside the server because the repository is
+ * also called directly by the tests that prove its own validation: route checks
+ * run first, so a repository-side check could be deleted without a single route
+ * test noticing.
  */
 const startWritableServer = async () => {
   const registryPath = seedRegistry();
-  const server = await startServer(realDeps(registryPath));
-  return { server, registryPath };
+  const deps = realDeps(registryPath);
+  const server = await startServer(deps);
+  return { server, registryPath, directory: deps.directory, repository: deps.repository };
 };
 
 /**
- * Sorts an object's own keys, which is how a payload's exact key set is pinned.
+ * Creates `linkPath` as a symbolic link to `targetPath`, reporting whether the
+ * host allowed it.
  *
- * @param {object} value Any object.
- * @returns {string[]} Its own enumerable keys, sorted.
+ * Symbolic-link creation is privileged on Windows unless the account holds
+ * `SeCreateSymbolicLinkPrivilege` or Developer Mode is on, so it cannot be a
+ * precondition of a test that has to run everywhere. The failed-write test adds
+ * the link case where the host permits it and falls back to a plain file, which
+ * proves the same exclusive-creation refusal without the privilege.
+ *
+ * @param {string} targetPath What the link should point at.
+ * @param {string} linkPath Where the link should be created.
+ * @returns {boolean} `true` when the link now exists.
  */
+const trySymlink = (targetPath, linkPath) => {
+  try {
+    fs.symlinkSync(targetPath, linkPath, 'file');
+    return true;
+  } catch {
+    // An unprivileged Windows account raises EPERM here. The caller keeps its
+    // plain-file case, so the refusal is still asserted.
+    return false;
+  }
+};
+
+/**
+ * The permission bits of a path, as a three-digit octal string.
+ *
+ * @param {string} entryPath An existing file.
+ * @returns {string} For example `'600'`.
+ */
+const modeOf = (entryPath) => (fs.statSync(entryPath).mode & 0o777).toString(8);
+
 const sortedKeys = (value) => Object.keys(value).sort();
 
 before(async () => {
@@ -686,26 +666,25 @@ after(async () => {
   }
   while (tempDirs.length > 0) {
     const directory = tempDirs.pop();
-    // Retries cover a Windows handle that has not been released yet. A survivor
-    // here fails `test/workbooks.test.js`, which is the intended alarm.
+    // Retries cover a Windows handle not yet released. A directory that
+    // survives this removal fails the fixture suite's leftover check, which is
+    // the intended alarm.
     fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 1-11: the read paths, served from the committed workbooks.
+ * The read paths, served from the committed workbooks.
  * ------------------------------------------------------------------------- */
 
-test('1 activity lookup for a known Student ID returns the workbook record', async () => {
+test('activity lookup for a known Student ID returns the workbook record', async () => {
   const res = await request(sharedServer, { path: S001_PATH });
   assert.equal(res.status, STATUS_OK, `GET ${S001_PATH} must succeed; body was ${res.text}`);
   assertMediaType(res, JSON_MEDIA_TYPE, `GET ${S001_PATH}`);
-  // deepEqual pins the exact key set as well as the values: an extra key in the
-  // payload fails here, which is what keeps a discarded directory column out.
   assert.deepEqual(json(res), S001_PAYLOAD);
 });
 
-test('2 the Student ID path segment is trimmed and case-folded before lookup', async () => {
+test('the Student ID path segment is trimmed and case-folded before lookup', async () => {
   const cases = [
     ['lowercase', '/api/students/s001/activities'],
     ['surrounding encoded spaces', '/api/students/%20S001%20/activities']
@@ -718,7 +697,7 @@ test('2 the Student ID path segment is trimmed and case-folded before lookup', a
   }
 });
 
-test('3 a malformed Student ID is rejected with the exact 400 envelope', async () => {
+test('a malformed Student ID is rejected with the exact 400 envelope', async () => {
   const expected = errorBody(
     CODE_INVALID_STUDENT_ID,
     'Student ID must match S followed by three digits: XYZ'
@@ -734,9 +713,9 @@ test('3 a malformed Student ID is rejected with the exact 400 envelope', async (
   // a deepEqual on the parsed body cannot see.
   assert.equal(res.text, JSON.stringify(expected));
 
-  // The 64-character cap belongs to an identifier `<value>` and to nothing
-  // else: a `<path>` is rendered in full (test 26). An overlong segment is
-  // sliced at exactly 64 characters, with no ellipsis and no other marker.
+  // The 64-character cap belongs to an identifier value and to nothing else: a
+  // path is rendered in full. An overlong segment is sliced at exactly 64
+  // characters, with no ellipsis and no other marker.
   const overlong = 'X'.repeat(80);
   const capped = await request(sharedServer, { path: `/api/students/${overlong}/activities` });
   assert.equal(
@@ -754,18 +733,18 @@ test('3 a malformed Student ID is rejected with the exact 400 envelope', async (
   );
 });
 
-test('4 a well-formed but unknown Student ID is a 404, not a 400', async () => {
+test('a well-formed but unknown Student ID is a 404, not a 400', async () => {
   const expected = errorBody(CODE_STUDENT_NOT_FOUND, 'No student with Student ID S999');
   const res = await request(sharedServer, { path: S999_PATH });
   assert.equal(res.status, STATUS_NOT_FOUND, `an unknown ID must be a 404; body was ${res.text}`);
   assert.deepEqual(json(res), expected);
   assert.equal(res.text, JSON.stringify(expected));
 
-  // Both identifier failures render `<value>` as the RAW, still-encoded segment
-  // as received - never the decoded form and never the normalized one (AAP
-  // 0.6.2). So a lowercase unknown identifier echoes the lowercase spelling it
-  // was sent as, even though the lookup itself used the normalized `S999`. The
-  // normalized identifier appears in one message only, the 409 of test 15.
+  // Both identifier failures render the offending value as the RAW,
+  // still-encoded segment as received - never the decoded form and never the
+  // normalized one. So a lowercase unknown identifier echoes the lowercase
+  // spelling it was sent as, even though the lookup used the normalized `S999`.
+  // The normalized identifier appears in the duplicate-conflict message alone.
   const lowercase = await request(sharedServer, { path: '/api/students/s999/activities' });
   assert.equal(
     lowercase.status,
@@ -779,9 +758,9 @@ test('4 a well-formed but unknown Student ID is a 404, not a 400', async () => {
   );
 
   // A raw segment can be far longer than the identifier it normalizes to, which
-  // is where the 64-character cap on an identifier `<value>` bites on this
-  // message too: 22 whitespace escapes and `S999` is 70 raw characters that
-  // trim to a well-formed, unknown `S999`.
+  // is where the 64-character cap on an identifier value bites on this message
+  // too: 22 whitespace escapes and `S999` is 70 raw characters that trim to a
+  // well-formed, unknown `S999`.
   const padded = `${'%20'.repeat(22)}S999`;
   const cappedUnknown = await request(sharedServer, {
     path: `/api/students/${padded}/activities`
@@ -798,12 +777,12 @@ test('4 a well-formed but unknown Student ID is a 404, not a 400', async () => {
   );
 });
 
-test('5 path-encoding hazards are rejected without decoding twice', async () => {
-  // `S%2530%2530%2531` decodes ONCE to `S%30%30%31`; decoding that again would
-  // yield `S001` and accept an identifier the caller never sent. Decoding
-  // happens exactly once at the boundary in `server.js`, which is the bug this
-  // case exists to prevent. `S%ZZ1` makes `decodeURIComponent` throw
-  // `URIError`, and `S001%2Fx` decodes to the literal `S001/x`.
+test('path-encoding hazards are rejected without decoding twice', async () => {
+  // `S%2530%2530%2531` decodes ONCE to `S%30%30%31`; a second decode would
+  // yield `S001` and accept an identifier the caller never sent, which is why
+  // decoding happens exactly once at the boundary in `server.js`. `S%ZZ1` makes
+  // `decodeURIComponent` throw `URIError`, and `S001%2Fx` decodes to the
+  // literal `S001/x`.
   const rawSegments = ['S%ZZ1', 'S%2530%2530%2531', 'S001%2Fx'];
   for (const rawSegment of rawSegments) {
     const target = `/api/students/${rawSegment}/activities`;
@@ -827,7 +806,7 @@ test('5 path-encoding hazards are rejected without decoding twice', async () => 
   }
 });
 
-test('6 a student whose activity cell is blank holds zero activities, not a 404', async () => {
+test('a student whose activity cell is blank holds zero activities, not a 404', async () => {
   // No committed student has a blank activity cell, so this case is reachable
   // only through the injected-row seams - never by adding a binary fixture.
   const directory = studentDirectory.fromRows([
@@ -855,13 +834,12 @@ test('6 a student whose activity cell is blank holds zero activities, not a 404'
   });
 });
 
-test('7 the full roster is the eight committed groups over ten records', async () => {
+test('the full roster is the eight committed groups over ten records', async () => {
   const res = await request(sharedServer, { path: ACTIVITIES_PATH });
   assert.equal(res.status, STATUS_OK, `GET ${ACTIVITIES_PATH} must succeed; body was ${res.text}`);
   assertMediaType(res, JSON_MEDIA_TYPE, `GET ${ACTIVITIES_PATH}`);
   const body = json(res);
   assert.deepEqual(body, { count: EXPECTED_GROUP_COUNT, activities: FULL_ROSTER });
-  // `count` is the number of groups, so it always equals `activities.length`.
   assert.equal(body.count, body.activities.length, 'count must equal activities.length');
   assert.equal(body.count, EXPECTED_GROUP_COUNT, 'the committed data yields eight groups');
   const members = body.activities.reduce((total, group) => total + group.count, 0);
@@ -870,7 +848,7 @@ test('7 the full roster is the eight committed groups over ten records', async (
   assert.equal(listed, EXPECTED_RECORD_COUNT, 'the listed Student IDs must sum to ten records');
 });
 
-test('8 the activity filter matches trimmed and case-insensitively', async () => {
+test('the activity filter matches trimmed and case-insensitively', async () => {
   const res = await request(sharedServer, { path: `${ACTIVITIES_PATH}?activity=debate%20society` });
   assert.equal(res.status, STATUS_OK, `the filter must succeed; body was ${res.text}`);
   assert.deepEqual(json(res), {
@@ -881,13 +859,13 @@ test('8 the activity filter matches trimmed and case-insensitively', async () =>
   });
 });
 
-test('9 a filter that matches nothing is an empty 200, not an error', async () => {
+test('a filter that matches nothing is an empty 200, not an error', async () => {
   const res = await request(sharedServer, { path: `${ACTIVITIES_PATH}?activity=Chess%20Club` });
   assert.equal(res.status, STATUS_OK, `an unmatched filter must be a 200; body was ${res.text}`);
   assert.deepEqual(json(res), { count: 0, activities: [] });
 });
 
-test('10 grouping folds case and labels the group with the workbook spelling', async () => {
+test('grouping folds case and labels the group with the workbook spelling', async () => {
   const directory = studentDirectory.fromRows([
     DIRECTORY_HEADER_ROW,
     { A: 'S001', B: S001_NAME },
@@ -910,9 +888,7 @@ test('10 grouping folds case and labels the group with the workbook spelling', a
   });
 });
 
-test('11 HEAD answers every GET route with the GET headers and no body bytes', async () => {
-  // Each route with the media type it promises: the root keeps the baseline's
-  // plain text, the two API routes are JSON.
+test('HEAD answers every GET route with the GET headers and no body bytes', async () => {
   const targets = [
     [ROOT_PATH, TEXT_MEDIA_TYPE],
     [S001_PATH, JSON_MEDIA_TYPE],
@@ -932,9 +908,8 @@ test('11 HEAD answers every GET route with the GET headers and no body bytes', a
     // The GET must advertise the body it actually sent - an omitted or misstated
     // `Content-Length` on the GET is a contract breach on its own - and only
     // then is HEAD-to-GET equality meaningful. Comparing the HEAD header
-    // straight to the GET's byte count, as an earlier form of this test did,
-    // passes an implementation that special-cases HEAD and leaves the GET header
-    // wrong or missing.
+    // straight to the GET's byte count passes an implementation that
+    // special-cases HEAD and leaves the GET header wrong or missing.
     assert.equal(
       get.headers['content-length'],
       String(get.bytes),
@@ -948,9 +923,6 @@ test('11 HEAD answers every GET route with the GET headers and no body bytes', a
     );
     assert.equal(head.bytes, 0, `HEAD ${target}: not one body byte may be written`);
   }
-  // The root's declared length is the preserved greeting's, to the byte, on both
-  // methods - the one length in this file that is a fixed number rather than a
-  // measurement, because the greeting is a byte-for-byte guarantee.
   const rootGet = await request(sharedServer, { path: ROOT_PATH });
   const rootHead = await request(sharedServer, { method: METHOD_HEAD, path: ROOT_PATH });
   assert.equal(
@@ -968,11 +940,11 @@ test('11 HEAD answers every GET route with the GET headers and no body bytes', a
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 12-24: the write path. Each test owns its registry file, so no test
- * depends on another's writes and every file-byte assertion is deterministic.
+ * The write path. Each test owns its registry file, so no test depends on
+ * another's writes and every file-byte assertion is deterministic.
  * ------------------------------------------------------------------------- */
 
-test('12 a POST records a second activity and stores exactly two fields', async () => {
+test('a POST records a second activity and stores exactly two fields', async () => {
   const { server, registryPath } = await startWritableServer();
   const created = await postJson(server, S003_PATH, { activity: NEW_ACTIVITY });
   assert.equal(created.status, STATUS_CREATED, `the POST must be a 201; body was ${created.text}`);
@@ -1010,8 +982,8 @@ test('12 a POST records a second activity and stores exactly two fields', async 
   );
 });
 
-test('13 a POST for an unknown student is refused and writes nothing', async () => {
-  const { server, registryPath } = await startWritableServer();
+test('a POST for an unknown student is refused and writes nothing', async () => {
+  const { server, registryPath, repository } = await startWritableServer();
   const before = fs.readFileSync(registryPath);
   const res = await postJson(server, S999_PATH, { activity: NEW_ACTIVITY });
   assert.equal(
@@ -1027,10 +999,42 @@ test('13 a POST for an unknown student is refused and writes nothing', async () 
     fs.readFileSync(registryPath).equals(before),
     'the registry file must be byte-unchanged after a refused write'
   );
+
+  // The same refusal asserted where it is actually implemented. The route
+  // resolves the identifier before it ever calls the repository, so every
+  // assertion above would still pass with the repository's own identifier checks
+  // deleted - which is precisely the regression this defence-in-depth block
+  // catches (CWE-602). `addActivity` never throws synchronously, so each case is
+  // a rejection with a stable `code`.
+  const identifierCases = [
+    ['a malformed identifier', 'XYZ', CODE_INVALID_STUDENT_ID],
+    ['a partial identifier', 'S1', CODE_INVALID_STUDENT_ID],
+    ['an encoded slash that survived decoding', 'S001/x', CODE_INVALID_STUDENT_ID],
+    ['a non-string identifier', 42, CODE_INVALID_STUDENT_ID],
+    ['a null identifier', null, CODE_INVALID_STUDENT_ID],
+    ['an object identifier', {}, CODE_INVALID_STUDENT_ID],
+    // Well-formed and unknown stays distinguishable from malformed, in the
+    // repository exactly as in the route.
+    ['a well-formed unknown identifier', 'S999', CODE_STUDENT_NOT_FOUND]
+  ];
+  for (const [label, id, expected] of identifierCases) {
+    await assert.rejects(
+      () => repository.addActivity(id, NEW_ACTIVITY),
+      (error) => {
+        assert.equal(error.code, expected, `${label}: wrong discriminator`);
+        return true;
+      },
+      `${label}: the repository must refuse it on its own, not rely on the route`
+    );
+  }
+  assert.ok(
+    fs.readFileSync(registryPath).equals(before),
+    'no direct call with an unusable identifier may reach the registry file'
+  );
 });
 
-test('14 every invalid activity form is refused with one fixed sentence', async () => {
-  const { server, registryPath } = await startWritableServer();
+test('every invalid activity form is refused with one fixed sentence', async () => {
+  const { server, registryPath, repository } = await startWritableServer();
   const before = fs.readFileSync(registryPath);
   // The contract states the requirement rather than echoing the offending
   // value, so a wrong-typed value never appears in the message.
@@ -1056,9 +1060,42 @@ test('14 every invalid activity form is refused with one fixed sentence', async 
     fs.readFileSync(registryPath).equals(before),
     'no invalid activity form may leave a trace in the registry file'
   );
+
+  // The same forms handed straight to the repository. `lib/activityRoutes.js`
+  // validates `activity` before calling here, so the table above proves the
+  // route's copy of the rule and nothing about the repository's - and the write
+  // path must never be able to store a value the read path would refuse to load
+  // (CWE-602).
+  const directCases = [
+    ['undefined', undefined],
+    ['an empty string', ''],
+    ['a whitespace-only string', '   '],
+    ['a number', 42],
+    ['null', null],
+    ['an object', {}],
+    ['an array', ['Chess Club']],
+    ['65 characters', OVERLONG_ACTIVITY],
+    // 64 characters of whitespace padding around a blank name still trims to
+    // nothing, which is the case a length-only check would let through.
+    ['whitespace around nothing', '\t\n  ']
+  ];
+  for (const [label, activity] of directCases) {
+    await assert.rejects(
+      () => repository.addActivity('S003', activity),
+      (error) => {
+        assert.equal(error.code, CODE_INVALID_ACTIVITY, `${label}: wrong discriminator`);
+        return true;
+      },
+      `${label}: the repository must refuse it on its own, not rely on the route`
+    );
+  }
+  assert.ok(
+    fs.readFileSync(registryPath).equals(before),
+    'no direct call with an invalid activity may reach the registry file'
+  );
 });
 
-test('15 posting the activity the workbook already records is a 409', async () => {
+test('posting the activity the workbook already records is a 409', async () => {
   const { server, registryPath } = await startWritableServer();
   const before = fs.readFileSync(registryPath);
   const res = await postJson(server, S003_PATH, { activity: S003_ACTIVITY });
@@ -1076,7 +1113,7 @@ test('15 posting the activity the workbook already records is a 409', async () =
   );
 });
 
-test('16 a duplicate of a registry activity is caught with the case folded', async () => {
+test('a duplicate of a registry activity is caught with the case folded', async () => {
   const { server, registryPath } = await startWritableServer();
   const first = await postJson(server, S003_PATH, { activity: NEW_ACTIVITY });
   assert.equal(
@@ -1103,14 +1140,14 @@ test('16 a duplicate of a registry activity is caught with the case folded', asy
   assert.deepEqual(stored, [{ studentId: 'S003', activity: NEW_ACTIVITY }]);
 });
 
-test('17 an unparseable body is a 400 MALFORMED_JSON', async () => {
+test('an unparseable body is a 400 MALFORMED_JSON', async () => {
   const { server } = await startWritableServer();
   const res = await postRaw(server, S003_PATH, '{');
   assert.equal(res.status, STATUS_BAD_REQUEST, `a bad body must be a 400; body was ${res.text}`);
   assert.deepEqual(json(res), errorBody(CODE_MALFORMED_JSON, MESSAGE_MALFORMED_JSON));
 });
 
-test('18 any key other than activity is refused and named', async () => {
+test('any key other than activity is refused and named', async () => {
   const { server, registryPath } = await startWritableServer();
   const before = fs.readFileSync(registryPath);
   // One offending key per case, placed first in the body's own key order, so the
@@ -1139,7 +1176,7 @@ test('18 any key other than activity is refused and named', async () => {
   );
 });
 
-test('19 Content-Type is matched on the media type alone', async () => {
+test('Content-Type is matched on the media type alone', async () => {
   const { server } = await startWritableServer();
   const body = JSON.stringify({ activity: NEW_ACTIVITY });
   const refused = await postRaw(server, S003_PATH, body, TEXT_MEDIA_TYPE);
@@ -1168,13 +1205,13 @@ test('19 Content-Type is matched on the media type alone', async () => {
 });
 
 /* ---------------------------------------------------------------------------
- * Synthetic dispatch - read by tests 20, 21, 25 and 26.
+ * Synthetic dispatch.
  *
- * AAP 0.6.2 requires a request answered before its body is read to be answered
- * and its stream **destroyed**, never read to the end. Over a socket the two
- * behaviours look alike: both deliver the response and both close the
- * connection, and the byte counts that do separate them sit on the server's
- * own socket rather than in the response. So those four tests drive the shipped
+ * A request answered before its body is read must be answered and its stream
+ * **destroyed**, never read to the end. Over a socket the two behaviours look
+ * alike: both deliver the response and both close the connection, and the byte
+ * counts that do separate them sit on the server's own socket rather than in
+ * the response. The tests that assert the abandon therefore drive the shipped
  * handler through the server's own `'request'` event with a synthetic request
  * and response, which makes "paused, then destroyed, and never resumed"
  * directly observable and free of timing. The doubles implement only the
@@ -1183,7 +1220,7 @@ test('19 Content-Type is matched on the media type alone', async () => {
 
 /**
  * The smallest emitter those handlers need: `on`, `once`, `emit`, and the
- * listener count test 21 reads to prove no body consumer was ever attached.
+ * listener count that proves no body consumer was ever attached.
  *
  * @returns {object} The emitter.
  */
@@ -1305,7 +1342,8 @@ const dispatchSynthetic = (server, method, target, headers) => {
 };
 
 /**
- * Waits out the response's `'finish'` tick and the deferred destroy after it.
+ * Waits out the response's `'finish'` tick and the destroy deferred behind it,
+ * which is why this is several turns of the event loop rather than one.
  *
  * @returns {Promise<void>} Resolved once the exchange has settled.
  */
@@ -1313,7 +1351,7 @@ const settleSynthetic = () => new Promise((resolve) => {
   setImmediate(() => setImmediate(() => setImmediate(resolve)));
 });
 
-test('20 a body over 8 KiB is refused with the size named', async () => {
+test('a body over 8 KiB is refused with the size named', async () => {
   const { server, registryPath } = await startWritableServer();
   const before = fs.readFileSync(registryPath);
   // Sent in a single `req.end()`. The server answers and then abandons the
@@ -1338,7 +1376,7 @@ test('20 a body over 8 KiB is refused with the size named', async () => {
 
   // The cap is only half the requirement. The other half is that the rest of
   // the upload is never read: the stream is paused and destroyed once the
-  // response has left, never resumed into a drain (AAP 0.6.2).
+  // response has left, never resumed into a drain.
   const refused = dispatchSynthetic(server, METHOD_POST, S003_PATH, {
     'Content-Type': JSON_MEDIA_TYPE
   });
@@ -1366,12 +1404,12 @@ test('20 a body over 8 KiB is refused with the size named', async () => {
   );
 });
 
-test('21 the Student ID is resolved before the body is read at all', async () => {
+test('the Student ID is resolved before the body is read at all', async () => {
   const { server } = await startWritableServer();
   // Unknown student, oversize body, unparseable body: the fixed order is path,
   // method, ID shape, ID existence, media type, size, parse, unexpected keys,
   // activity, duplicate, persistence - so this is a 404, not a 413 and not a
-  // 400. This is the one test that pins that order.
+  // 400.
   const res = await postRaw(server, S999_PATH, `{${'z'.repeat(OVERSIZE_BODY_BYTES)}`);
   assert.equal(
     res.status,
@@ -1390,8 +1428,8 @@ test('21 the Student ID is resolved before the body is read at all', async () =>
 
   // "Before the body is read at all" is literal, and this is what proves it:
   // the route attaches no `'data'` consumer before answering, and then abandons
-  // the stream - paused, then destroyed - instead of draining the 9000 bytes
-  // the client declared (AAP 0.6.2).
+  // the stream - paused, then destroyed - instead of draining the bytes the
+  // client declared.
   const unread = dispatchSynthetic(server, METHOD_POST, S999_PATH, {
     'Content-Type': JSON_MEDIA_TYPE
   });
@@ -1414,7 +1452,7 @@ test('21 the Student ID is resolved before the body is read at all', async () =>
   );
 });
 
-test('22 a failed write is a 500 that leaks nothing and leaves no artifact', async () => {
+test('a failed write is a 500 that leaks nothing and leaves no artifact', async () => {
   const registryDir = mkTemp();
   const registryPath = path.join(registryDir, REGISTRY_FILENAME);
   fs.writeFileSync(registryPath, EMPTY_REGISTRY, 'utf8');
@@ -1523,6 +1561,65 @@ test('22 a failed write is a 500 that leaks nothing and leaves no artifact', asy
     `CR, LF and ESC must appear escaped; got ${JSON.stringify(diagnostic)}`
   );
 
+  // The same sink, attacked the other way. A bidirectional control is not a
+  // control character and not whitespace, so nothing about "one line" or
+  // "no C0 byte" catches it: U+202E (right-to-left override) and U+2066 (isolate)
+  // reorder the text that FOLLOWS them, and U+200F/U+061C nudge it, so an
+  // activity name of 1-64 characters - valid by contract - can make this
+  // diagnostic read in a terminal or log viewer as a sentence it does not
+  // contain. Each one must therefore arrive as its visible escape instead
+  // (CWE-117), which is exactly what a caller-supplied value reaching an
+  // operator's evidence requires.
+  const bidiActivity = 'Chess\u202eClub\u2066Team\u200f\u061c';
+  const bidiControlPattern = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+  const bidiCaptured = [];
+  const bidiOriginalWrite = process.stderr.write;
+  process.stderr.write = (chunk, encoding, callback) => {
+    bidiCaptured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    if (typeof encoding === 'function') encoding();
+    else if (typeof callback === 'function') callback();
+    return true;
+  };
+  let bidiResponse = null;
+  try {
+    bidiResponse = await postJson(server, S001_PATH, { activity: bidiActivity });
+  } finally {
+    process.stderr.write = bidiOriginalWrite;
+  }
+  assert.equal(
+    bidiResponse.status,
+    STATUS_INTERNAL_ERROR,
+    `the injected writer must fail this write too; body was ${bidiResponse.text}`
+  );
+  assert.deepEqual(
+    json(bidiResponse),
+    errorBody(CODE_INTERNAL_ERROR, MESSAGE_INTERNAL_ERROR),
+    'escaping the bidi controls must leave the fixed 500 envelope untouched'
+  );
+  const bidiDiagnostic = bidiCaptured.join('');
+  assert.equal(
+    bidiDiagnostic.split('\n').filter((line) => line !== '').length,
+    1,
+    `the diagnostic must occupy exactly one line; got ${JSON.stringify(bidiDiagnostic)}`
+  );
+  assert.equal(
+    bidiControlPattern.test(bidiDiagnostic),
+    false,
+    'no bidirectional control may survive into the record; got '
+      + `${JSON.stringify(bidiDiagnostic)}`
+  );
+  for (const escaped of ['\\u202e', '\\u2066', '\\u200f', '\\u061c']) {
+    assert.ok(
+      bidiDiagnostic.includes(escaped),
+      `${escaped} must appear escaped in the record; got ${JSON.stringify(bidiDiagnostic)}`
+    );
+  }
+  // Neutralized, not discarded: the operator still sees which activity failed.
+  assert.ok(
+    bidiDiagnostic.includes('Chess') && bidiDiagnostic.includes('Club'),
+    `the readable part of the activity must survive; got ${JSON.stringify(bidiDiagnostic)}`
+  );
+
   const read = await request(server, { path: S001_PATH });
   assert.deepEqual(
     json(read).activities,
@@ -1544,16 +1641,405 @@ test('22 a failed write is a 500 that leaks nothing and leaves no artifact', asy
     [],
     `a failed write must discard its temporary file; found ${leftovers.join(', ')}`
   );
-  // The registry itself is still the empty array it was seeded with: the failed
-  // write must not have renamed anything over it.
   assert.equal(
     fs.readFileSync(registryPath, 'utf8'),
     EMPTY_REGISTRY,
     'a failed write must leave the registry file exactly as it was'
   );
+
+  /* ---- The production writer, against an occupied scratch path -----------
+   * Everything above substitutes the writer. What follows exercises the real
+   * one, because the scratch path is where a write can be turned against the
+   * filesystem: `<registry>.tmp` is predictable, and the registry's own
+   * directory has to be writable for any write to work at all. A scratch entry
+   * that already exists was therefore not created by this service, and the
+   * writer must neither write THROUGH it - a symbolic link would carry the
+   * registry's contents into the file it points at, truncating it (CWE-59) -
+   * nor delete it, which would act on a path it has just refused to trust and
+   * destroy the evidence of whatever put it there.
+   */
+  const guardedDir = mkTemp();
+  const guardedRegistry = path.join(guardedDir, REGISTRY_FILENAME);
+  fs.writeFileSync(guardedRegistry, EMPTY_REGISTRY, 'utf8');
+  if (MODE_BITS_ARE_MEANINGFUL) fs.chmodSync(guardedRegistry, REGISTRY_PRESERVED_MODE);
+  const decoyPath = path.join(guardedDir, 'decoy.txt');
+  fs.writeFileSync(decoyPath, DECOY_CONTENTS, 'utf8');
+  const occupiedPath = `${guardedRegistry}${REGISTRY_TEMPORARY_SUFFIX}`;
+  // A link is the case that matters; a plain file with the same sentinel proves
+  // the same exclusive-creation refusal on a host that will not grant the
+  // privilege, so the assertions below hold either way.
+  const linked = trySymlink(decoyPath, occupiedPath);
+  if (!linked) fs.writeFileSync(occupiedPath, DECOY_CONTENTS, 'utf8');
+
+  const guardedServer = await startServer(realDeps(guardedRegistry));
+  const refusedDiagnostic = [];
+  const guardedWrite = process.stderr.write;
+  process.stderr.write = (chunk, encoding, callback) => {
+    refusedDiagnostic.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    if (typeof encoding === 'function') encoding();
+    else if (typeof callback === 'function') callback();
+    return true;
+  };
+  let refused = null;
+  try {
+    refused = await postJson(guardedServer, S003_PATH, { activity: NEW_ACTIVITY });
+  } finally {
+    process.stderr.write = guardedWrite;
+  }
+  assert.equal(
+    refused.status,
+    STATUS_INTERNAL_ERROR,
+    `an occupied scratch path must fail the write, not silently reuse it; body was ${refused.text}`
+  );
+  assert.deepEqual(
+    json(refused),
+    errorBody(CODE_INTERNAL_ERROR, MESSAGE_INTERNAL_ERROR),
+    'the refusal must carry the same fixed 500 envelope as any other write failure'
+  );
+  assert.equal(
+    refused.text.includes(occupiedPath),
+    false,
+    'the 500 body must not name a filesystem path'
+  );
+  // The operator does get the path - on stderr, where the diagnostic belongs.
+  const refusalLog = refusedDiagnostic.join('');
+  assert.ok(
+    refusalLog.includes(occupiedPath),
+    `the refusal must be reported on stderr naming ${occupiedPath}; got ${JSON.stringify(refusalLog)}`
+  );
+  // The heart of it: the file the entry pointed at is untouched.
+  assert.equal(
+    fs.readFileSync(decoyPath, 'utf8'),
+    DECOY_CONTENTS,
+    'a registry write must never reach a file the scratch entry points at'
+  );
+  // And the entry itself is still exactly what the test put there. Presence
+  // first, so a cleanup that deleted it reads as a sentence rather than as an
+  // `ENOENT` from the `lstat` below.
+  assert.equal(
+    fs.existsSync(occupiedPath),
+    true,
+    `the pre-existing scratch entry ${occupiedPath} must be left in place, not removed ` +
+      'by a cleanup that cannot know what it is'
+  );
+  const occupiedStats = fs.lstatSync(occupiedPath);
+  assert.equal(
+    linked ? occupiedStats.isSymbolicLink() : occupiedStats.isFile(),
+    true,
+    'the pre-existing scratch entry must be left as it was found, not replaced'
+  );
+  if (!linked) {
+    assert.equal(
+      fs.readFileSync(occupiedPath, 'utf8'),
+      DECOY_CONTENTS,
+      'a pre-existing scratch file must be neither truncated nor rewritten'
+    );
+  }
+  assert.equal(
+    fs.readFileSync(guardedRegistry, 'utf8'),
+    EMPTY_REGISTRY,
+    'nothing may be renamed over the registry when the scratch path was refused'
+  );
+  const refusedRead = await request(guardedServer, { path: S003_PATH });
+  assert.deepEqual(
+    json(refusedRead).activities,
+    [{ activity: S003_ACTIVITY, source: 'workbook' }],
+    'the index must be untouched when the scratch path was refused'
+  );
+
+  /* ---- The production writer, once the path is free ----------------------
+   * The refusal must be a refusal and not a breakage: with the entry removed by
+   * hand - the remedy the stderr diagnostic asks for - the next write lands,
+   * leaves no scratch file behind, and keeps the permissions the operator gave
+   * the registry rather than substituting whatever the process umask produces
+   * (CWE-732).
+   */
+  fs.unlinkSync(occupiedPath);
+  const modeBeforeWrite = modeOf(guardedRegistry);
+  const accepted = await postJson(guardedServer, S003_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    accepted.status,
+    STATUS_CREATED,
+    `the write must succeed once the scratch path is free; body was ${accepted.text}`
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(guardedRegistry, 'utf8')),
+    [{ studentId: 'S003', activity: NEW_ACTIVITY }],
+    'the record must reach the registry through the real atomic writer'
+  );
+  assert.equal(
+    fs.existsSync(occupiedPath),
+    false,
+    'a successful write must leave no scratch file beside the registry'
+  );
+  // Asserted on every platform: whatever the registry's permissions were, the
+  // rename must leave them alone rather than substituting the scratch file's.
+  assert.equal(
+    modeOf(guardedRegistry),
+    modeBeforeWrite,
+    'a rename must not change the permissions the registry already had'
+  );
+  // And the exact value, where the platform derives access from mode bits at
+  // all. Windows reports 0o666 for any writable file however it was created, so
+  // comparing a number there would test the platform and not the writer.
+  if (MODE_BITS_ARE_MEANINGFUL) {
+    assert.equal(
+      modeOf(guardedRegistry),
+      REGISTRY_PRESERVED_MODE.toString(8),
+      'the operator-set 0o640 must survive the write, not become the umask default'
+    );
+  }
+
+  // A registry that does not exist yet has no permissions to inherit, so the
+  // file the writer creates must be readable by its owner alone - never the
+  // 0o666-minus-umask Node would default to. Driven through the repository
+  // directly: `fromData` reads nothing, so an absent registry needs no server
+  // and produces no missing-file warning.
+  const freshRegistry = path.join(mkTemp(), REGISTRY_FILENAME);
+  const freshRepository = activityRepository.fromData({
+    directory: studentDirectory.fromRows([DIRECTORY_HEADER_ROW, { A: 'S001', B: S001_NAME }]),
+    activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
+    registryRecords: [],
+    activitiesDataPath: freshRegistry
+  });
+  const createdRecord = await freshRepository.addActivity('S001', UNUSED_ACTIVITY);
+  assert.deepEqual(
+    createdRecord,
+    { studentId: 'S001', activity: UNUSED_ACTIVITY, source: 'registry' },
+    'the default writer must create a registry that was not there before'
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(freshRegistry, 'utf8')),
+    [{ studentId: 'S001', activity: UNUSED_ACTIVITY }]
+  );
+  assert.equal(
+    fs.existsSync(`${freshRegistry}${REGISTRY_TEMPORARY_SUFFIX}`),
+    false,
+    'the scratch file must be gone once it has been renamed'
+  );
+  if (MODE_BITS_ARE_MEANINGFUL) {
+    assert.equal(
+      modeOf(freshRegistry),
+      REGISTRY_TEMPORARY_FILE_MODE.toString(8),
+      'a registry created by a write must be readable by its owner alone'
+    );
+  }
+
+  /* ---- The cleanup that runs for an injected writer ----------------------
+   * The default writer removes only what it created, so the best-effort
+   * cleanup after a failed write exists for an injected `writeFile` (AAP
+   * 0.7.3) - and it reaches the scratch path by name, which is the same path a
+   * local actor can occupy. A regular file there is removed, as the first half
+   * of this test asserts. A symbolic link is NOT: unlinking it would delete an
+   * entry this service never created and erase what put it there, so it is left
+   * in place and reported instead. Only runnable where the host grants symbolic
+   * links; the refusal above covers the production writer either way.
+   */
+  if (linked) {
+    const cleanupDir = mkTemp();
+    const cleanupRegistry = path.join(cleanupDir, REGISTRY_FILENAME);
+    fs.writeFileSync(cleanupRegistry, EMPTY_REGISTRY, 'utf8');
+    const cleanupDecoy = path.join(cleanupDir, 'decoy.txt');
+    fs.writeFileSync(cleanupDecoy, DECOY_CONTENTS, 'utf8');
+    const cleanupLink = `${cleanupRegistry}${REGISTRY_TEMPORARY_SUFFIX}`;
+    fs.symlinkSync(cleanupDecoy, cleanupLink, 'file');
+    const cleanupDirectory = studentDirectory.fromRows([
+      DIRECTORY_HEADER_ROW,
+      { A: 'S001', B: S001_NAME }
+    ]);
+    const cleanupRepository = activityRepository.fromData({
+      directory: cleanupDirectory,
+      activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
+      registryRecords: [],
+      activitiesDataPath: cleanupRegistry,
+      // Fails without creating anything, so the only entry at the scratch path
+      // is the link the test planted.
+      writeFile: () => {
+        throw new Error('injected write failure');
+      }
+    });
+    const cleanupReport = [];
+    const cleanupStderr = process.stderr.write;
+    process.stderr.write = (chunk, encoding, callback) => {
+      cleanupReport.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      if (typeof encoding === 'function') encoding();
+      else if (typeof callback === 'function') callback();
+      return true;
+    };
+    let cleanupFailure = null;
+    try {
+      await cleanupRepository.addActivity('S001', UNUSED_ACTIVITY);
+    } catch (error) {
+      cleanupFailure = error;
+    } finally {
+      process.stderr.write = cleanupStderr;
+    }
+    assert.equal(
+      cleanupFailure === null ? 'resolved' : cleanupFailure.code,
+      'ACTIVITY_PERSIST_FAILED',
+      'an injected writer that throws must still reject the write'
+    );
+    assert.equal(
+      fs.existsSync(cleanupLink),
+      true,
+      'the cleanup must leave a symbolic link at the scratch path exactly where it found it'
+    );
+    assert.equal(
+      fs.lstatSync(cleanupLink).isSymbolicLink(),
+      true,
+      'the cleanup must not replace the link with a file of its own'
+    );
+    assert.equal(
+      fs.readFileSync(cleanupDecoy, 'utf8'),
+      DECOY_CONTENTS,
+      'the cleanup must never reach the file the link points at'
+    );
+    assert.ok(
+      cleanupReport.join('').includes(cleanupLink),
+      `the refusal to remove it must be reported naming ${cleanupLink}; ` +
+        `got ${JSON.stringify(cleanupReport.join(''))}`
+    );
+    fs.unlinkSync(cleanupLink);
+  }
+
+  // ---- The other way a write is refused: a bound, not a fault --------------
+  // A quota refusal has to behave like the failed write above in the one
+  // respect that matters here - it must leave the file and the directory
+  // exactly as it found them - while reporting itself as capacity rather than
+  // as a server error. Without these bounds the registry, the per-student
+  // response and the full-file rewrite all grew with however many POSTs a
+  // caller chose to send.
+  /**
+   * Starts a server whose repository carries the given ceilings, over a
+   * one-student workbook row set and its own seeded registry file.
+   *
+   * @param {object} limits The `max…` ceilings to apply.
+   * @returns {Promise<{server: object, file: string, directory: string}>} The
+   *   server, its registry file and the directory holding it.
+   */
+  const startBoundedServer = async (limits) => {
+    const boundedDir = mkTemp();
+    const boundedFile = path.join(boundedDir, REGISTRY_FILENAME);
+    fs.writeFileSync(boundedFile, EMPTY_REGISTRY, 'utf8');
+    const boundedDirectory = studentDirectory.fromRows([
+      DIRECTORY_HEADER_ROW,
+      { A: 'S001', B: S001_NAME },
+      { A: 'S003', B: S003_NAME }
+    ]);
+    const boundedRepository = activityRepository.fromData({
+      directory: boundedDirectory,
+      activityRows: [
+        ACTIVITY_HEADER_ROW,
+        { A: 'S001', B: 'Hostel', C: S001_ACTIVITY },
+        { A: 'S003', B: 'Hostel', C: S003_ACTIVITY }
+      ],
+      registryRecords: [],
+      activitiesDataPath: boundedFile,
+      ...limits
+    });
+    return {
+      server: await startServer({ directory: boundedDirectory, repository: boundedRepository }),
+      file: boundedFile,
+      directory: boundedDir
+    };
+  };
+
+  // Each student already holds one workbook activity, so a ceiling of 2 leaves
+  // room for exactly one more - and the second POST must be refused.
+  const perStudent = await startBoundedServer({ maxActivitiesPerStudent: 2 });
+  const firstAdmitted = await postJson(perStudent.server, S001_PATH, { activity: UNUSED_ACTIVITY });
+  assert.equal(firstAdmitted.status, STATUS_CREATED, `the first POST must be accepted; ${firstAdmitted.text}`);
+  const storedAtCap = fs.readFileSync(perStudent.file);
+  const atCap = await postJson(perStudent.server, S001_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    atCap.status,
+    STATUS_INSUFFICIENT_STORAGE,
+    `a student at their ceiling must be refused with 507; body was ${atCap.text}`
+  );
+  assertMediaType(atCap, JSON_MEDIA_TYPE, `POST ${S001_PATH} (507)`);
+  assert.deepEqual(
+    json(atCap),
+    errorBody(CODE_STUDENT_ACTIVITY_LIMIT_REACHED, messageStudentActivityLimit('S001'))
+  );
+  assert.ok(
+    fs.readFileSync(perStudent.file).equals(storedAtCap),
+    'a quota refusal must leave the registry file byte-unchanged'
+  );
+  // A ceiling is per student: one full collection must not close the service.
+  const sibling = await postJson(perStudent.server, S003_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    sibling.status,
+    STATUS_CREATED,
+    `another student must still be served; body was ${sibling.text}`
+  );
+  // Admission runs before the body is read, so an oversize body from a student
+  // at their ceiling answers 507 rather than the 413 it would otherwise earn.
+  // This is the observable proof that no body was consumed.
+  const oversizeAtCap = await postRaw(
+    perStudent.server,
+    S001_PATH,
+    `{"activity":"${'x'.repeat(OVERSIZE_BODY_BYTES)}"}`
+  );
+  assert.equal(
+    oversizeAtCap.status,
+    STATUS_INSUFFICIENT_STORAGE,
+    `admission must precede the body cap; body was ${oversizeAtCap.text}`
+  );
+  assert.equal(json(oversizeAtCap).error.code, CODE_STUDENT_ACTIVITY_LIMIT_REACHED);
+
+  // The registry's own cardinality ceiling, which no single student can be
+  // blamed for: one record fills it, and the next write is refused whoever
+  // sends it.
+  const byRecords = await startBoundedServer({ maxRegistryRecords: 1 });
+  const firstRecord = await postJson(byRecords.server, S001_PATH, { activity: UNUSED_ACTIVITY });
+  assert.equal(firstRecord.status, STATUS_CREATED, firstRecord.text);
+  const registryFull = await postJson(byRecords.server, S003_PATH, { activity: UNUSED_ACTIVITY });
+  assert.equal(
+    registryFull.status,
+    STATUS_INSUFFICIENT_STORAGE,
+    `a full registry must be refused with 507; body was ${registryFull.text}`
+  );
+  assert.deepEqual(json(registryFull), errorBody(CODE_REGISTRY_FULL, MESSAGE_REGISTRY_FULL));
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(byRecords.file, 'utf8')),
+    [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
+    'only the admitted record may reach the registry file'
+  );
+
+  // The byte ceiling is the one bound that cannot be judged before the write is
+  // serialized, so it is enforced inside the critical section - after the body
+  // has been read, and still before anything is written.
+  const byBytes = await startBoundedServer({ maxRegistryBytes: 16 });
+  const tooManyBytes = await postJson(byBytes.server, S001_PATH, { activity: UNUSED_ACTIVITY });
+  assert.equal(
+    tooManyBytes.status,
+    STATUS_INSUFFICIENT_STORAGE,
+    `a write past the byte ceiling must be refused with 507; body was ${tooManyBytes.text}`
+  );
+  assert.deepEqual(json(tooManyBytes), errorBody(CODE_REGISTRY_FULL, MESSAGE_REGISTRY_FULL));
+  assert.equal(
+    fs.readFileSync(byBytes.file, 'utf8'),
+    EMPTY_REGISTRY,
+    'a write refused on size must not rewrite the registry'
+  );
+  const boundedLeftovers = fs
+    .readdirSync(byBytes.directory)
+    .filter((name) => name.endsWith(REGISTRY_TEMPORARY_SUFFIX));
+  assert.deepEqual(
+    boundedLeftovers,
+    [],
+    `a refused write must leave no temporary file; found ${boundedLeftovers.join(', ')}`
+  );
+  // And the index is untouched, exactly as on the failed-write path above.
+  const boundedRead = await request(byBytes.server, { path: S001_PATH });
+  assert.deepEqual(
+    json(boundedRead).activities,
+    [{ activity: S001_ACTIVITY, source: 'workbook' }],
+    'a refused write must leave the in-memory index untouched'
+  );
 });
 
-test('23 one failed write does not poison the writes that follow it', async () => {
+test('one failed write does not poison the writes that follow it', async () => {
   const registryPath = path.join(mkTemp(), REGISTRY_FILENAME);
   fs.writeFileSync(registryPath, EMPTY_REGISTRY, 'utf8');
   const directory = studentDirectory.fromRows([
@@ -1599,9 +2085,61 @@ test('23 one failed write does not poison the writes that follow it', async () =
     [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
     'exactly the recovered record must be on disk'
   );
+
+  // ---- The same property for a write refused by a bound -------------------
+  // A quota refusal never reaches the writer at all, so it must not occupy the
+  // queue either: the write that follows it has to be served normally. A bound
+  // that left the queue wedged would trade an unbounded registry for an
+  // unusable one.
+  const boundedPath = path.join(mkTemp(), REGISTRY_FILENAME);
+  fs.writeFileSync(boundedPath, EMPTY_REGISTRY, 'utf8');
+  const boundedDirectory = studentDirectory.fromRows([
+    DIRECTORY_HEADER_ROW,
+    { A: 'S001', B: S001_NAME },
+    { A: 'S003', B: S003_NAME }
+  ]);
+  const boundedRepository = activityRepository.fromData({
+    directory: boundedDirectory,
+    activityRows: [
+      ACTIVITY_HEADER_ROW,
+      { A: 'S001', B: 'Hostel', C: S001_ACTIVITY },
+      { A: 'S003', B: 'Hostel', C: S003_ACTIVITY }
+    ],
+    registryRecords: [],
+    activitiesDataPath: boundedPath,
+    // Each student holds one workbook activity already, so this leaves room
+    // for exactly one more each.
+    maxActivitiesPerStudent: 2
+  });
+  const boundedServer = await startServer({
+    directory: boundedDirectory,
+    repository: boundedRepository
+  });
+  const filled = await postJson(boundedServer, S001_PATH, { activity: UNUSED_ACTIVITY });
+  assert.equal(filled.status, STATUS_CREATED, `the first write must land; body was ${filled.text}`);
+  const refused = await postJson(boundedServer, S001_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    refused.status,
+    STATUS_INSUFFICIENT_STORAGE,
+    `the write past the ceiling must be refused; body was ${refused.text}`
+  );
+  const afterRefusal = await postJson(boundedServer, S003_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    afterRefusal.status,
+    STATUS_CREATED,
+    `a refusal must not poison the queue behind it; body was ${afterRefusal.text}`
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(boundedPath, 'utf8')),
+    [
+      { studentId: 'S001', activity: UNUSED_ACTIVITY },
+      { studentId: 'S003', activity: NEW_ACTIVITY }
+    ],
+    'exactly the two admitted records must be on disk, in the order they were accepted'
+  );
 });
 
-test('24 two concurrent posts of one activity produce one record', async () => {
+test('two concurrent posts of one activity produce one record', async () => {
   const { server, registryPath } = await startWritableServer();
   const [first, second] = await Promise.all([
     postJson(server, S003_PATH, { activity: NEW_ACTIVITY }),
@@ -1620,27 +2158,265 @@ test('24 two concurrent posts of one activity produce one record', async () => {
     [{ studentId: 'S003', activity: NEW_ACTIVITY }],
     'only one record may reach the registry file'
   );
+
+  // ---- Saturation: pending write work is finite --------------------------
+  // Concurrency is what the two POSTs above exercise; this is what happens when
+  // there is more of it than the service will carry. Before the bound existed,
+  // every valid POST allocated pending promise and response state and a task on
+  // this serialized queue, so queue depth, memory, sockets and latency were a
+  // function of how many requests a caller chose to send at once.
+  //
+  // The writer below blocks until the test releases it, which holds the single
+  // permitted write open and makes the saturated state deterministic rather
+  // than a matter of timing.
+  const gatedPath = path.join(mkTemp(), REGISTRY_FILENAME);
+  fs.writeFileSync(gatedPath, EMPTY_REGISTRY, 'utf8');
+  let releaseWrite = null;
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  const gatedDirectory = studentDirectory.fromRows([
+    DIRECTORY_HEADER_ROW,
+    { A: 'S001', B: S001_NAME }
+  ]);
+  const gatedRepository = activityRepository.fromData({
+    directory: gatedDirectory,
+    activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
+    registryRecords: [],
+    activitiesDataPath: gatedPath,
+    maxPendingWrites: 1,
+    writeFile: async (target, contents) => {
+      await writeGate;
+      fs.writeFileSync(target, contents, 'utf8');
+    }
+  });
+  const gatedServer = await startServer({
+    directory: gatedDirectory,
+    repository: gatedRepository
+  });
+
+  const inFlight = postJson(gatedServer, S001_PATH, { activity: UNUSED_ACTIVITY });
+  // Wait for the admitted write to actually occupy the queue, so the requests
+  // below meet a saturated service rather than racing to fill it.
+  const saturatedBy = Date.now() + SATURATION_DEADLINE_MS;
+  while (gatedRepository.checkWriteAdmission('S001') === null) {
+    assert.ok(
+      Date.now() < saturatedBy,
+      `the queue did not report itself full within ${SATURATION_DEADLINE_MS} ms`
+    );
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.equal(
+    gatedRepository.checkWriteAdmission('S001').code,
+    CODE_WRITE_QUEUE_FULL,
+    'a saturated queue must refuse admission by that code'
+  );
+
+  const shed = await Promise.all([
+    postJson(gatedServer, S001_PATH, { activity: NEW_ACTIVITY }),
+    postJson(gatedServer, S001_PATH, { activity: 'Dance Club' }),
+    // Admission precedes every interpretation of the request, so a body this
+    // service would otherwise refuse as 415 or 400 is shed as capacity - the
+    // observable proof that a saturated service reads no body at all.
+    postRaw(gatedServer, S001_PATH, '{', TEXT_MEDIA_TYPE)
+  ]);
+  shed.forEach((res, index) => {
+    assert.equal(
+      res.status,
+      STATUS_SERVICE_UNAVAILABLE,
+      `shed request ${index} must be a 503; body was ${res.text}`
+    );
+    assertMediaType(res, JSON_MEDIA_TYPE, `shed request ${index}`);
+    assert.deepEqual(
+      json(res),
+      errorBody(CODE_WRITE_QUEUE_FULL, MESSAGE_WRITE_QUEUE_FULL),
+      `shed request ${index} must carry the fixed queue-full envelope`
+    );
+    assert.equal(
+      res.headers['retry-after'],
+      RETRY_AFTER_SECONDS,
+      `shed request ${index} must say when to retry, read ${res.headers['retry-after']}`
+    );
+  });
+
+  releaseWrite();
+  const admitted = await inFlight;
+  assert.equal(
+    admitted.status,
+    STATUS_CREATED,
+    `the admitted write must still complete; body was ${admitted.text}`
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(gatedPath, 'utf8')),
+    [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
+    'only the admitted write may reach the registry file'
+  );
+  // The bound is capacity, not a ban: once the queue drains it admits again.
+  assert.equal(
+    gatedRepository.checkWriteAdmission('S001'),
+    null,
+    'admission must reopen once the queue has drained'
+  );
+  const afterDrain = await postJson(gatedServer, S001_PATH, { activity: NEW_ACTIVITY });
+  assert.equal(
+    afterDrain.status,
+    STATUS_CREATED,
+    `a write after the queue drained must be served; body was ${afterDrain.text}`
+  );
+
+  // ---- The bound covers the request, not just the queued task -------------
+  // The case above saturates the queue with a write that is already running.
+  // This one starts from an **empty** queue with an ordinary writer, and the
+  // requests that hold the capacity have not finished arriving: each sends its
+  // headers and one byte of body and then stops. That is the shape that
+  // matters, because it is the cheap one to send and the expensive one to hold -
+  // a socket, its listeners and a partial body per request - and a boundary
+  // that merely *checked* for room would admit every one of them, since no
+  // write has been enqueued yet. Capacity is therefore acquired, not consulted:
+  // exactly `maxPendingWrites` requests may be reading a body at once.
+  const heldPath = path.join(mkTemp(), REGISTRY_FILENAME);
+  fs.writeFileSync(heldPath, EMPTY_REGISTRY, 'utf8');
+  const heldDirectory = studentDirectory.fromRows([
+    DIRECTORY_HEADER_ROW,
+    { A: 'S001', B: S001_NAME }
+  ]);
+  const heldRepository = activityRepository.fromData({
+    directory: heldDirectory,
+    activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
+    registryRecords: [],
+    activitiesDataPath: heldPath,
+    maxPendingWrites: 2
+  });
+  const heldServer = await startServer({
+    directory: heldDirectory,
+    repository: heldRepository
+  });
+
+  /**
+   * Sends a `POST` whose declared body is complete but whose bytes are not, so
+   * the request sits in the read phase until `finish()` is called.
+   *
+   * @param {string} activity The activity the finished body will carry.
+   * @returns {{settled: boolean, status: number|null, headers: object, text: string, finish: () => void}}
+   *   A live record of the exchange, updated as it settles.
+   */
+  const openPartialPost = (activity) => {
+    const body = JSON.stringify({ activity });
+    const record = { settled: false, status: null, headers: {}, text: '', finish: () => {} };
+    const req = http.request(
+      {
+        host: LOOPBACK_HOST,
+        port: heldServer.address().port,
+        path: S001_PATH,
+        method: METHOD_POST,
+        headers: { 'Content-Type': JSON_MEDIA_TYPE, 'Content-Length': Buffer.byteLength(body) },
+        agent: false
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          record.status = res.statusCode;
+          record.headers = res.headers;
+          record.text = Buffer.concat(chunks).toString('utf8');
+          record.settled = true;
+        });
+      }
+    );
+    // A refused request has its stream destroyed once it has been answered, so
+    // a write-side error here is expected and must not fail the test.
+    req.on('error', () => {});
+    req.write(body.slice(0, 1));
+    record.finish = () => { req.end(body.slice(1)); };
+    return record;
+  };
+
+  const partials = [1, 2, 3, 4, 5, 6].map((n) => openPartialPost(`Held Club ${n}`));
+  const refusedBy = Date.now() + SATURATION_DEADLINE_MS;
+  while (partials.filter((entry) => entry.settled).length < partials.length - 2) {
+    assert.ok(
+      Date.now() < refusedBy,
+      'the requests past the capacity of the read phase must be refused immediately; '
+        + `only ${partials.filter((entry) => entry.settled).length} of `
+        + `${partials.length - 2} had answered within ${SATURATION_DEADLINE_MS} ms`
+    );
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+  const answered = partials.filter((entry) => entry.settled);
+  const holding = partials.filter((entry) => !entry.settled);
+  assert.equal(
+    answered.length,
+    4,
+    `exactly 4 of 6 requests must be refused while 2 hold the capacity; ${answered.length} answered`
+  );
+  assert.equal(
+    holding.length,
+    2,
+    `exactly maxPendingWrites requests may occupy the read phase; ${holding.length} did`
+  );
+  answered.forEach((entry, index) => {
+    assert.equal(
+      entry.status,
+      STATUS_SERVICE_UNAVAILABLE,
+      `refused partial ${index} must be a 503; body was ${entry.text}`
+    );
+    assert.deepEqual(
+      JSON.parse(entry.text),
+      errorBody(CODE_WRITE_QUEUE_FULL, MESSAGE_WRITE_QUEUE_FULL),
+      `refused partial ${index} must carry the fixed queue-full envelope`
+    );
+    assert.equal(entry.headers['retry-after'], RETRY_AFTER_SECONDS);
+  });
+  assert.equal(
+    fs.readFileSync(heldPath, 'utf8'),
+    EMPTY_REGISTRY,
+    'not one of these requests has completed a body, so nothing may be written yet'
+  );
+
+  // Completing the two held bodies releases their slots the ordinary way.
+  holding.forEach((entry) => entry.finish());
+  const completedBy = Date.now() + SATURATION_DEADLINE_MS;
+  while (holding.filter((entry) => entry.settled).length < holding.length) {
+    assert.ok(
+      Date.now() < completedBy,
+      'the two held requests must complete once their bodies arrive'
+    );
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+  holding.forEach((entry) => {
+    assert.equal(
+      entry.status,
+      STATUS_CREATED,
+      `a request that held capacity must be served once its body arrives; body was ${entry.text}`
+    );
+  });
+  assert.equal(
+    JSON.parse(fs.readFileSync(heldPath, 'utf8')).length,
+    2,
+    'exactly the two admitted writes may reach the registry file'
+  );
+  assert.equal(
+    heldRepository.checkWriteAdmission('S001'),
+    null,
+    'both slots must be released once their requests are done'
+  );
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 25-27: method dispatch, unknown paths and the response schemas.
+ * Method dispatch, unknown paths and the response schemas.
  * ------------------------------------------------------------------------- */
 
-test('25 an unsupported method is a 405 carrying the exact Allow header', async () => {
+test('an unsupported method is a 405 carrying the exact Allow header', async () => {
   const cases = [
     ['DELETE', S001_PATH, ALLOW_STUDENT_ACTIVITIES],
     [METHOD_POST, ACTIVITIES_PATH, ALLOW_ACTIVITIES],
-    // The baseline answered the greeting to every method; method-aware routing
-    // is the point of the feature, so `/` now refuses anything else.
     ['PUT', ROOT_PATH, ALLOW_ROOT],
     // A malformed percent-escape does not stop the path being recognised - the
     // raw shape is what recognises it - so the fixed order still applies:
-    // method before identifier shape (AAP 0.6.2). This is a 405 naming what
-    // the route serves, where GET on the same target is the 400 of test 5.
+    // method before identifier shape. This is a 405 naming what the route
+    // serves, where a GET on the same target is a 400.
     ['DELETE', '/api/students/S%ZZ1/activities', ALLOW_STUDENT_ACTIVITIES],
     // The same branch, with a path past the 64-character mark: the entrypoint
-    // writes this `405` itself, and `<path>` is rendered in full there too -
-    // the cap is for identifier and activity values only (test 3).
+    // writes this `405` itself, and the path is rendered in full there too -
+    // the cap is for identifier and activity values only.
     ['DELETE', `/api/students/%ZZ${'q'.repeat(70)}/activities`, ALLOW_STUDENT_ACTIVITIES]
   ];
   for (const [method, target, allow] of cases) {
@@ -1650,7 +2426,6 @@ test('25 an unsupported method is a 405 carrying the exact Allow header', async 
       STATUS_METHOD_NOT_ALLOWED,
       `${method} ${target}: must be a 405; body was ${res.text}`
     );
-    // The header string is asserted exactly: the order is part of the contract.
     assert.equal(
       res.headers.allow,
       allow,
@@ -1664,8 +2439,8 @@ test('25 an unsupported method is a 405 carrying the exact Allow header', async 
   }
 
   // The entrypoint writes the root `405` itself, and it abandons an unread body
-  // on the same terms the routes do: paused, then destroyed, never resumed
-  // (AAP 0.6.2). One pattern, both files.
+  // on the same terms the routes do: paused, then destroyed, never resumed.
+  // One pattern, both files.
   const refusedRoot = dispatchSynthetic(sharedServer, 'PUT', ROOT_PATH);
   await settleSynthetic();
   assert.equal(refusedRoot.res.statusCode, STATUS_METHOD_NOT_ALLOWED);
@@ -1683,7 +2458,7 @@ test('25 an unsupported method is a 405 carrying the exact Allow header', async 
   );
 });
 
-test('26 an unrecognised path is a 404 naming the query-stripped target', async () => {
+test('an unrecognised path is a 404 naming the query-stripped target', async () => {
   // There is no trailing-slash normalization, which is why `/api/activities/`
   // is a 404 rather than the roster, and the query string never reaches the
   // message.
@@ -1692,9 +2467,8 @@ test('26 an unrecognised path is a 404 naming the query-stripped target', async 
     ['/api/activities/', '/api/activities/'],
     ['/nope', '/nope'],
     ['/api/unknown?x=1', '/api/unknown'],
-    // `<path>` is never shortened: the 64-character cap applies to identifier
-    // and activity values only (test 3), so a target well past it is named in
-    // full.
+    // A path is never shortened: the 64-character cap applies to identifier and
+    // activity values only, so a target well past it is named in full.
     [`/api/${'q'.repeat(90)}`, `/api/${'q'.repeat(90)}`],
     [`/api/${'r'.repeat(90)}?drop=me`, `/api/${'r'.repeat(90)}`]
   ];
@@ -1709,7 +2483,7 @@ test('26 an unrecognised path is a 404 naming the query-stripped target', async 
   }
 
   // The single `404` fallback abandons an unread body too, rather than reading
-  // an upload nothing will look at to its end (AAP 0.6.2).
+  // an upload nothing will look at to its end.
   const gone = dispatchSynthetic(sharedServer, METHOD_GET, '/nope');
   await settleSynthetic();
   assert.equal(gone.res.statusCode, STATUS_NOT_FOUND);
@@ -1726,7 +2500,7 @@ test('26 an unrecognised path is a 404 naming the query-stripped target', async 
   );
 });
 
-test('27 every payload carries exactly its documented keys and no discarded column', async () => {
+test('every payload carries exactly its documented keys and no discarded column', async () => {
   const { server } = await startWritableServer();
   const perStudent = await request(server, { path: S001_PATH });
   const roster = await request(server, { path: ACTIVITIES_PATH });
@@ -1744,7 +2518,6 @@ test('27 every payload carries exactly its documented keys and no discarded colu
     `an unrecognised path must be a 404; body was ${unroutable.text}`
   );
 
-  // Every JSON response, success and failure, from both writers.
   assertMediaType(perStudent, JSON_MEDIA_TYPE, `GET ${S001_PATH}`);
   assertMediaType(roster, JSON_MEDIA_TYPE, `GET ${ACTIVITIES_PATH}`);
   assertMediaType(created, JSON_MEDIA_TYPE, `POST ${S003_PATH} (201)`);
@@ -1822,11 +2595,11 @@ test('27 every payload carries exactly its documented keys and no discarded colu
 });
 
 /* ---------------------------------------------------------------------------
- * Tests 28-33: load-time behaviour and the injection seam. None of these can
- * be reached through a socket, which is why the seams exist.
+ * Load-time behaviour and the injection seam. None of it can be reached through
+ * a socket, which is why the seams exist.
  * ------------------------------------------------------------------------- */
 
-test('28 a missing registry file warns and serves the workbook data anyway', async () => {
+test('a missing registry file warns and serves the workbook data anyway', async () => {
   const missingRegistry = path.join(mkTemp(), REGISTRY_FILENAME);
   const directory = studentDirectory.load({ workbookDir: REPO_ROOT });
   const collected = [];
@@ -1865,27 +2638,158 @@ test('28 a missing registry file warns and serves the workbook data anyway', asy
     warning.includes(missingRegistry),
     `the warning must name the missing path; got "${warning}"`
   );
+
+  // The same warning is the repository's OWN log sink, and the value it prints
+  // is a configured path - so the path is what has to be neutralized there
+  // (CWE-117). This is the only place that sink is observable on its own: every
+  // diagnostic the routes module writes is escaped again at its own sink, which
+  // would mask a gap here. A bidirectional override in the basename is the case
+  // that a control-character check misses; nothing is created on disk, so the
+  // name only has to be a legal string, and the file's absence is the point.
+  const hostileRegistry = path.join(mkTemp(), 'activities\u202enosj.json');
+  const hostileCollected = [];
+  const hostileOriginalWrite = process.stderr.write;
+  let hostileRepository = null;
+  let hostileFailure = null;
+  process.stderr.write = (chunk, encoding, callback) => {
+    hostileCollected.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    if (typeof encoding === 'function') encoding();
+    else if (typeof callback === 'function') callback();
+    return true;
+  };
+  try {
+    hostileRepository = activityRepository.load({
+      workbookDir: REPO_ROOT,
+      activitiesDataPath: hostileRegistry,
+      directory
+    });
+  } catch (error) {
+    hostileFailure = error;
+  } finally {
+    process.stderr.write = hostileOriginalWrite;
+  }
+
+  assert.equal(
+    hostileFailure,
+    null,
+    `a missing registry must not be fatal whatever its name; threw ${hostileFailure}`
+  );
+  assert.equal(
+    hostileRepository.recordCount(),
+    EXPECTED_RECORD_COUNT,
+    'the ten workbook-sourced records must still be served'
+  );
+  const hostileWarning = hostileCollected.join('');
+  assert.equal(
+    hostileWarning.split('\n').filter((line) => line !== '').length,
+    1,
+    `the warning must occupy exactly one line; got ${JSON.stringify(hostileWarning)}`
+  );
+  assert.equal(
+    /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(hostileWarning),
+    false,
+    `no bidirectional control may survive into the warning; got ${JSON.stringify(hostileWarning)}`
+  );
+  assert.ok(
+    hostileWarning.includes(hostileRegistry.replace('\u202e', '\\u202e')),
+    'the warning must name the missing path with the override escaped; got '
+      + `${JSON.stringify(hostileWarning)}`
+  );
 });
 
-test('29 a corrupt registry file aborts the load and names the fault', async () => {
+test('a corrupt registry file aborts the load and names the fault', async () => {
   const directory = studentDirectory.load({ workbookDir: REPO_ROOT });
+  // The fourth column marks a fault that lives in a RECORD rather than in the
+  // file around it, so the second loop below can replay it through `fromData`.
+  // A stored record is exactly `{studentId, activity}`, so the shape
+  // faults are as fatal as the semantic ones: `source` is derived at
+  // serialization time and a file carrying it was written by something other
+  // than this service, and a wrong-typed field would otherwise be indexed and
+  // served as if the workbooks had said it.
   const cases = [
-    ['malformed JSON', '{', 'does not contain valid JSON'],
-    ['a non-array root', '{}', 'must contain a JSON array of records'],
+    ['malformed JSON', '{', 'does not contain valid JSON', false],
+    ['a non-array root', '{}', 'must contain a JSON array of records', false],
     [
       'an orphan studentId',
       '[{"studentId":"S999","activity":"Chess Club"}]',
-      'record 1 names Student ID S999, which is not in the student directory'
+      'record 1 names Student ID S999, which is not in the student directory',
+      true
     ],
     [
       'an invalid activity',
       '[{"studentId":"S001","activity":""}]',
-      'record 1 (S001) has an invalid activity'
+      'record 1 (S001) has an invalid activity',
+      true
     ],
     [
       'a duplicate of the workbook value',
       '[{"studentId":"S001","activity":"Robotics Club"}]',
-      'record 1 duplicates activity "Robotics Club" for Student ID S001'
+      'record 1 duplicates activity "Robotics Club" for Student ID S001',
+      true
+    ],
+    [
+      'a record carrying the derived source field',
+      '[{"studentId":"S001","activity":"Chess Club","source":"registry"}]',
+      'record 1 carries an unexpected field "source"',
+      true
+    ],
+    [
+      // `JSON.parse` defines `__proto__` as an ordinary OWN property rather than
+      // setting a prototype, so the own-key allowlist sees it and refuses the
+      // record - which is what keeps a hand-edited registry from reaching any
+      // merge that would pollute a prototype.
+      'a record carrying a __proto__ key',
+      '[{"studentId":"S001","activity":"Chess Club","__proto__":{"polluted":true}}]',
+      'record 1 carries an unexpected field "__proto__"',
+      true
+    ],
+    [
+      'a record missing its activity',
+      '[{"studentId":"S001"}]',
+      'record 1 is missing the required field "activity"',
+      true
+    ],
+    [
+      'a record that is not an object at all',
+      '["Chess Club"]',
+      'record 1 must be an object with exactly the keys',
+      true
+    ],
+    [
+      'a non-string studentId',
+      '[{"studentId":1,"activity":"Chess Club"}]',
+      'record 1 has a Student ID that is not a string (received number)',
+      true
+    ],
+    [
+      'a malformed studentId',
+      '[{"studentId":"S1","activity":"Chess Club"}]',
+      'record 1 has a malformed Student ID "S1"',
+      true
+    ],
+    [
+      'a non-string activity',
+      '[{"studentId":"S001","activity":42}]',
+      'record 1 (S001) has an activity that is not a string (received number)',
+      true
+    ],
+    [
+      'a null activity',
+      '[{"studentId":"S001","activity":null}]',
+      'record 1 (S001) has an activity that is not a string (received null)',
+      true
+    ],
+    [
+      'an object activity',
+      '[{"studentId":"S001","activity":{"name":"Chess Club"}}]',
+      'record 1 (S001) has an activity that is not a string (received object)',
+      true
+    ],
+    [
+      'an activity over 64 characters',
+      `[{"studentId":"S001","activity":${JSON.stringify(OVERLONG_ACTIVITY)}}]`,
+      'record 1 (S001) has an invalid activity',
+      true
     ]
   ];
   for (const [label, contents, expected] of cases) {
@@ -1912,9 +2816,57 @@ test('29 a corrupt registry file aborts the load and names the fault', async () 
       `${label}: the load must abort rather than under-report a student's activities`
     );
   }
+
+  // Nothing above may have reached a prototype. Asserted rather than assumed,
+  // because the `__proto__` case is the one record whose key could pollute every
+  // object in the process if the load path ever merged a record instead of
+  // reading its own keys.
+  assert.equal(
+    Object.prototype.polluted,
+    undefined,
+    'refusing a __proto__ record must leave Object.prototype untouched'
+  );
+  assert.equal(
+    ({}).polluted,
+    undefined,
+    'no object may inherit a key smuggled in through a registry record'
+  );
+
+  // The same records with no file in sight. `fromData` is the no-read
+  // equivalent of `load` and must be EXACTLY as strict as it, so
+  // every record-level refusal above is asserted a second time on the injected
+  // path - which is also the path any future caller of this module uses. The
+  // text is re-parsed rather than written as an object literal on purpose: in a
+  // literal, `__proto__:` sets the prototype instead of creating the own key
+  // that reproduces a hand-edited file.
+  const injectedRows = [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }];
+  for (const [label, contents, expected, injectable] of cases) {
+    if (!injectable) continue;
+    assert.throws(
+      () => activityRepository.fromData({
+        directory,
+        activityRows: injectedRows,
+        registryRecords: JSON.parse(contents),
+        activitiesDataPath: path.join(mkTemp(), REGISTRY_FILENAME)
+      }),
+      (error) => {
+        assert.equal(
+          error.code,
+          CODE_REPOSITORY_INVALID,
+          `${label} (injected): wrong error code`
+        );
+        assert.ok(
+          error.message.includes(expected),
+          `${label} (injected): the message must state "${expected}"; got "${error.message}"`
+        );
+        return true;
+      },
+      `${label} (injected): fromData must be exactly as strict as load`
+    );
+  }
 });
 
-test('30 the student directory refuses every row set it cannot key', async () => {
+test('the student directory refuses every row set it cannot key', async () => {
   const cases = [
     [
       'a header mismatch',
@@ -1936,9 +2888,9 @@ test('30 the student directory refuses every row set it cannot key', async () =>
       [DIRECTORY_HEADER_ROW, { A: 'S001', B: '' }],
       'row 2 (S001) has a blank Name'
     ],
-    // The row shapes `lib/workbook.js` can never yield. Each one used to be read
-    // as a blank cell and silently skipped, which loses a student the caller
-    // believes was supplied: `fromRows` must be exactly as strict as `load`.
+    // The row shapes `lib/workbook.js` can never yield. Read as a blank cell
+    // each would silently skip its row, losing a student the caller believes
+    // was supplied: `fromRows` is exactly as strict as `load`.
     [
       'a null key cell',
       [DIRECTORY_HEADER_ROW, { A: null, B: S001_NAME }],
@@ -1997,7 +2949,7 @@ test('30 the student directory refuses every row set it cannot key', async () =>
   );
 });
 
-test('31 the activity source refuses a reshaped sheet and an unknown student', async () => {
+test('the activity source refuses a reshaped sheet and an unknown student', async () => {
   const directory = studentDirectory.fromRows([
     DIRECTORY_HEADER_ROW,
     { A: 'S001', B: S001_NAME }
@@ -2025,10 +2977,10 @@ test('31 the activity source refuses a reshaped sheet and an unknown student', a
       [ACTIVITY_HEADER_ROW, { A: 'S002', B: 'Day Scholar', C: 'Debate Society' }],
       'row 2 names Student ID S002, which is not in the student directory'
     ],
-    // The row shapes `lib/workbook.js` can never yield. A null key used to be
-    // read as a blank cell and the row skipped; a null activity used to make a
-    // student who holds an activity look like one who holds none, which `GET`
-    // would then answer with `count` 0 for the life of the process.
+    // The row shapes `lib/workbook.js` can never yield. Read as a blank cell, a
+    // null key would skip its row, and a null activity would make a student who
+    // holds an activity look like one who holds none - which `GET` would answer
+    // with `count` 0 for the life of the process.
     [
       'a null key cell',
       [ACTIVITY_HEADER_ROW, { A: null, B: 'Hostel', C: UNUSED_ACTIVITY }],
@@ -2113,7 +3065,7 @@ test('31 the activity source refuses a reshaped sheet and an unknown student', a
   );
 });
 
-test('32 an unreadable or malformed workbook fails with the path named', async () => {
+test('an unreadable or malformed workbook fails with the path named', async () => {
   const workingDirectory = mkTemp();
 
   const notAPackage = path.join(workingDirectory, 'not-a-package.xlsx');
@@ -2124,24 +3076,48 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
   const zlib = require('node:zlib');
 
   /**
-   * Assembles a minimal, valid one-entry ZIP package: local file header, the
+   * Assembles a minimal, VALID one-entry ZIP package: local file header, the
    * entry data, the central directory record pointing back at it, then the
-   * end-of-central-directory record. The CRC and the timestamps are left zero
-   * deliberately - the reader resolves its entry by name and validates
-   * structure, and checks neither.
+   * end-of-central-directory record.
    *
-   * Each option forges exactly one field, which is what lets the reader's
-   * fail-closed branches be reached without a hand-assembled buffer per case:
-   * a package must be refused when it declares a part far larger than the
-   * reader's ceiling, when its DEFLATE stream expands past what it declared,
-   * when a central record claims variable-length bytes it does not carry, or
-   * when the walked records do not fill the declared directory. And it must
-   * still be READ when the only oddity is a legal archive comment.
+   * Both headers carry the entry content's real CRC-32, computed here with
+   * `zlib.crc32`, and both carry the same method, name and sizes - so a package
+   * built with no options is structurally valid AND checksum-valid. That is
+   * what makes it usable as a control: a control carrying a zero checksum is a
+   * package the reader is entitled to refuse for a reason the case under test
+   * is not about, and calling such a package valid would let a missing
+   * integrity check look like a passing suite.
    *
-   * @param {string} body The entry's content.
+   * Each option forges exactly ONE field, which is what lets the reader's
+   * fail-closed branches be reached without a hand-assembled buffer per case.
+   * They fall into three families:
+   *
+   *   - What the archive DECLARES about the part, with both headers still in
+   *     agreement: `entryName`, `stored`, `declaredSize` (written into both
+   *     headers for exactly that reason), `declaredExtra`, `flags`,
+   *     `duplicate`, `padding` and a trailing `comment`.
+   *   - What the LOCAL header claims while the central record says otherwise:
+   *     `localName`, `localMethod`, `localFlags`, `localCrc`,
+   *     `localCompressedSize` and `localDeclaredSize`. The two copies of an
+   *     entry's metadata are written independently, so a package can point a
+   *     well-formed central record at a local header describing something else.
+   *   - What the DATA is: `crc`, a checksum both headers agree on and the bytes
+   *     contradict, and `trailingJunk`, bytes appended after a complete DEFLATE
+   *     stream and counted inside the declared compressed size so that no
+   *     bounds check can see them.
+   *
+   * `body` may be a string or a `Buffer`; a `Buffer` is what lets a case store
+   * bytes that are not valid UTF-8 at all. And the package must still be READ
+   * when the only oddity is a legal archive comment, or a local header using
+   * the lawful streaming form in which those three fields are zero.
+   *
+   * @param {string|Buffer} body The entry's content.
    * @param {{entryName?: string, stored?: boolean, declaredSize?: number,
    *   declaredExtra?: number, comment?: Buffer, padding?: Buffer,
-   *   flags?: number, duplicate?: boolean}} [options]
+   *   flags?: number, duplicate?: boolean, crc?: number, localCrc?: number,
+   *   localName?: string, localMethod?: number, localFlags?: number,
+   *   localCompressedSize?: number, localDeclaredSize?: number,
+   *   trailingJunk?: Buffer}} [options]
    * @returns {Buffer} The package bytes.
    */
   const buildPackage = (body, options = {}) => {
@@ -2153,26 +3129,48 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
       comment = Buffer.alloc(0),
       padding = Buffer.alloc(0),
       flags = 0,
-      duplicate = false
+      duplicate = false,
+      crc,
+      localCrc,
+      localName,
+      localMethod,
+      localFlags,
+      localCompressedSize,
+      localDeclaredSize,
+      trailingJunk = Buffer.alloc(0)
     } = options;
     const name = Buffer.from(entryName, 'utf8');
-    const content = Buffer.from(body, 'utf8');
-    const data = stored ? content : zlib.deflateRawSync(content);
+    const content = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
+    const data = Buffer.concat([stored ? content : zlib.deflateRawSync(content), trailingJunk]);
+    /** The real checksum of the content unless a case forges one. */
+    const checksum = crc === undefined ? zlib.crc32(content) : crc;
+    /** The declared uncompressed size, shared by both headers. */
+    const uncompressed = declaredSize === undefined ? content.length : declaredSize;
 
     const localHeader = Buffer.alloc(30);
+    const localNameBytes = localName === undefined ? name : Buffer.from(localName, 'utf8');
     localHeader.writeUInt32LE(0x04034b50, 0);
-    localHeader.writeUInt16LE(stored ? 0 : 8, 8);
-    localHeader.writeUInt32LE(data.length, 18);
-    localHeader.writeUInt32LE(content.length, 22);
-    localHeader.writeUInt16LE(name.length, 26);
-    const localPart = Buffer.concat([localHeader, name, data]);
+    localHeader.writeUInt16LE(localFlags === undefined ? flags : localFlags, 6);
+    localHeader.writeUInt16LE(localMethod === undefined ? (stored ? 0 : 8) : localMethod, 8);
+    localHeader.writeUInt32LE(localCrc === undefined ? checksum : localCrc, 14);
+    localHeader.writeUInt32LE(
+      localCompressedSize === undefined ? data.length : localCompressedSize,
+      18
+    );
+    localHeader.writeUInt32LE(
+      localDeclaredSize === undefined ? uncompressed : localDeclaredSize,
+      22
+    );
+    localHeader.writeUInt16LE(localNameBytes.length, 26);
+    const localPart = Buffer.concat([localHeader, localNameBytes, data]);
 
     const centralHeader = Buffer.alloc(46);
     centralHeader.writeUInt32LE(0x02014b50, 0);
     centralHeader.writeUInt16LE(flags, 8);
     centralHeader.writeUInt16LE(stored ? 0 : 8, 10);
+    centralHeader.writeUInt32LE(checksum, 16);
     centralHeader.writeUInt32LE(data.length, 20);
-    centralHeader.writeUInt32LE(declaredSize === undefined ? content.length : declaredSize, 24);
+    centralHeader.writeUInt32LE(uncompressed, 24);
     centralHeader.writeUInt16LE(name.length, 28);
     centralHeader.writeUInt16LE(declaredExtra, 30);
     centralHeader.writeUInt32LE(0, 42);
@@ -2192,26 +3190,12 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
     return Buffer.concat([localPart, centralPart, padding, endRecord, comment]);
   };
 
-  /**
-   * Writes a built package into the working directory.
-   *
-   * @param {string} name The filename to write.
-   * @param {string} body The worksheet part's content.
-   * @param {object} [options] Passed straight to `buildPackage`.
-   * @returns {string} The absolute path written.
-   */
   const packageAt = (name, body, options) => {
     const target = path.join(workingDirectory, name);
     fs.writeFileSync(target, buildPackage(body, options));
     return target;
   };
 
-  /**
-   * Wraps cells in the worksheet shell the reader requires.
-   *
-   * @param {string} inner The `<row>` elements.
-   * @returns {string} A complete worksheet part.
-   */
   const sheet = (inner) => `<worksheet><sheetData>${inner}</sheetData></worksheet>`;
 
   /** One well-formed inline-string row, the control every forgery deviates from. */
@@ -2428,9 +3412,189 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
       'an encrypted worksheet entry',
       packageAt('encrypted.xlsx', sheet(validRow), { flags: 0x0001 }),
       'is encrypted'
+    ],
+    // ARCHIVE INTEGRITY, which is a different claim from archive structure.
+    // Every case below is a package whose records fit, whose offsets resolve
+    // and whose walk completes - and whose bytes are still not the bytes its
+    // own records describe. A structural parser accepts all of them.
+    //
+    // The checksum is the only check that can see ALTERED CONTENT: flipping a
+    // bit inside a student name or an ID changes no length and no offset, so
+    // nothing but the CRC-32 distinguishes the result from the real sheet.
+    [
+      'a worksheet entry whose data does not match its recorded checksum',
+      packageAt('bad-checksum.xlsx', sheet(validRow), { crc: 0 }),
+      'bytes of data hash to'
+    ],
+    // A ZIP records each entry's metadata twice, and the two copies are
+    // written independently - so a crafted central record can point at a local
+    // header that describes something else entirely. Each field that changes
+    // how the data is read gets its own case.
+    [
+      'a local header naming a different part than the central record',
+      packageAt('local-name.xlsx', sheet(validRow), { localName: 'xl/worksheets/sheet9.xml' }),
+      'names "xl/worksheets/sheet9.xml"'
+    ],
+    [
+      'a local header declaring a different compression method',
+      packageAt('local-method.xlsx', sheet(validRow), { localMethod: 0 }),
+      'declares compression method 0 in its local file header'
+    ],
+    [
+      'a local header declaring different general-purpose flags',
+      packageAt('local-flags.xlsx', sheet(validRow), { localFlags: 0x0001 }),
+      'declares general-purpose flags 0x00000001 in its local file header'
+    ],
+    [
+      'a local header declaring a different checksum',
+      packageAt('local-crc.xlsx', sheet(validRow), { localCrc: 0x1234 }),
+      'declares CRC-32 0x00001234 in its local file header'
+    ],
+    [
+      'a local header declaring a different uncompressed size',
+      packageAt('local-usize.xlsx', sheet(validRow), { localDeclaredSize: 999 }),
+      '999 uncompressed bytes in its local file header'
+    ],
+    [
+      'a local header declaring a different compressed size',
+      packageAt('local-csize.xlsx', sheet(validRow), { localCompressedSize: 7 }),
+      'declares 7 compressed and'
+    ],
+    // Bytes appended after a complete DEFLATE stream sit INSIDE the declared
+    // compressed size, so no bounds check can see them and zlib stops at the
+    // stream's end without complaint unless it is told not to. The cause code
+    // is asserted because our own summary cannot distinguish this from any
+    // other decompression failure.
+    [
+      'trailing compressed garbage after the DEFLATE stream',
+      packageAt('trailing-junk.xlsx', sheet(validRow), {
+        trailingJunk: Buffer.from([0x00, 0x11, 0x22])
+      }),
+      'could not be decompressed',
+      'ERR_TRAILING_JUNK_AFTER_STREAM_END'
+    ],
+    // `toString('utf8')` maps an ill-formed sequence to U+FFFD and reads on, so
+    // a single bad byte inside a <t> would serve a name with a replacement
+    // character in it and nothing would say so. The decode is fatal instead.
+    [
+      'a worksheet part that is not valid UTF-8',
+      packageAt(
+        'invalid-utf8.xlsx',
+        Buffer.concat([
+          Buffer.from(
+            '<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>',
+            'utf8'
+          ),
+          // A lone continuation byte: valid UTF-8 never starts a sequence here.
+          Buffer.from([0x53, 0x80, 0x30]),
+          Buffer.from('</t></is></c></row></sheetData></worksheet>', 'utf8')
+        ])
+      ),
+      'is not valid UTF-8'
+    ],
+    // XML forbids a repeated attribute name, and a scanner that assigns as it
+    // goes keeps whichever copy came last: `r` would put a forged value in a
+    // column the document also describes another way, and a second `t` would
+    // redeclare the cell's type. Both are pinned.
+    [
+      'a cell repeating its reference attribute',
+      packageAt(
+        'duplicate-attribute-r.xlsx',
+        sheet('<row r="1"><c r="A1" r="B1" t="inlineStr"><is><t>forged</t></is></c></row>')
+      ),
+      'carries attribute r twice'
+    ],
+    [
+      'a cell repeating its type attribute',
+      packageAt(
+        'duplicate-attribute-t.xlsx',
+        sheet('<row r="1"><c r="A1" t="inlineStr" t="s"><is><t>forged</t></is></c></row>')
+      ),
+      'carries attribute t twice'
+    ],
+    // An entity reference this reader cannot account for is a fault, not text:
+    // left as written it would serve a value that differs from the sheet's.
+    [
+      'an undefined entity reference in cell text',
+      packageAt(
+        'undefined-entity.xlsx',
+        sheet('<row r="1"><c r="A1" t="inlineStr"><is><t>Ren&eacute;e</t></is></c></row>')
+      ),
+      'is not one of the five predefined XML entities'
+    ],
+    [
+      'an undefined entity reference in an attribute value',
+      packageAt(
+        'undefined-entity-attribute.xlsx',
+        sheet('<row r="1"><c r="A&eacute;1" t="inlineStr"><is><t>x</t></is></c></row>')
+      ),
+      'is not one of the five predefined XML entities'
+    ],
+    // The two cases above sit in attributes this reader CONSUMES. These two sit
+    // in attributes it ignores - a cell's style index and the whitespace hint
+    // on a text run, both of which real sheets carry. Their values are never
+    // read, but a broken reference makes the document not well formed all the
+    // same, and a scanner that checked only what it consumed would call such a
+    // document sound.
+    [
+      'an undefined entity reference in an attribute the reader ignores',
+      packageAt(
+        'undefined-entity-ignored.xlsx',
+        sheet(
+          '<row r="1"><c r="A1" t="inlineStr" s="&undefined;"><is><t>S001</t></is></c></row>'
+        )
+      ),
+      'is not one of the five predefined XML entities'
+    ],
+    [
+      'an unterminated entity reference in an attribute the reader ignores',
+      packageAt(
+        'unterminated-entity-ignored.xlsx',
+        sheet(
+          '<row r="1"><c r="A1" t="inlineStr"><is><t xml:space="pre&serve">S001</t></is></c>' +
+            '</row>'
+        )
+      ),
+      'is not a complete XML entity reference'
+    ],
+    [
+      'a bare ampersand in cell text',
+      packageAt(
+        'bare-ampersand.xlsx',
+        sheet('<row r="1"><c r="A1" t="inlineStr"><is><t>Tom & Jerry</t></is></c></row>')
+      ),
+      'is not a complete XML entity reference'
+    ],
+    // The hunt for the terminating ';' is bounded, so a reference body longer
+    // than any legal one is refused rather than searched for to end of part.
+    [
+      'an entity reference whose body exceeds the reader bound',
+      packageAt(
+        'overlong-entity.xlsx',
+        sheet(
+          `<row r="1"><c r="A1" t="inlineStr"><is><t>&${'a'.repeat(40)};</t></is></c></row>`
+        )
+      ),
+      'is not a complete XML entity reference'
+    ],
+    [
+      'a character reference to a surrogate code point',
+      packageAt(
+        'surrogate-reference.xlsx',
+        sheet('<row r="1"><c r="A1" t="inlineStr"><is><t>&#xD800;</t></is></c></row>')
+      ),
+      'refers to a code point XML does not permit'
+    ],
+    [
+      'a character reference to a forbidden control character',
+      packageAt(
+        'nul-reference.xlsx',
+        sheet('<row r="1"><c r="A1" t="inlineStr"><is><t>&#0;</t></is></c></row>')
+      ),
+      'refers to a code point XML does not permit'
     ]
   ];
-  for (const [label, target, expected] of cases) {
+  for (const [label, target, expected, causeCode] of cases) {
     assert.throws(
       () => readWorksheetRows(target),
       (error) => {
@@ -2444,11 +3608,77 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
           `${label}: the message must name the path; got "${error.message}"`
         );
         assert.equal(error.path, target, `${label}: the error must carry the path`);
+        if (causeCode !== undefined) {
+          assert.equal(
+            error.cause === undefined || error.cause === null ? undefined : error.cause.code,
+            causeCode,
+            `${label}: the underlying cause must be preserved as ${causeCode}`
+          );
+        }
         return true;
       },
       `${label}: a failed read must abort construction with the path named`
     );
   }
+
+  // THE CONTROLS ARE CONTROLS, asserted rather than assumed. Every forgery
+  // above deviates from a package this builder produces with no options, so
+  // that package has to be one the reader accepts in full - checksum
+  // included. If it were not, each case above could be passing for the wrong
+  // reason and the integrity checks could be absent or broken unnoticed.
+  assert.deepEqual(
+    readWorksheetRows(packageAt('control.xlsx', sheet(validRow))),
+    [{ A: 'S001' }],
+    'a synthetic package with correct metadata and a correct CRC-32 must be read, or ' +
+      'every forgery in the table above proves nothing'
+  );
+  assert.deepEqual(
+    readWorksheetRows(packageAt('control-stored.xlsx', sheet(validRow), { stored: true })),
+    [{ A: 'S001' }],
+    'a stored (method 0) entry must be read and checksum-verified exactly as a ' +
+      'DEFLATE entry is'
+  );
+
+  // The one local/central disagreement that is LAWFUL: a writer streaming into
+  // a non-seekable sink sets the data-descriptor bit and writes the local CRC
+  // and both local sizes as zero, leaving the real values in the central
+  // record. Refusing that would reject a legitimately produced package, so the
+  // rule is "zero is lawful only when that bit says so" rather than "the two
+  // copies must be identical".
+  assert.deepEqual(
+    readWorksheetRows(
+      packageAt('control-streamed.xlsx', sheet(validRow), {
+        flags: 0x0008,
+        localFlags: 0x0008,
+        localCrc: 0,
+        localCompressedSize: 0,
+        localDeclaredSize: 0
+      })
+    ),
+    [{ A: 'S001' }],
+    'the lawful streaming form - data-descriptor bit set and the three local fields ' +
+      'zeroed - must still be read'
+  );
+
+  // Fail-closed entity handling must not become over-strict: every reference a
+  // worksheet may legally carry still resolves, and resolution is SINGLE PASS,
+  // so `&amp;lt;` yields the literal text `&lt;` rather than `<`. That last
+  // property is what stops markup being smuggled through two layers of
+  // escaping.
+  assert.deepEqual(
+    readWorksheetRows(
+      packageAt(
+        'legal-entities.xlsx',
+        sheet(
+          '<row r="1"><c r="A1" t="inlineStr"><is><t>a&amp;b &lt;c&gt; &quot;d&quot; ' +
+            '&apos;e&apos; &#65;&#x42;&#X43; &amp;lt;</t></is></c></row>'
+        )
+      )
+    ),
+    [{ A: 'a&b <c> "d" \'e\' ABC &lt;' }],
+    'the five predefined entities and decimal and hexadecimal character references ' +
+      'must resolve, and an escaped escape must stay literal'
+  );
 
   // The mirror image of the cases above: `PK\x05\x06` is four ordinary bytes
   // and may legally sit inside an archive comment, which trails the record it
@@ -2511,12 +3741,10 @@ test('32 an unreadable or malformed workbook fails with the path named', async (
   }
 });
 
-test('33 injecting both dependencies reads no file at all', async () => {
+test('injecting both dependencies reads no file at all', async () => {
   const registryPath = seedRegistry();
   const { directory, repository } = realDeps(registryPath);
   const missing = path.join(mkTemp(), 'no-such-dir');
-  // Both dependencies are supplied, so neither path is opened, checked, nor
-  // created - which is exactly what lets a test point them at nothing.
   const server = createServer({
     directory,
     repository,

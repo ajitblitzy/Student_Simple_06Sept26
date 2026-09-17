@@ -1,104 +1,55 @@
 'use strict';
 
 /**
- * verify-tests.js - the guard that stands between `npm test` and a vacuous pass.
+ * verify-tests.js - the guarded entry point of `npm test`.
  *
- * WHY THIS FILE EXISTS
- * ---------------------------------------------------------------------------
- * `node --test` with **no test files discovered** prints a zero-count summary
- * and **exits 0** - reproduced on this checkout - and that survives the script
- * layer, so `npm test` would "pass" on an empty or partially discovered suite.
- * A suite that silently stops running is worse than no suite at all, because
- * the green exit status is read as evidence. The same is true of the
- * programmatic runner used below: `run()` never sets an exit code, so a run
- * with one failing test, a nonexistent file or no files at all still leaves the
- * process exiting 0 - all three reproduced here before this file was written.
+ * It supplies the exit status nothing else does: `node --test` exits 0 when it
+ * discovers no test file, and the programmatic `run()` used here never sets an
+ * exit code at all, so an empty or partial suite would otherwise report a pass.
+ * It is wired as `scripts.test`, so the conventional command cannot bypass it;
+ * `npm run test:raw` is the unguarded runner, for per-test output.
  *
- * It is wired as `scripts.test`, so the guard cannot be bypassed by using the
- * conventional command. `npm run test:raw` remains the unguarded runner for
- * reading per-test output while developing, and it is deliberately not the gate.
+ * It lives at the repository root rather than under `test/`, because default
+ * discovery executes every `.js` file under `test/` as a test - a guard placed
+ * there would become one of the tests it counts.
  *
- * It lives at the repository **root**, not under `test/`: every `.js` file
- * inside a directory named `test/` is executed as a test by the runner's
- * default discovery - verified, a plain `test/helper.js` ran and was counted as
- * a passing test - so a guard placed there would become one of the tests it
- * exists to count.
+ * Exit 0 requires all of the following; anything else exits 1, naming each
+ * condition that did not hold:
  *
- * WHAT IT GUARANTEES
- * ---------------------------------------------------------------------------
- *   1. The host runtime satisfies `engines.node` from `package.json`, checked
- *      **before a single test runs**. This is the only place the runtime
- *      contract is enforced rather than merely declared: `engines` only warns
- *      (no `.npmrc` sets `engine-strict`, and none is added) and `.nvmrc` is
- *      inert without a version manager. The comparison follows npm's own
- *      semver semantics, **prerelease precedence included**, so an rc or
- *      nightly build of an otherwise in-range version is refused here exactly
- *      as npm would refuse it rather than passing on its numbers alone.
- *   2. Every declared test file exists, named individually when one does not.
- *   3. The suite runs **once**, at concurrency 1. That is required rather than
- *      cosmetic: `test/server.test.js` binds the fixed `127.0.0.1:3000`, and at
- *      default concurrency a second simultaneous bind fails with `EADDRINUSE`
- *      surfacing as *cancelled* tests whose message names neither the port nor
- *      the conflict.
- *   4. Exit 0 **only** when all three conditions hold - `passed >= MIN_TESTS`,
- *      `failed === 0` and `cancelled === 0`. All three are genuinely required:
- *      an empty run produces a zero exit, and a run has been observed
- *      reporting zero failures alongside a failing status because tests were
- *      cancelled rather than failed. `MIN_TESTS` is itself required to be an
- *      integer of **at least 1**, so the floor cannot be turned off: `passed
- *      >= 0` is satisfied by a run that executed nothing.
- *   5. A missing `test:summary` event is a failure, not a pass - it means the
- *      suite did not execute as intended. Both halves are required: the
- *      **cumulative** summary supplies the counts, and **every declared file**
- *      must additionally have emitted exactly one summary of its own, because a
- *      file that exits early or declares no test emits none while still
- *      contributing to the cumulative counts.
+ *   - The host runtime satisfies `engines.node` from `package.json`, checked
+ *     before any test runs. That check is the only enforcement of the runtime
+ *     contract: `engines` merely warns with no `.npmrc` setting
+ *     `engine-strict`, and `.nvmrc` is inert without a version manager.
+ *   - Every declared test file exists.
+ *   - The cumulative summary reports `passed >= MIN_TESTS` with `failed === 0`
+ *     and `cancelled === 0`. The floor is 45 by default; `MIN_TESTS` may set
+ *     any floor of at least 1, never 0, which a run that executed nothing
+ *     would satisfy.
+ *   - Every declared file emitted exactly one `test:summary` of its own.
  *
- * Only `test()` declarations count toward `counts.passed`; assertions made
- * inside a `before`/`after` hook do not. Nothing here compensates for that -
- * the suite is written so every guarded behaviour is a declared test.
+ * The suite runs at concurrency 1 because `test/server.test.js` binds the fixed
+ * `127.0.0.1:3000`: a concurrent second bind fails with `EADDRINUSE`, surfacing
+ * as cancelled tests that name neither the port nor the conflict.
  *
- * CONVENTIONS
- * ---------------------------------------------------------------------------
- * The conventions the repository scan established in `server.js`: CommonJS
- * `require`/`module.exports` with no ESM anywhere, two-space indentation,
- * single quotes, `const`, arrow callbacks, semicolons, errors carrying a `code`,
- * `process.exitCode` rather than `process.exit`, and **zero dependencies** -
- * `node:test` is built in, and the `engines.node` range is parsed here rather
- * than by adding `semver`.
- *
- * @example <caption>The authoritative suite command and the liveness proof</caption>
- * // npm test               -> exit 0 when 45 tests pass, 0 fail, 0 cancel
- * // MIN_TESTS=46 npm test  -> exit 1, naming 45 against 46: the guard is live
+ * Only `test()` declarations count toward `passed`; an assertion made inside a
+ * `before` or `after` hook does not.
  */
 
 const { run } = require('node:test');
 const fs = require('node:fs');
 const path = require('node:path');
 
-/* ---------------------------------------------------------------------------
- * Constants.
- * ------------------------------------------------------------------------- */
-
-/** Exit status of a run that satisfied every condition. */
 const EXIT_SUCCESS = 0;
-
-/** Exit status of any other run. There is no third outcome. */
 const EXIT_FAILURE = 1;
 
-/** The manifest this guard reads `engines.node` from, beside this file. */
 const MANIFEST_PATH = path.join(__dirname, 'package.json');
 
 /**
- * The suite, named explicitly and in this order. Explicit rather than
- * discovered for two verified reasons: passing a **directory** to the runner
- * fails, and every `.js` file under `test/` is otherwise executed as a test, so
- * a helper or a stray file would silently join the suite and inflate the very
- * count this file checks.
- *
- * Each path is resolved against `__dirname`, so the guard behaves identically
- * however it is invoked - `npm test`, `node verify-tests.js`, or an absolute
- * path from an unrelated working directory.
+ * The suite, in run order. Named explicitly rather than discovered: the runner
+ * does not accept a directory argument, and every `.js` file under `test/` would
+ * otherwise join the suite and inflate the count this guard checks. Each path
+ * resolves against `__dirname`, so the guard behaves identically however it is
+ * invoked.
  */
 const TEST_FILES = [
   'test/activities.test.js',
@@ -107,39 +58,24 @@ const TEST_FILES = [
 ].map((relativePath) => path.join(__dirname, relativePath));
 
 /**
- * 45 - the number of declared tests, 33 + 8 + 4 across the three files above.
- * It is a fixed floor written down on purpose: deriving it from the run itself
- * would make any number of executed tests "expected" and defeat the guard.
+ * The number of tests the suite declares, and a fixed floor: deriving it from
+ * the run itself would make any number of executed tests "expected".
  */
 const DEFAULT_MIN_TESTS = 45;
 
-/**
- * Overrides `DEFAULT_MIN_TESTS`, for subsetting the suite while developing. It
- * may lower the floor but never remove it - see `MINIMUM_MIN_TESTS`.
- */
 const MIN_TESTS_ENVIRONMENT_KEY = 'MIN_TESTS';
 
 /**
- * 1 - the smallest floor the override may set. A floor of zero would be met by
- * a run that executed nothing, so accepting it would hand back the vacuous pass
- * this file exists to prevent; `MIN_TESTS=1` is as permissive as subsetting is
- * allowed to get, and it still requires at least one test to have passed.
+ * The smallest floor an override may set. Zero is refused because `passed >= 0`
+ * holds for a run that executed nothing, so an override may narrow the floor
+ * for a subset but never remove it.
  */
 const MINIMUM_MIN_TESTS = 1;
 
-/** See guarantee 3 above: this is a correctness requirement, not a preference. */
 const TEST_CONCURRENCY = 1;
-
-/** How many failing tests are echoed before the list is truncated. */
 const FAILURE_DETAIL_LIMIT = 20;
-
-/** Characters of an assertion message echoed per failing test. */
 const MESSAGE_EXCERPT_LIMIT = 200;
-
-/** Characters of an offending configuration value echoed in a diagnostic. */
 const VALUE_EXCERPT_LIMIT = 64;
-
-/** Every line this file writes carries this prefix, on stdout and on stderr. */
 const LOG_PREFIX = 'verify-tests.js';
 
 const ERROR_CODE_MANIFEST = 'ERR_VERIFY_TESTS_MANIFEST';
@@ -148,21 +84,6 @@ const ERROR_CODE_CONFIG = 'ERR_VERIFY_TESTS_CONFIG';
 const ERROR_CODE_MISSING_FILE = 'ERR_VERIFY_TESTS_MISSING_FILE';
 const ERROR_CODE_RUNNER = 'ERR_VERIFY_TESTS_RUNNER';
 
-/* ---------------------------------------------------------------------------
- * Diagnostics.
- * ------------------------------------------------------------------------- */
-
-/**
- * Builds a guard failure, following the repository's error convention: a plain
- * `Error` whose message is prefixed with its origin and which carries a `code`
- * for programmatic discrimination. No ES class is introduced, because none is
- * used anywhere else in this codebase.
- *
- * @param {string} summary What went wrong, as one sentence.
- * @param {string} code One of the `ERROR_CODE_*` constants.
- * @param {unknown} [cause] The underlying error, when there is one.
- * @returns {Error} The failure, ready to throw.
- */
 const guardError = (summary, code, cause) => {
   const message = `${LOG_PREFIX}: ${summary}`;
   const error = cause === undefined ? new Error(message) : new Error(message, { cause });
@@ -171,10 +92,8 @@ const guardError = (summary, code, cause) => {
 };
 
 /**
- * Renders an untrusted value for a diagnostic: whitespace collapsed so a
- * multi-line value cannot break the one-line-per-problem output, length bounded
- * so a large value cannot flood it, and the empty string made visible rather
- * than printed as nothing.
+ * Renders an untrusted value for a diagnostic: whitespace collapsed so one
+ * problem stays on one line, length bounded, and the empty string made visible.
  *
  * @param {unknown} value The value at fault.
  * @param {number} [limit] Characters to keep.
@@ -189,11 +108,6 @@ const renderValue = (value, limit = VALUE_EXCERPT_LIMIT) => {
   return collapsed.length > limit ? `${collapsed.slice(0, limit)}...` : collapsed;
 };
 
-/**
- * @param {string} absolutePath A path inside the checkout.
- * @returns {string} It, relative to this file and with forward slashes, so
- *   output reads the same on Windows and on POSIX.
- */
 const displayPath = (absolutePath) => {
   const relativePath = path.relative(__dirname, absolutePath);
   if (relativePath === '' || relativePath.startsWith('..')) {
@@ -202,33 +116,18 @@ const displayPath = (absolutePath) => {
   return relativePath.split(path.sep).join('/');
 };
 
-/** @param {string} line Written verbatim to stdout with a trailing newline. */
 const writeOut = (line) => {
   process.stdout.write(`${line}\n`);
 };
 
-/** @param {string} line Written verbatim to stderr with a trailing newline. */
 const writeErr = (line) => {
   process.stderr.write(`${line}\n`);
 };
 
-/* ---------------------------------------------------------------------------
- * The `engines.node` range check - no dependency, hand-parsed.
- * ------------------------------------------------------------------------- */
-
-/** A numeric segment, or a wildcard standing for "unspecified". */
 const VERSION_SEGMENT_PATTERN = /^(?:0|[1-9]\d*|[xX*])$/;
-
-/** An optional operator followed by a version token, e.g. `>=24.0.0`. */
 const COMPARATOR_PATTERN = /^(>=|<=|>|<|=|\^|~)?\s*(.+)$/;
-
-/** One prerelease identifier: alphanumerics and hyphens, and never empty. */
 const PRERELEASE_IDENTIFIER_PATTERN = /^[0-9A-Za-z-]+$/;
-
-/** A prerelease identifier that is purely numeric, with no leading zero. */
 const NUMERIC_IDENTIFIER_PATTERN = /^(?:0|[1-9]\d*)$/;
-
-/** A prerelease identifier made only of digits, leading zero or not. */
 const DIGITS_ONLY_PATTERN = /^\d+$/;
 
 /**
@@ -353,17 +252,14 @@ const comparePrerelease = (left, right) => {
 /**
  * Parses a version token into a possibly partial triple and its prerelease.
  *
- * A leading `v` is accepted, because `process.version` carries one. **Build
- * metadata is discarded** (`+build.7`), because semver gives it no precedence -
- * it is the only suffix that may be dropped. A **prerelease is kept** and
- * compared (`-rc.1`, `-nightly.20260917`): npm's semver, the authority that
- * reads `engines.node` everywhere else, sorts a prerelease below its own
- * release and refuses it unless the range names a prerelease of the same
- * triple. Discarding it here would let `v24.0.0-rc.1` pass a `>=24.0.0 <25`
- * gate that npm rejects.
- *
- * A prerelease qualifies one exact triple, so it is **rejected** on a partial
- * or wildcard token (`24-rc`, `24.x-rc`) rather than quietly dropped.
+ * A leading `v` is accepted, because `process.version` carries one. Build
+ * metadata (`+build.7`) is discarded, because semver gives it no precedence. A
+ * prerelease (`-rc.1`, `-nightly.20260917`) is kept and compared: node-semver
+ * sorts a prerelease below its own release and admits it only where the range
+ * names a prerelease of the same triple, so discarding it here would let
+ * `v24.0.0-rc.1` pass a `>=24.0.0 <25` gate that npm rejects. A prerelease
+ * qualifies one exact triple, so it is rejected on a partial or wildcard token
+ * (`24-rc`, `24.x-rc`) rather than quietly dropped.
  *
  * @param {unknown} raw The token, e.g. `24.21.0`, `v24.21.0`, `24.x`, `24` or
  *   `24.0.0-rc.1`.
@@ -512,19 +408,16 @@ const compareVersions = (left, right) => {
 };
 
 /**
- * Expands one range token into the primitive comparators it means. Every
- * supported form reduces to `>=`, `>`, `<=` or `<` against a concrete version,
- * which is all the comparison below needs.
+ * Expands one range token into the primitive comparators it means: `>=`, `>`,
+ * `<=` or `<` against a concrete version, which is all the comparison needs.
  *
  * Supported: `*`, `x`, a bare or `=`-prefixed version (exact when complete, a
  * range when partial), `>=`, `>`, `<=`, `<`, `^` and `~`, each against a
- * version token - `>` and `<` against a *wildcard* are not, for the reason in
- * the body. Anything else returns `null` so the caller can **fail closed** - a
- * guard that cannot read the declared range must not report a pass.
- *
- * The desugaring matches npm's, `-0` upper bounds included, so a prerelease
- * runtime is judged by the same rules `npm install` would apply; see
- * `withLowestPrerelease`.
+ * version token. Anything else - an inequality against a wildcard included -
+ * returns `null` so the caller fails closed: a guard that cannot read the
+ * declared range must not report a pass. The desugaring matches npm's, `-0`
+ * upper bounds included, so a prerelease runtime is judged by the same rules;
+ * see `withLowestPrerelease`.
  *
  * @param {string} token One whitespace-delimited token of a range.
  * @returns {Comparator[]|null} The comparators, an empty array for "any
@@ -720,13 +613,6 @@ const satisfiesRange = (versionText, rangeText) => {
   });
 };
 
-/**
- * Reads and parses `package.json` beside this file.
- *
- * @returns {Record<string, unknown>} The parsed manifest.
- * @throws {Error} When it cannot be read or is not valid JSON, with the path
- *   named - a guard cannot check a contract it cannot load.
- */
 const readManifest = () => {
   let text;
   try {
@@ -780,19 +666,17 @@ const readEngineRange = () => {
 };
 
 /**
- * The runtime-contract check, and the first thing the guard does. It runs
- * before any test because a pass reported from an unsupported runtime is not
- * evidence of anything: the suite would be exercising APIs and behaviour the
- * project does not claim to support.
+ * The runtime-contract check, and the first thing the guard does: it runs before
+ * any test, because a pass reported from an unsupported runtime is not evidence
+ * of anything the project claims to support.
  *
  * @param {string} [version] The runtime to check, `process.version` by default.
  * @returns {{version: string, range: string}} The version checked and the range
  *   it satisfied.
- * @throws {Error} When the runtime is outside the range, naming both the
- *   detected version and the requirement - and, for an rc or nightly build,
- *   the prerelease rule that excluded it, since its numbers alone look inside
- *   the range and the refusal would otherwise read as a bug in this guard.
- *   Also when either side cannot be parsed.
+ * @throws {Error} When the runtime is outside the range, or either side cannot
+ *   be parsed. A refusal names the detected version and the requirement, and a
+ *   prerelease refusal also names the prerelease rule that excluded it, since
+ *   its numbers alone look inside the range.
  */
 const assertRuntimeSupported = (version = process.version) => {
   const range = readEngineRange();
@@ -809,26 +693,16 @@ const assertRuntimeSupported = (version = process.version) => {
   return { version, range };
 };
 
-/* ---------------------------------------------------------------------------
- * Configuration and preconditions.
- * ------------------------------------------------------------------------- */
-
 /**
  * Resolves the minimum number of passing tests: `DEFAULT_MIN_TESTS` unless the
  * environment overrides it for local subsetting.
  *
- * The override is validated as a **positive integer - at least 1** - and
- * rejected otherwise, including the empty string. Every part of that rule is
- * load-bearing:
- *
- *   - Zero is refused because `passed >= 0` holds for a run that executed
- *     nothing, which is exactly the vacuous pass this file exists to prevent;
- *     an override may narrow the floor for a subset, never remove it.
- *   - The empty string is refused because it coerces to `0`, and any other
- *     non-numeric text coerces to `NaN`, so both would make the comparison
- *     trivially or permanently satisfied - a guard that can never fail.
- *   - The match is anchored and digits-only, so `1e3`, ` 4.5`, `+5` and `-1`
- *     are text, not numbers, here.
+ * The override must be an integer of at least 1, and is rejected otherwise.
+ * Zero and the empty string, which coerces to `0`, would leave the comparison
+ * trivially satisfied by a run that executed nothing; any other non-numeric
+ * text coerces to `NaN`, which no count can be compared against at all. The
+ * match is anchored and digits-only, so `1e3`, ` 4.5`, `+5` and `-1` are text
+ * here, not numbers.
  *
  * @param {Record<string, (string|undefined)>} [environment] `process.env` by
  *   default; injectable so the rule is assertable without mutating the process.
@@ -905,10 +779,6 @@ const assertTestFilesPresent = (files) => {
   return files;
 };
 
-/* ---------------------------------------------------------------------------
- * Running the suite.
- * ------------------------------------------------------------------------- */
-
 /**
  * Reads one count off a summary payload defensively. An absent or non-numeric
  * count becomes `NaN`, which every condition below treats as a failure rather
@@ -923,17 +793,8 @@ const countOf = (counts, key) => {
   return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN;
 };
 
-/**
- * @param {number} count A possibly unreadable count.
- * @returns {string} It, or the word `unknown`, so a diagnostic never prints
- *   `NaN` at a reader.
- */
 const describeCount = (count) => (Number.isNaN(count) ? 'unknown' : String(count));
 
-/**
- * @param {unknown} counts The `counts` object of a `test:summary` event.
- * @returns {string} A compact, fixed-order rendering of the counts that matter.
- */
 const formatCounts = (counts) => {
   const passed = describeCount(countOf(counts, 'passed'));
   const failed = describeCount(countOf(counts, 'failed'));
@@ -944,10 +805,9 @@ const formatCounts = (counts) => {
 };
 
 /**
- * Summarizes one failing test for the diagnostic list.
- *
  * @param {unknown} event A `test:fail` payload.
- * @returns {{name: string, file: string, message: string}} The failure, bounded.
+ * @returns {{name: string, file: string, message: string}} That failing test
+ *   summarized for the diagnostic list, every field bounded.
  */
 const describeFailure = (event) => {
   const data = event === null || typeof event !== 'object' ? {} : event;
@@ -967,21 +827,16 @@ const describeFailure = (event) => {
  * Runs the suite once through the programmatic runner and collects everything
  * the verdict needs.
  *
- * Two mechanics here are load-bearing and were verified rather than assumed:
+ * The run is at `concurrency: 1`, because `test/server.test.js` binds the fixed
+ * `127.0.0.1:3000`. The returned stream must be consumed or `end` never fires
+ * and this promise never settles; the `data` listener is that consumer.
  *
- *   - `concurrency: 1`, because `test/server.test.js` binds the fixed
- *     `127.0.0.1:3000` (guarantee 3 in the file header).
- *   - The returned stream is **consumed**. Without a consumer, `end` never
- *     fires and this promise would never settle; the `data` listener is that
- *     consumer, and it deliberately does nothing with the events beyond letting
- *     them flow.
- *
- * A file that ran emits its own `test:summary` carrying a `file`, and the
- * cumulative summary arrives with no `file` property - which is how the two are
- * told apart here. Both are kept and both are checked: the cumulative one is
- * the only source of the verdict's counts, and the per-file ones are what shows
- * every declared file actually ran (`auditFileSummaries`). Neither is allowed
- * to stand in for the other.
+ * A file that ran emits its own `test:summary` carrying a `file`, while the
+ * cumulative summary arrives with no `file` - which is how the two are told
+ * apart. Both are kept and both are checked: the cumulative one is the only
+ * source of the verdict's counts, and the per-file ones show that every
+ * declared file actually ran (`auditFileSummaries`). Neither stands in for the
+ * other.
  *
  * @param {string[]} files Absolute paths, already checked for existence.
  * @param {{runner?: Function}} [options] `runner` replaces `node:test`'s `run`;
@@ -1053,12 +908,8 @@ const runSuite = (files, options = {}) => new Promise((resolve, reject) => {
   });
 });
 
-/* ---------------------------------------------------------------------------
- * The verdict.
- * ------------------------------------------------------------------------- */
-
 /**
- * Applies the counts half of the guard to the **cumulative** summary: all three
+ * Applies the counts half of the guard to the cumulative summary: all three
  * conditions must hold, and a missing summary is a failure in its own right
  * rather than something another event can stand in for. The other half - that
  * every declared file actually reported - is `auditFileSummaries`.
@@ -1087,9 +938,8 @@ const evaluateRun = (summary, minTests) => {
   if (failed !== 0) {
     reasons.push(`failed is ${describeCount(failed)}, expected 0`);
   }
-  // Cancelled tests are their own condition: a run has been observed reporting
-  // zero failures while tests were cancelled, which a failure check alone
-  // would pass.
+  // Cancelled tests are their own condition: a run can report zero failures
+  // while tests were cancelled, which a failure check alone would pass.
   if (cancelled !== 0) {
     reasons.push(`cancelled is ${describeCount(cancelled)}, expected 0`);
   }
@@ -1119,15 +969,14 @@ const summaryPathKey = (filePath) => {
 };
 
 /**
- * Requires **exactly one** per-file `test:summary` from every declared file.
+ * Requires exactly one per-file `test:summary` from every declared file.
  *
- * The aggregate alone is not sufficient evidence that the suite ran, and that
- * was measured rather than assumed on v24.21.0: a test file that calls
- * `process.exit(0)` part way through, and a test file that declares no test at
- * all, each emit **no** per-file summary while still adding 1 to the
- * aggregate's `passed` with `failed` at 0. A whole file can therefore fail to
- * run behind a clean-looking total. Two summaries for one file are refused for
- * the mirror-image reason: the total would then include that file twice.
+ * The aggregate alone is not evidence that the suite ran: a file that exits part
+ * way through, and a file that declares no test at all, each emit no per-file
+ * summary while still contributing to the aggregate's `passed` with `failed` at
+ * 0, so a whole file can fail to run behind a clean-looking total. Two
+ * summaries for one file are refused because the total would then include that
+ * file twice.
  *
  * @param {string[]} files The declared suite, in order.
  * @param {object[]} fileSummaries The per-file `test:summary` payloads
@@ -1176,9 +1025,8 @@ const reportFailures = (outcome) => {
 };
 
 /**
- * Turns any thrown value into one stderr line. Mirrors `server.js`'s
- * `reportStartupFailure`: the message is collapsed to a single line, and no
- * stack is printed, because the message names the problem and the fix.
+ * Turns any thrown value into one stderr line, collapsed to a single line with
+ * no stack, because the message names the problem and the fix.
  *
  * @param {unknown} error The guard failure.
  * @returns {void}
@@ -1190,31 +1038,23 @@ const reportGuardFailure = (error) => {
   writeErr(detail.replace(/\s+/g, ' '));
 };
 
-/* ---------------------------------------------------------------------------
- * Entry point.
- * ------------------------------------------------------------------------- */
-
 /**
- * The whole guard, in the order the contract requires: runtime first, then
- * configuration, then preconditions, then the single run, then the verdict.
- *
- * It returns an exit status instead of setting one, so the status is a value
- * the caller can assert rather than a side effect it has to observe.
+ * The whole guard, in the order the contract requires: runtime, configuration,
+ * preconditions, the single run, then the verdict. It returns an exit status
+ * instead of setting one, so the status is a value the caller can assert.
  *
  * @param {{files?: string[], environment?: Record<string, (string|undefined)>, version?: string, runner?: Function}} [options]
  *   Injection seams, all defaulted to the real thing: the declared suite,
  *   `process.env`, `process.version` and `node:test`'s `run`.
  * @returns {Promise<number>} `EXIT_SUCCESS` only when the cumulative summary
- *   cleared every condition of `evaluateRun` **and** every declared file
- *   reported exactly one summary of its own; `EXIT_FAILURE` otherwise, with one
- *   stderr line naming every reason.
+ *   cleared every condition of `evaluateRun` and every declared file reported
+ *   exactly one summary of its own; `EXIT_FAILURE` otherwise, with one stderr
+ *   line naming every reason.
  */
 const main = async (options = {}) => {
   try {
     const files = Array.isArray(options.files) ? options.files : TEST_FILES;
 
-    // Fails fast, before anything is executed: an unsupported runtime cannot
-    // produce evidence this project is willing to stand behind.
     const runtime = assertRuntimeSupported(options.version === undefined ? process.version : options.version);
     const minTests = resolveMinTests(options.environment === undefined ? process.env : options.environment);
     assertTestFilesPresent(files);
@@ -1248,12 +1088,10 @@ const main = async (options = {}) => {
 };
 
 /**
- * Exported for in-process verification of the pieces that decide a verdict -
- * the range parser, the `MIN_TESTS` rule and the guard itself - which cannot be
- * reached through the command line without running the whole suite. Requiring
- * this module has **no side effect**: nothing is checked and no test is run
- * unless this file is the process entry point, the same lifecycle `server.js`
- * uses.
+ * Exported so the pieces that decide a verdict - the range parser, the
+ * `MIN_TESTS` rule and the guard itself - can be exercised in process without
+ * running the whole suite. Requiring this module has no side effect: nothing is
+ * checked and no test runs unless this file is the process entry point.
  */
 module.exports = {
   TEST_FILES,
