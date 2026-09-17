@@ -1,0 +1,18 @@
+{
+  "name": "student-simple-06sept26",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP service over the committed student workbooks, exposing extracurricular activity data keyed by Student ID.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=24.0.0 <25",
+    "npm": ">=11.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node verify-tests.js",
+    "test:raw": "node --test --test-concurrency=1 test/activities.test.js test/server.test.js test/workbooks.test.js"
+  }
+}
