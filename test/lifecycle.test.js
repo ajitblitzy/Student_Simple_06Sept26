@@ -9,10 +9,17 @@
  * runs it: the same runtime, the same entry point, the literal port 3000. That
  * is what lets it assert the process-level facts — what the service actually
  * writes to stdout and stderr, how many times, the exit disposition of a
- * refused bind, and that the process carries on serving after a refused store
- * write — and it asserts the preserved response and the `/activities`
- * namespace boundary against that spawned instance, end to end over a real
- * socket.
+ * refused bind, the exit disposition of a misconfigured store path that stops
+ * the service loading at all, and that the process carries on serving after a
+ * refused store write — and it asserts the preserved response and the
+ * `/activities` namespace boundary against that spawned instance, end to end
+ * over a real socket.
+ *
+ * Each of `server.js`'s three failure dispositions is asserted here as the
+ * exact bytes it writes: a refused bind, a refused startup, and a refused
+ * store write. All three are meant to be one legible line rather than a stack
+ * trace, and an assertion weaker than an exact one would pass against the very
+ * dump it is named for.
  *
  * SERIAL ONLY
  * -----------
@@ -161,6 +168,78 @@ const UNHANDLED_CRASH_MARKERS = [
   'Node.js v',
 ];
 
+/**
+ * The HANDLED startup configuration fault, as `server.js`'s startup boundary
+ * reports it: the same `server error: <CODE>` shape a refused bind uses, then
+ * the error's own actionable sentence, `process.exitCode = 1`, and nothing on
+ * stdout.
+ *
+ * Two lines rather than one, deliberately. The first is the shape an operator
+ * or a start script gates on and is asserted EXACTLY. The second is the only
+ * part of the fault that tells a reader what to change, and is asserted by the
+ * three things it must name — see `PROTECTED_FAULT_SENTENCE_MARKERS` — rather
+ * than verbatim, so rewording the sentence in `activity-store.js` does not
+ * fail this file while an empty or unhelpful sentence still does.
+ */
+const HANDLED_STARTUP_FAULT_LINE = 'server error: E_STORE_PATH_PROTECTED';
+const HANDLED_STARTUP_FAULT_EXIT_CODE = 1;
+
+/**
+ * What the second line must name: the variable to change, the file it resolved
+ * to, and where to point it instead. A sentence missing any of the three is not
+ * actionable, which is the whole justification for printing it at all.
+ */
+const PROTECTED_FAULT_SENTENCE_MARKERS = [
+  'ACTIVITY_STORE',
+  'xlsx-read.js',
+  'outside the repository',
+];
+
+/**
+ * The byte ceiling for that whole report.
+ *
+ * Measured rather than chosen: the two lines are 226 bytes, and the
+ * uncaught-throw dump this disposition replaced was 1 421 bytes across 25
+ * lines. 512 leaves room for a longer protected file name while failing long
+ * before anything resembling a stack dump could fit.
+ */
+const STARTUP_FAULT_STDERR_MAX_BYTES = 512;
+
+/**
+ * The character bound `server.js` caps that second line at, restated here so a
+ * change to one without the other is caught rather than silently tolerated. The
+ * real refusal sentence is comfortably inside it; the case that exercises the
+ * cap fabricates a message far past it.
+ */
+const STARTUP_FAULT_DETAIL_MAX_CHARS = 400;
+
+/**
+ * Fragments that belong to Node's UNCAUGHT-THROW dump and to no handled
+ * report: the module loader's internal frames, the runtime's version banner,
+ * the re-thrown source line, and `diagnostic:` — which can only appear if the
+ * error OBJECT was handed to `console.error` and printed in its inspected
+ * form, rather than its `code` and `message` being printed as strings.
+ *
+ * Asserting their absence is what makes the group load-bearing: it fails if
+ * anyone removes the startup boundary from `server.js`, which is the exact
+ * regression it exists to catch.
+ */
+const UNCAUGHT_THROW_MARKERS = [
+  'node:internal',
+  'Node.js v',
+  'throw error;',
+  'diagnostic:',
+  'RangeError:',
+];
+
+/**
+ * An absolute filesystem path, in either platform's spelling: a drive letter
+ * followed by a backslash, or a POSIX path of two or more segments. Not a
+ * global regex, so `.test()` is stateless and cannot skip a match because of a
+ * previous call's `lastIndex`.
+ */
+const ABSOLUTE_PATH_SHAPE = /[A-Za-z]:\\|(?:^|[\s(])\/[^\s/]+\/[^\s/]/;
+
 /** Response media types the claimed namespace uses, for the boundary cases. */
 const HTML_CONTENT_TYPE = 'text/html; charset=utf-8';
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
@@ -245,6 +324,24 @@ const CONNECT_DEADLINE_MS = 5000;
  * assertion would pass simply because the output had not arrived yet.
  */
 const QUIET_PERIOD_MS = 300;
+/**
+ * How many consecutive unchanged polls make a child's captured output QUIET.
+ *
+ * Derived from the settling period above rather than chosen independently, so
+ * the adaptive wait in `awaitOutputQuiescence` can never accept a shorter span
+ * of silence than the fixed settle it replaces: at `POLL_INTERVAL_MS` per poll,
+ * this many polls cover at least `QUIET_PERIOD_MS`. `Math.ceil` is what keeps
+ * that true if either constant is ever retuned.
+ */
+const OUTPUT_QUIET_POLLS = Math.ceil(QUIET_PERIOD_MS / POLL_INTERVAL_MS);
+/**
+ * 100 polls x 50 ms = a 5-second ceiling on waiting for output to go quiet.
+ *
+ * The ceiling is what stops a child that never stops writing from turning a
+ * settle into a hang. Reaching it is not itself a failure — see
+ * `awaitOutputQuiescence` for why the wait returns there rather than throwing.
+ */
+const OUTPUT_QUIESCENCE_POLL_ATTEMPTS = 100;
 /**
  * A generous per-case ceiling. It exists so a defect surfaces as a failed case
  * with a message rather than as a suite that never finishes; no healthy case
@@ -966,19 +1063,26 @@ function childEnvironment(storePath) {
  *
  * The category is decided by a string comparison, never by touching the
  * filesystem: `writableStorePath` puts a store directly in the temporary root,
- * and `unwritableStorePath` puts it two levels below, under a directory that is
- * never created.
+ * `unwritableStorePath` puts it two levels below under a directory that is
+ * never created, and `protectedStorePath` names a tracked file of the
+ * repository itself.
  *
  * @param {string} storePath The child's `ACTIVITY_STORE` value.
  * @returns {string} A path-free description.
  */
 function describeStore(storePath) {
-  const insideTemporaryRoot =
-    temporaryRoot !== null && path.dirname(storePath) === temporaryRoot;
+  if (temporaryRoot !== null && path.dirname(storePath) === temporaryRoot) {
+    return `${path.basename(storePath)} (writable, directly inside the suite's temporary root)`;
+  }
 
-  return insideTemporaryRoot
-    ? `${path.basename(storePath)} (writable, directly inside the suite's temporary root)`
-    : `${path.basename(storePath)} (parent directory absent — the deliberately unwritable case)`;
+  // Named third because a protected destination is the one category that does
+  // not live under the temporary root at all, and reporting it as the
+  // unwritable case would send a reader looking for a missing directory.
+  if (path.dirname(storePath) === REPOSITORY_ROOT) {
+    return `${path.basename(storePath)} (a tracked file of the repository — the protected case)`;
+  }
+
+  return `${path.basename(storePath)} (parent directory absent — the deliberately unwritable case)`;
 }
 
 /**
@@ -1066,6 +1170,65 @@ async function awaitReadiness(handle) {
     `the service did not log its readiness line within ` +
       `${(READINESS_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 1000}s\n${describeService(handle)}`
   );
+}
+
+/**
+ * Waits, bounded, for a child's captured output to STOP GROWING.
+ *
+ * This is the adaptive form of the settling period, for the one assertion that
+ * can have it: a case that has already awaited everything it asked the service
+ * to do, where the only thing still outstanding is an asynchronous flush of the
+ * child's stdio pipes. Polling for silence instead of sleeping through a
+ * guessed interval is what makes it wait LONGER on a host that is still
+ * flushing, and no longer than it has to on one that finished immediately.
+ *
+ * Both streams are measured together, as one length. A stray line on stderr
+ * violates "serving requests adds no output" exactly as much as a stray line on
+ * stdout, so one wait covers both rather than settling the first and leaving
+ * the second to luck.
+ *
+ * Two properties are deliberate, and neither is an implementation detail.
+ *
+ * It CANNOT be weaker than the fixed settle it replaces. Returning takes
+ * `OUTPUT_QUIET_POLLS` consecutive unchanged measurements, derived from
+ * `QUIET_PERIOD_MS`, so the shortest silence it will accept is the same span a
+ * `sleep(QUIET_PERIOD_MS)` observed — a contended host only makes it wait for
+ * more than that, never less.
+ *
+ * And on exhausting `OUTPUT_QUIESCENCE_POLL_ATTEMPTS` it RETURNS rather than
+ * throwing. Output that never stops growing is precisely the defect the
+ * caller's assertions exist to report, and they report it exactly — naming the
+ * readiness count, the line count and a redacted preview. A throw here would
+ * replace that diagnosis with a helper's own timeout message, which says less
+ * about the failure and would be actively misleading about which failure it was.
+ *
+ * @param {object} handle A handle from `spawnService`.
+ * @returns {Promise<void>} Resolves once the captured output has been unchanged
+ *   for a full quiet window, or once the ceiling is reached — the caller's
+ *   assertions render judgement either way.
+ */
+async function awaitOutputQuiescence(handle) {
+  const measure = () => handle.stdout.length + handle.stderr.length;
+
+  // The baseline is taken BEFORE the first sleep, so the first unchanged poll
+  // already attests to a whole `POLL_INTERVAL_MS` of silence rather than to a
+  // single instant.
+  let previous = measure();
+  let quietPolls = 0;
+
+  for (let attempt = 0; attempt < OUTPUT_QUIESCENCE_POLL_ATTEMPTS; attempt += 1) {
+    await sleep(POLL_INTERVAL_MS);
+
+    const current = measure();
+    // Any growth resets the window rather than shortening it: the point is a
+    // full quiet span at the END of the output, not a quiet span somewhere.
+    quietPolls = current === previous ? quietPolls + 1 : 0;
+    previous = current;
+
+    if (quietPolls >= OUTPUT_QUIET_POLLS) {
+      return;
+    }
+  }
 }
 
 /**
@@ -1503,6 +1666,110 @@ function writableStorePath(name) {
  */
 function unwritableStorePath(name) {
   return path.join(temporaryRoot, name, 'absent-directory', 'activities.json');
+}
+
+/**
+ * A store path naming a TRACKED FILE of this repository, which the store
+ * refuses outright.
+ *
+ * `xlsx-read.js` is chosen for two reasons. It is on the protected list, so the
+ * refusal is the one under test rather than an incidental filesystem error. And
+ * a write to the store is a `rename` OVER the target, so a file that is
+ * genuinely needed by the next case is the honest subject: the assertions below
+ * hash it before and after to show it was never touched.
+ *
+ * The file is never modified by anything here. It is not created, not opened
+ * for writing and not renamed over — the point of the case is that the service
+ * refuses before any of that can happen.
+ *
+ * @returns {string} The absolute path of a protected repository file.
+ */
+function protectedStorePath() {
+  return path.join(REPOSITORY_ROOT, 'xlsx-read.js');
+}
+
+/**
+ * Runs `node` with the given arguments to completion and returns everything it
+ * wrote.
+ *
+ * Separate from `spawnService` because the subject is different: that helper
+ * spawns the service and hands back a live handle to interrogate while it runs,
+ * whereas these children are expected to be GONE by the time anything is
+ * asserted — they refuse to start, or they load a module and print one thing.
+ * Bending `spawnService` to both shapes would put a readiness gate and a port
+ * release in the path of a child that binds nothing.
+ *
+ * Bounded and reaped: the wait is deadlined, and a child that outlives its
+ * deadline is killed and reported rather than waited on, so no case here can
+ * hang the runner or leave a process behind.
+ *
+ * @param {Array<string>} args The arguments for `process.execPath`.
+ * @param {string} storePath The value for `ACTIVITY_STORE`.
+ * @param {string} [cwd] The child's working directory. Defaults to the
+ *   repository root, which is what `npm start` uses; a case that runs a COPY of
+ *   the entry point beside a stub module passes that copy's directory instead,
+ *   so the copy's relative require resolves to the stub rather than to the real
+ *   feature.
+ * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string}>}
+ *   The child's exit disposition and its complete output.
+ * @throws {Error} When the child does not close within the deadline.
+ */
+async function runNodeToCompletion(args, storePath, cwd = REPOSITORY_ROOT) {
+  const child = spawn(process.execPath, args, {
+    cwd,
+    env: childEnvironment(storePath),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const result = { code: null, signal: null, stdout: '', stderr: '' };
+
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    result.stdout += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    result.stderr += chunk;
+  });
+
+  // A failure to start the executable arrives asynchronously; without a
+  // listener it is an unhandled `'error'` event that takes the runner down.
+  // Reduced at capture, like `spawnService` does, so nothing path-bearing is
+  // held for a later reader to print.
+  const spawnFailures = [];
+  child.once('error', (error) => {
+    spawnFailures.push(errorCode(error));
+  });
+
+  // `'close'` rather than `'exit'`: every assertion below reads the captured
+  // output, and only `'close'` guarantees the pipes have finished flushing.
+  const closed = new Promise((resolve) => {
+    child.once('close', (code, signal) => {
+      result.code = code;
+      result.signal = signal;
+      resolve();
+    });
+  });
+
+  if (!(await awaitWithDeadline(closed, EXIT_DEADLINE_MS))) {
+    child.kill('SIGKILL');
+    await awaitWithDeadline(closed, CLOSE_DEADLINE_MS);
+    throw new Error(
+      `a child that should have exited on its own did not close within ` +
+        `${EXIT_DEADLINE_MS / 1000}s (pid ${child.pid}); it was killed. ` +
+        `${summarizeOutput('stdout', result.stdout)}; ` +
+        `${summarizeOutput('stderr', result.stderr)}`
+    );
+  }
+
+  if (spawnFailures.length > 0) {
+    throw new Error(
+      `the child could not be started (${spawnFailures.join(', ')}), so nothing ` +
+        `it was supposed to report can be asserted`
+    );
+  }
+
+  return result;
 }
 
 before(
@@ -2115,7 +2382,12 @@ describe('startup and the readiness contract', () => {
       await request({ path: '/' });
       await request({ path: '/activities' });
       await request({ path: `/activities/${SEEDED_STUDENT_ID}` });
-      await sleep(QUIET_PERIOD_MS);
+      // All three requests above are already awaited, so the only thing still
+      // outstanding is an asynchronous flush of the child's stdio. That is a
+      // thing that finishes, so it is waited FOR rather than slept through:
+      // bounded, never accepting a shorter silence than `QUIET_PERIOD_MS`, and
+      // waiting longer than that on a host still writing.
+      await awaitOutputQuiescence(service);
 
       assert.strictEqual(
         countReadinessLines(service.stdout),
@@ -2137,6 +2409,55 @@ describe('startup and the readiness contract', () => {
         service.stderr,
         '',
         `serving valid requests must write nothing to stderr\n${describeService(service)}`
+      );
+    }
+  );
+
+  test(
+    'loading the file as a module prints no readiness line and binds nothing',
+    { timeout: CASE_TIMEOUT_MS },
+    async () => {
+      // The other half of the readiness contract, and the half that is easy to
+      // lose. The line is emitted from inside the `require.main === module`
+      // guard, so a caller that LOADS the service must see nothing: it has not
+      // started anything, and a readiness line would be a claim about a
+      // listener that does not exist. Anyone driving the exported seam — which
+      // is how this file asserts the loopback bind, and how a harness reaches
+      // the service when the literal port is unavailable — depends on that
+      // silence being deliberate rather than incidental.
+      //
+      // Asserted in a CHILD process because the question is about what a fresh
+      // load writes to stdout. In this process the module is already in the
+      // CommonJS registry from the case that requires it, so a second require
+      // would print nothing for a reason that has nothing to do with the guard.
+      const result = await runNodeToCompletion(
+        ['-e', "console.log('listening=' + require('./server').server.listening);"],
+        writableStorePath('module-load-silence')
+      );
+
+      assert.deepStrictEqual(
+        outputLines(result.stdout),
+        ['listening=false'],
+        `loading the module must print exactly the caller's own line — no readiness ` +
+          `line, and nothing bound. stdout was ${JSON.stringify(result.stdout)}`
+      );
+      assert.strictEqual(
+        countReadinessLines(result.stdout),
+        0,
+        'the readiness line belongs to direct execution alone: a module load has ' +
+          'started no listener and must claim no readiness'
+      );
+      assert.strictEqual(
+        normalizeNewlines(result.stderr),
+        '',
+        `and a clean module load must write nothing to stderr. stderr was ` +
+          `${JSON.stringify(result.stderr)}`
+      );
+      assert.strictEqual(
+        result.code,
+        0,
+        'a module load that binds nothing holds no handle, so the process leaves ' +
+          'of its own accord with a clean status'
       );
     }
   );
@@ -3059,6 +3380,351 @@ describe('the unwritable-store disposition', () => {
         () => fs.access(path.dirname(storePath)),
         (error) => error.code === 'ENOENT',
         'the service must not create the missing directory on its own'
+      );
+    }
+  );
+});
+
+
+/* ========================================================================= *
+ * The protected-store startup disposition
+ *
+ * The third failure `server.js` owns, and the only one that happens before
+ * there is a listener to report it or a request to answer with: an
+ * `ACTIVITY_STORE` naming a tracked file of this repository is refused while
+ * `activity-store.js` is loading, so the fault comes out of the feature
+ * require rather than out of a handler.
+ *
+ * WHAT MAKES THIS GROUP LOAD-BEARING. Left uncaught, that throw becomes Node's
+ * default uncaught-throw dump — measured at 1 421 bytes across 25 lines, with
+ * 10 stack frames, 7 of them the CommonJS loader's internals, the absolute
+ * path of three source files, the inspected error object, and the runtime's
+ * version banner. Every one of those facts is correct and none of them is
+ * diagnosis: what an operator needs is the code and the sentence naming the
+ * variable, the file and the remedy. So these cases assert the report EXACTLY
+ * and reject the dump's markers BY NAME, which is what fails if the startup
+ * boundary is ever removed.
+ *
+ * The disposition is the same one a refused bind gets — one `server error:
+ * <CODE>` line, a non-zero exit, nothing on stdout, no stack trace — because a
+ * reader gating on that shape should not have to parse a line for one startup
+ * fault and a stack dump for the other.
+ *
+ * This group binds NO port: the child refuses before it can listen, and the
+ * module-consumer case loads the file without executing it as a program. It
+ * still sits behind the file's pre-flight probe, because the probe gates the
+ * file rather than the case.
+ * ========================================================================= */
+
+describe('the protected-store startup disposition', () => {
+  /** @type {object|null} */
+  let refusedInstance = null;
+
+  /** The protected file's digest, taken BEFORE anything is spawned. */
+  let protectedFileDigestBefore = null;
+
+  before(
+    async () => {
+      // Hashed first, so the comparison at the end is against the file as it
+      // was before a service was ever pointed at it.
+      protectedFileDigestBefore = sha256(await fs.readFile(protectedStorePath()));
+
+      // `spawnService`, not `startService`: this child is REFUSED, so it never
+      // writes a readiness line and gating on one would report a startup
+      // failure where the refusal is the subject.
+      refusedInstance = spawnService(protectedStorePath());
+
+      // `closed`, not `exited`: every case below reads the captured output, and
+      // only `'close'` guarantees the pipes have finished flushing.
+      const closed = await awaitWithDeadline(refusedInstance.closed, EXIT_DEADLINE_MS);
+      assert.strictEqual(
+        closed,
+        true,
+        `an instance given a protected store must refuse to start and leave, not ` +
+          `keep running\n${describeService(refusedInstance)}`
+      );
+    },
+    { timeout: CASE_TIMEOUT_MS }
+  );
+
+  after(
+    async () => {
+      if (refusedInstance !== null) {
+        // `killService` rather than `stopService`: this child never held port
+        // 3000, so waiting for the port to be released here would only wait out
+        // whatever legitimately holds it. The call is unconditional and safe on
+        // a child that has already gone, which is what keeps the no-orphans
+        // case at the foot of this file honest.
+        await killService(refusedInstance);
+        refusedInstance = null;
+      }
+    },
+    { timeout: CASE_TIMEOUT_MS }
+  );
+
+  test(
+    'the instance exits non-zero, writes nothing to stdout, and claims no readiness',
+    { timeout: CASE_TIMEOUT_MS },
+    () => {
+      assert.strictEqual(
+        typeof refusedInstance.close.code,
+        'number',
+        `it must exit of its own accord with a status code, not be terminated by a ` +
+          `signal\n${describeService(refusedInstance)}`
+      );
+      assert.strictEqual(
+        refusedInstance.close.signal,
+        null,
+        'no signal was sent to it — it left on its own'
+      );
+      assert.strictEqual(
+        refusedInstance.close.code,
+        HANDLED_STARTUP_FAULT_EXIT_CODE,
+        `the startup boundary sets process.exitCode = ${HANDLED_STARTUP_FAULT_EXIT_CODE} and ` +
+          `lets the loop drain, so the exit status is exactly that — a misconfigured ` +
+          `service must not exit 0 and look like a clean run to a start script\n` +
+          `${describeService(refusedInstance)}`
+      );
+
+      assert.strictEqual(
+        normalizeNewlines(refusedInstance.stdout),
+        '',
+        `an instance that never composed the service must write nothing to stdout\n` +
+          `${describeService(refusedInstance)}`
+      );
+      assert.strictEqual(
+        countReadinessLines(refusedInstance.stdout),
+        0,
+        'an instance that never bound must not claim readiness'
+      );
+    }
+  );
+
+  test(
+    'stderr is exactly the handled line and one actionable sentence',
+    { timeout: CASE_TIMEOUT_MS },
+    () => {
+      const lines = outputLines(refusedInstance.stderr);
+
+      assert.strictEqual(
+        lines.length,
+        2,
+        `the refusal must be reported as exactly two lines — the handled shape and ` +
+          `the sentence that says what to change — and ${lines.length} were written. ` +
+          `More than two means the uncaught-throw dump is back\n` +
+          `${describeService(refusedInstance)}`
+      );
+      assert.strictEqual(
+        lines[0],
+        HANDLED_STARTUP_FAULT_LINE,
+        `the first line must be exactly "${HANDLED_STARTUP_FAULT_LINE}" — the same ` +
+          `shape the 'error' listener uses for a refused bind, so one gate reads both`
+      );
+
+      for (const marker of PROTECTED_FAULT_SENTENCE_MARKERS) {
+        assert.strictEqual(
+          lines[1].includes(marker),
+          true,
+          `the sentence must name ${JSON.stringify(marker)}: a refusal that does not ` +
+            `name the variable, the file it resolved to and where to point it instead ` +
+            `is not actionable, and being actionable is the only reason it is printed ` +
+            `at all. Received ${JSON.stringify(lines[1])}`
+        );
+      }
+    }
+  );
+
+  test(
+    'the refusal prints no stack frame, no Node internals and no filesystem path',
+    { timeout: CASE_TIMEOUT_MS },
+    () => {
+      // The negative half of the same contract, as its own named case so it
+      // fails on its own and says which marker appeared. The case above pins
+      // the line count, which implies all of this; stating it separately is
+      // deliberate, because the implication runs the wrong way for a reader —
+      // this case names the dump for what it is instead of reporting a count
+      // mismatch and leaving them to recognise a stack trace in the diff.
+      for (const marker of UNCAUGHT_THROW_MARKERS) {
+        assert.strictEqual(
+          refusedInstance.stderr.includes(marker),
+          false,
+          `stderr must not contain ${JSON.stringify(marker)} — that fragment belongs ` +
+            `to Node's uncaught-throw dump, so its presence means the startup ` +
+            `boundary in server.js is no longer catching the configuration fault\n` +
+            `${describeService(refusedInstance)}`
+        );
+      }
+
+      assert.strictEqual(
+        /^\s*at\s/m.test(refusedInstance.stderr),
+        false,
+        `the refusal must print no stack frame: a handled startup fault is one legible ` +
+          `line plus its sentence, and a stack trace is what this disposition replaced\n` +
+          `${describeService(refusedInstance)}`
+      );
+
+      // A misconfiguration report is read by whoever operates the host and
+      // retained wherever their logs go, so it names the repository-relative
+      // file and never the checkout's location on disk.
+      assert.strictEqual(
+        ABSOLUTE_PATH_SHAPE.test(refusedInstance.stderr),
+        false,
+        `the refusal must disclose no absolute path: the uncaught-throw dump it ` +
+          `replaced carried three, and the message names the repository-relative file ` +
+          `instead\n${describeService(refusedInstance)}`
+      );
+      assert.strictEqual(
+        redactPaths(refusedInstance.stderr),
+        refusedInstance.stderr,
+        'and this suite\'s own path redactor finds nothing in it to remove, which is ' +
+          'the same statement made by the tool that has to sanitize everything else'
+      );
+
+      assert.ok(
+        Buffer.byteLength(refusedInstance.stderr, 'utf8') <= STARTUP_FAULT_STDERR_MAX_BYTES,
+        `the whole report must stay within ${STARTUP_FAULT_STDERR_MAX_BYTES} bytes and it ` +
+          `was ${Buffer.byteLength(refusedInstance.stderr, 'utf8')} — the dump this ` +
+          `replaced was 1421\n${describeService(refusedInstance)}`
+      );
+    }
+  );
+
+  test(
+    'the protected file is byte-identical and nothing was staged beside it',
+    { timeout: CASE_TIMEOUT_MS },
+    async () => {
+      // Why the guard exists at all: a write is a `rename` OVER the target, so
+      // a mistyped variable would not append to this file, it would replace it.
+      // Refusing at load is what proves nothing was staged in the meantime.
+      assert.strictEqual(
+        sha256(await fs.readFile(protectedStorePath())),
+        protectedFileDigestBefore,
+        'a protected destination must be left byte-identical — the refusal happens ' +
+          'before the store is read or written, so the file is never opened for ' +
+          'writing and never renamed over'
+      );
+      await assert.rejects(
+        () => fs.access(`${protectedStorePath()}.tmp`),
+        (error) => error.code === 'ENOENT',
+        'and the derived staging sibling must not have been created beside it'
+      );
+    }
+  );
+
+  test(
+    'a hostile startup message is reported as one bounded line, never as two',
+    { timeout: CASE_TIMEOUT_MS },
+    async () => {
+      // The sanitisation, asserted against an input no file in this repository
+      // can produce. The real refusal composes a single well-behaved sentence,
+      // so the boundary's promise — ONE bounded line, whatever the message was
+      // built from — would otherwise rest on a message that could never test
+      // it. A log line an error can extend at will is a log line an error can
+      // forge a second entry in.
+      //
+      // THE MECHANISM: `server.js` is copied into the temporary root beside a
+      // stub `./activities` that throws a fabricated fault carrying the
+      // allow-listed code. Nothing else is needed, because the file's only
+      // other require is the built-in `http` — and nothing in the checkout is
+      // touched, since the copy and the stub both live under the temporary
+      // root.
+      const stubRoot = path.join(temporaryRoot, 'hostile-message');
+      await fs.mkdir(stubRoot, { recursive: true });
+      await fs.copyFile(SERVER_ENTRY_POINT, path.join(stubRoot, 'server.js'));
+
+      // A newline, a Unicode line separator, a control character, a run of
+      // spaces, and a message far past the 400-character bound.
+      const hostile =
+        'refused:\\nsecond line\\u2028third line\\u0007bell    spaced ' + 'x'.repeat(600);
+      await fs.writeFile(
+        path.join(stubRoot, 'activities.js'),
+        `const error = new RangeError("${hostile}");\n` +
+          `error.code = "E_STORE_PATH_PROTECTED";\n` +
+          `throw error;\n`,
+        'utf8'
+      );
+
+      const result = await runNodeToCompletion(
+        [path.join(stubRoot, 'server.js')],
+        writableStorePath('hostile-message'),
+        stubRoot
+      );
+
+      const lines = outputLines(result.stderr);
+
+      assert.strictEqual(
+        lines.length,
+        2,
+        `a message carrying newlines and control characters must still be reported as ` +
+          `exactly two lines, and ${lines.length} were written — a message that can add ` +
+          `a line can forge a log entry. stderr was ${JSON.stringify(result.stderr)}`
+      );
+      assert.strictEqual(
+        lines[0],
+        HANDLED_STARTUP_FAULT_LINE,
+        'the gateable first line is unaffected by whatever the message contains'
+      );
+      assert.ok(
+        lines[1].length <= STARTUP_FAULT_DETAIL_MAX_CHARS + 3,
+        `the sentence must be capped at ${STARTUP_FAULT_DETAIL_MAX_CHARS} characters plus ` +
+          `the truncation marker, and it was ${lines[1].length}`
+      );
+      assert.strictEqual(
+        /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(lines[1]),
+        false,
+        'no control character or line separator may survive into the reported line'
+      );
+      assert.strictEqual(
+        /  /.test(lines[1]),
+        false,
+        'runs of whitespace are collapsed, so the line cannot be padded into ' +
+          'something that reads as two fields'
+      );
+      assert.strictEqual(
+        result.code,
+        HANDLED_STARTUP_FAULT_EXIT_CODE,
+        'and the disposition is unchanged: a non-zero exit, however the message was built'
+      );
+      assert.strictEqual(
+        normalizeNewlines(result.stdout),
+        '',
+        'with nothing on stdout'
+      );
+    }
+  );
+
+  test(
+    'a caller that loads the service as a module receives the fault itself',
+    { timeout: CASE_TIMEOUT_MS },
+    async () => {
+      // The deliberate asymmetry in the boundary. Direct execution IS the
+      // program, so it reports and leaves. A caller that requires the file is
+      // composing the service itself and can do more with the error object than
+      // this process could do with a line: inspect the code, report it in its
+      // own terms, or decide to carry on. Reporting a line and handing back a
+      // module with nothing in it would hide the fault from exactly the caller
+      // best placed to act on it.
+      const result = await runNodeToCompletion(
+        [
+          '-e',
+          "try { require('./server'); console.log('resolved'); } " +
+            "catch (error) { console.log('threw ' + error.code); }",
+        ],
+        protectedStorePath()
+      );
+
+      assert.deepStrictEqual(
+        outputLines(result.stdout),
+        ['threw E_STORE_PATH_PROTECTED'],
+        `requiring the file must reject with the configuration fault, carrying its ` +
+          `code, rather than resolving to a module that cannot serve. stdout was ` +
+          `${JSON.stringify(result.stdout)}`
+      );
+      assert.strictEqual(
+        normalizeNewlines(result.stderr),
+        '',
+        `and the module path must print nothing of its own — the caller decides what ` +
+          `to report. stderr was ${JSON.stringify(result.stderr)}`
       );
     }
   );

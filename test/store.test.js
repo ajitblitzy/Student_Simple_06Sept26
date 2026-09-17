@@ -289,8 +289,30 @@ const MAX_LABEL_LENGTH = 60;
 const MAX_STORE_BYTES = 2 * 1024 * 1024;
 const MAX_ACTIVITY_RECORDS = 5000;
 
+/**
+ * The record count at which the store starts warning that it is running out of
+ * room: ninety per cent of the ceiling. Restated here for the same reason the
+ * ceilings are — a case that read the threshold out of the module under test
+ * would agree with whatever that module said, including a warning somebody had
+ * quietly moved to the very last record, where it would be useless.
+ */
+const CAPACITY_WARNING_RECORDS = 4500;
+
 /** The suffix the store derives its staging path from. */
 const TEMPORARY_SUFFIX = '.tmp';
+
+/**
+ * How many times the store attempts the publishing rename before refusing the
+ * write, restated here for the same reason as the ceilings above.
+ *
+ * The bound exists because this platform refuses a rename whose destination
+ * another descriptor holds open, so a collision is worth retrying briefly and
+ * is not worth waiting out: a destination held continuously is a process
+ * racing the writer rather than a state that clears. Only a collision code is
+ * retried, so a refusal that would recur identically costs exactly one
+ * attempt — both halves are asserted below.
+ */
+const MAX_PUBLISH_ATTEMPTS = 3;
 
 /**
  * The refusal codes `activity-store.js` raises, and those the reader raises,
@@ -307,6 +329,14 @@ const E_REFERENCE_DATA = 'E_REFERENCE_DATA';
 const E_LABEL_INVALID = 'E_LABEL_INVALID';
 const E_STORE_UNREADABLE = 'E_STORE_UNREADABLE';
 const E_STORE_WRITE_FAILED = 'E_STORE_WRITE_FAILED';
+/* Apart from `E_STORE_WRITE_FAILED` because the two call for different
+ * actions: a write failure is environmental and a retry may well clear it,
+ * while this one says the document cannot grow and only reclaiming room will
+ * clear it. A case that accepted either code for either event would pass on
+ * exactly the confusion the second code was added to remove, which is why
+ * every ceiling case below names this one and every write-fault case names the
+ * other. */
+const E_STORE_AT_CAPACITY = 'E_STORE_AT_CAPACITY';
 const E_XLSX_UNSUPPORTED_COMPRESSION = 'E_XLSX_UNSUPPORTED_COMPRESSION';
 const E_XLSX_UNSUPPORTED_FLAGS = 'E_XLSX_UNSUPPORTED_FLAGS';
 const E_XLSX_UNSUPPORTED_SOURCE = 'E_XLSX_UNSUPPORTED_SOURCE';
@@ -1698,10 +1728,18 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     },
     /* The three rows below exist because a `.trim()` applied to a cell BEFORE
      * it is validated launders malformed authoritative data into well-formed
-     * data: `String.prototype.trim` strips `\t`, `\n`, `\v`, `\f` and `\r`,
-     * every one of which is a C0 control character. So a padded Student ID
-     * became a valid Student ID, and a control-only label tested as blank and
-     * had its row skipped before the control-character rule could see it.
+     * data: `String.prototype.trim` strips `\n`, `\v`, `\f` and `\r` as well
+     * as the horizontal whitespace normalization removes, and every one of
+     * those four is a control character the store refuses. So a padded Student
+     * ID became a valid Student ID — no ID is trimmed at all, which is why the
+     * tab-padded ID below is still refused — and a line-break-only label
+     * tested as blank and had its row skipped before the control-character
+     * rule could see it.
+     *
+     * The label row therefore carries a NEWLINE rather than a tab. A tab is
+     * horizontal whitespace, so a tab-only cell is genuinely blank and is
+     * skipped by the case that follows this loop; a newline is not, and must
+     * still be refused.
      *
      * Each row is built so that the LAUNDERED reading would SUCCEED — the key
      * column carries all ten IDs, the seed ID names a student who exists, the
@@ -1721,9 +1759,9 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
       },
     },
     {
-      name: 'a seed row whose label is a control character only',
+      name: 'a seed row whose label is a line break only',
       values: {
-        [SEED_LABEL_COLUMN]: ['Extracurricular Activity', '\t'],
+        [SEED_LABEL_COLUMN]: ['Extracurricular Activity', '\n'],
       },
     },
   ];
@@ -1756,7 +1794,7 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     });
   }
 
-  it('still skips a genuinely empty cell and a space-separator-only label, rather than refusing them', async (t) => {
+  it('still skips a genuinely empty cell and a horizontal-whitespace-only label, rather than refusing them', async (t) => {
     /* The mirror of the three control-character rows above, and the reason
      * validating as read is not the same as refusing everything unusual. Two
      * kinds of leniency are deliberate and must survive:
@@ -1764,27 +1802,36 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
      *   1. A GENUINELY EMPTY cell — the empty string the reader yields for a
      *      cell absent from a row inside the declared dimension — is skipped,
      *      because a worksheet may carry empty rows.
-     *   2. A label of SPACE SEPARATORS ONLY is blank, so its row contributes
-     *      no record. That is the same class `normalizeLabel` trims, which is
-     *      what keeps the blank rule and the normalization rule from
-     *      disagreeing about one value.
+     *   2. A label of HORIZONTAL WHITESPACE ONLY is blank, so its row
+     *      contributes no record. That is the same class `normalizeLabel`
+     *      trims, which is what keeps the blank rule and the normalization
+     *      rule from disagreeing about one value — a tab included, since a
+     *      tab-only cell would otherwise be refused as an empty label while a
+     *      space-only cell was quietly skipped.
      *
      * A trailing empty row is scripted into all three columns at once, so the
      * key authority and the seed pass both meet it. */
-    const context = 'reference data with an empty trailing row and a space-only label';
+    const context = 'reference data with an empty trailing row and whitespace-only labels';
     const directory = await makeTemporaryDirectory(t);
     const storeFile = path.join(directory, 'activities.json');
     const { store, script } = storeWithScriptedReader(t, storeFile);
-    script.values.set(KEY_COLUMN, ['Student ID', 'S001', 'S002', '']);
-    script.values.set(SEED_ID_COLUMN, ['Student ID', 'S001', 'S002', '']);
-    /* U+00A0 NO-BREAK SPACE and U+0020 SPACE: both space separators, neither a
-     * control character, so this is blank rather than malformed. */
-    script.values.set(SEED_LABEL_COLUMN, ['Extracurricular Activity', 'Robotics Club', '\u00a0 ', '']);
+    script.values.set(KEY_COLUMN, ['Student ID', 'S001', 'S002', 'S003', '']);
+    script.values.set(SEED_ID_COLUMN, ['Student ID', 'S001', 'S002', 'S003', '']);
+    /* U+00A0 NO-BREAK SPACE, U+0020 SPACE and U+0009 TAB: all horizontal
+     * whitespace, none of them a character the store refuses, so both of these
+     * cells are blank rather than malformed. */
+    script.values.set(SEED_LABEL_COLUMN, [
+      'Extracurricular Activity',
+      'Robotics Club',
+      '\u00a0 ',
+      '\t\t',
+      '',
+    ]);
 
     assert.strictEqual(
       store.isKnownStudent('S002'),
       true,
-      `${context}: the empty trailing cell must be skipped, not refused — the key set must still hold both IDs`
+      `${context}: the empty trailing cell must be skipped, not refused — the key set must still hold every ID`
     );
     assert.deepStrictEqual(
       await store.listActivities('S001'),
@@ -1795,6 +1842,11 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
       await store.listActivities('S002'),
       [],
       `${context}: a space-separator-only label records nothing, and must not refuse the whole read`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S003'),
+      [],
+      `${context}: a tab-only label is blank for the same reason, and must not refuse the whole read either`
     );
     assert.deepStrictEqual(
       await fs.readdir(directory),
@@ -1837,15 +1889,21 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
  *
  * ON TAB AND NEWLINE, because it is the one place where two rules meet:
  * whitespace is trimmed and collapsed, AND a control character is refused. A
- * tab is both. `activity-store.js` resolves this by trimming and collapsing
- * the Unicode SPACE SEPARATOR category only, so a tab, a newline or a
- * carriage return survives untouched and is then refused by the
- * control-character rule. That is the only order in which the two rules do
- * not cancel each other out: laundering a tab into a space would ACCEPT a
- * label carrying a control character and leave the refusal rule dead for the
- * three control characters most likely to arrive. The cases below therefore
- * pin a tab as a refusal, and exercise the collapse of a mixed run with
- * genuine space separators — U+0020, U+00A0 and U+2003.
+ * tab is arguably both, so the module draws the line at HORIZONTAL
+ * whitespace: the Unicode SPACE SEPARATOR category plus U+0009 TAB is
+ * trimmed and collapsed, and everything left — a newline, a carriage return,
+ * a vertical tab, NUL, DEL, the C1 block, U+2028 and U+2029 — is then
+ * refused. The steps run in that order, which is what stops the two rules
+ * cancelling each other out: a tab is laundered into a space and the label is
+ * accepted, while nothing that BREAKS A LINE is ever laundered, because two
+ * visually identical labels would then dedupe differently depending on which
+ * character separated their words.
+ *
+ * The cases below therefore pin a tab as a COLLAPSE at every position, pin a
+ * tab-only label as empty rather than as a control character, keep every
+ * non-tab control character and both line separators as refusals, and
+ * exercise the collapse of a mixed run — U+0020, U+0009, U+00A0 and U+2003
+ * together.
  * ========================================================================= */
 
 describe('activity label normalization', () => {
@@ -1874,22 +1932,76 @@ describe('activity label normalization', () => {
     );
   });
 
-  it('refuses a tab, which is a control character rather than whitespace to launder', () => {
-    const context = 'a tab inside a label';
-    const error = captureThrow(() => bootstrapStore.normalizeLabel('Robotics\tClub'), context);
-    assertCode(error, E_LABEL_INVALID, context);
-    assertMessageMentions(
-      error,
-      /control character/,
-      'the refusal must name the control-character rule, not the length or emptiness rule'
+  it('collapses a tab as horizontal whitespace, at every position it can occupy', () => {
+    /* A tab is horizontal whitespace and nothing else inside a single-line
+     * label, so it trims and collapses exactly as a space does. This is the
+     * case that separates the two candidate readings of the rule: were the
+     * tab left in the control-character class it would survive the collapse
+     * and be refused, and `Chess<TAB>Club` and `Chess Club` would be two
+     * activities instead of one. Each position is exercised because trimming
+     * and collapsing are two different steps. */
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('Robotics\tClub'),
+      'Robotics Club',
+      'an internal tab collapses to a single space'
+    );
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('\tRobotics Club'),
+      'Robotics Club',
+      'a leading tab is trimmed'
+    );
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('Robotics Club\t'),
+      'Robotics Club',
+      'a trailing tab is trimmed'
+    );
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('Robotics\t\t\tClub'),
+      'Robotics Club',
+      'a run of tabs collapses to exactly one space'
+    );
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('\t Robotics \t\u00a0 \u2003Club \t'),
+      'Robotics Club',
+      'a mixed run of tabs and space separators collapses to one ASCII space, and trims'
+    );
+    /* Casing is untouched by the collapse, and the composite key folds case,
+     * so the tab form and the plain form are the same activity. */
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('robotics\tCLUB').toLowerCase(),
+      bootstrapStore.normalizeLabel('Robotics Club').toLowerCase(),
+      'the tab form and the plain form normalize to one composite key'
     );
   });
 
-  it('refuses every C0, DEL and C1 control character, at the start, mid-string and at the end', () => {
+  it('refuses a tab-only label as empty, not as a control character', () => {
+    /* The consequence of the rule above that is worth its own case: once a
+     * tab is whitespace, a label of nothing but tabs normalizes to the empty
+     * string, so it is refused by the emptiness rule rather than the
+     * control-character rule. Both refuse it; naming which one keeps the
+     * message a submitter reads honest. */
+    const context = 'a label of tabs only';
+    const error = captureThrow(() => bootstrapStore.normalizeLabel('\t\t'), context);
+    assertCode(error, E_LABEL_INVALID, context);
+    assertMessageMentions(
+      error,
+      /empty/,
+      'the refusal must name the emptiness rule, since the tab was removed before anything could refuse it'
+    );
+  });
+
+  it('refuses every C0 except TAB, plus DEL and every C1 control character, at the start, mid-string and at the end', () => {
     /* The complete ranges the store's pattern declares, generated rather than
      * sampled. A handful of representatives cannot show that the boundaries
      * sit where they are claimed to: it is the characters nobody thinks of —
-     * U+000B, U+0085, U+009F — that a narrowed class would start admitting. */
+     * U+000B, U+0085, U+009F — that a narrowed class would start admitting.
+     *
+     * U+0009 TAB is the ONE hole in C0, and it is generated out rather than
+     * quietly omitted so the hole is exactly one code point wide and is
+     * visible as a deliberate exclusion. The two cases above pin what a tab
+     * does instead, and `HORIZONTAL_WHITESPACE` below pins that its C0
+     * neighbours U+0008 and U+000A are not treated like it. */
+    const TAB = 0x0009;
     const CONTROL_CHARACTER_RANGES = [
       [0x0000, 0x001f, 'C0'],
       [0x007f, 0x007f, 'DEL'],
@@ -1898,24 +2010,31 @@ describe('activity label normalization', () => {
     const controlCharacters = [];
     for (const [first, last, block] of CONTROL_CHARACTER_RANGES) {
       for (let codePoint = first; codePoint <= last; codePoint += 1) {
+        if (codePoint === TAB) {
+          continue;
+        }
         const name = `${block} U+${codePoint.toString(16).toUpperCase().padStart(4, '0')}`;
         controlCharacters.push([String.fromCodePoint(codePoint), name]);
       }
     }
     assert.strictEqual(
       controlCharacters.length,
-      65,
-      'the generated set must be the whole of C0 (32) plus DEL (1) plus C1 (32)'
+      64,
+      'the generated set must be C0 less TAB (31) plus DEL (1) plus C1 (32)'
+    );
+    assert.ok(
+      !controlCharacters.some(([character]) => character === '\t'),
+      'and it must not contain the tab, which normalization collapses rather than refuses'
     );
 
     for (const [character, name] of controlCharacters) {
       /* Three placements, because trimming and collapsing run BEFORE the
-       * control-character check and act on the Unicode space-separator
-       * category alone. A leading or trailing control character therefore has
-       * to survive the trim and then be refused; were the trim widened to a
-       * general whitespace class it would strip these instead, and the
-       * refusal would quietly stop applying at exactly the two positions
-       * where a pasted value carries one. */
+       * control-character check and act on horizontal whitespace alone. A
+       * leading or trailing control character therefore has to survive the
+       * trim and then be refused; were the trim widened to a general
+       * whitespace class it would strip `\n`, `\r`, `\v` and `\f` instead,
+       * and the refusal would quietly stop applying at exactly the two
+       * positions where a pasted value carries one. */
       for (const [placement, label] of [
         ['at the start', `${character}Chess Club`],
         ['mid-string', `Chess${character}Club`],
@@ -1934,11 +2053,27 @@ describe('activity label normalization', () => {
      * case pins the edges rather than merely refusing a large set: U+0020 sits
      * one above C0, U+007E one below DEL, U+00A1 one above C1, and U+00A0 —
      * also one above C1 — is a space separator, so normalization collapses it
-     * instead of refusing it. */
+     * instead of refusing it. U+0009 is the interior exclusion, and it
+     * collapses for the same reason U+0020 does. */
     assert.strictEqual(bootstrapStore.normalizeLabel('Chess\u0020Club'), 'Chess Club');
+    assert.strictEqual(bootstrapStore.normalizeLabel('Chess\u0009Club'), 'Chess Club');
     assert.strictEqual(bootstrapStore.normalizeLabel('Chess\u007eClub'), 'Chess~Club');
     assert.strictEqual(bootstrapStore.normalizeLabel('Chess\u00a1Club'), 'Chess\u00a1Club');
     assert.strictEqual(bootstrapStore.normalizeLabel('Chess\u00a0Club'), 'Chess Club');
+
+    /* And the tab's own C0 neighbours, one on each side, so the hole cannot
+     * silently widen: U+0008 BACKSPACE and U+000A LINE FEED are both refused
+     * where U+0009 between them is collapsed. */
+    for (const [character, name] of [
+      ['\u0008', 'U+0008 BACKSPACE, one below TAB'],
+      ['\u000a', 'U+000A LINE FEED, one above TAB'],
+    ]) {
+      assertCode(
+        captureThrow(() => bootstrapStore.normalizeLabel(`Chess${character}Club`), name),
+        E_LABEL_INVALID,
+        name
+      );
+    }
   });
 
   it('refuses a Unicode line separator rather than laundering it into a space', () => {
@@ -2048,7 +2183,10 @@ describe('activity label normalization', () => {
   });
 
   it('refuses a whitespace-only label, which normalizes to empty', () => {
-    for (const raw of ['', ' ', '   ', '\u00a0\u2003']) {
+    /* `'\t'` and `'\t \u00a0'` belong in this list rather than in the
+     * control-character one: a tab is horizontal whitespace, so a label made
+     * of nothing else has no content left once it is trimmed. */
+    for (const raw of ['', ' ', '   ', '\u00a0\u2003', '\t', '\t\t', '\t \u00a0']) {
       const context = `a whitespace-only label ${JSON.stringify(raw)}`;
       assertCode(captureThrow(() => bootstrapStore.normalizeLabel(raw), context), E_LABEL_INVALID, context);
     }
@@ -2430,6 +2568,15 @@ const MALFORMED_STORE_DOCUMENTS = [
   },
   {
     name: 'an activity containing a control character',
+    body: bodyOf([baseSubmission({ activity: 'Chess\nClub' })]),
+  },
+  {
+    /* A tab is not refused on submission — normalization collapses it — so a
+     * stored label carrying one cannot have been written by this service. It
+     * is refused on load all the same, as a value that is not in normalized
+     * form, which is what keeps the loader's guarantee that every stored
+     * label is already normalized true for the tab as well. */
+    name: 'an activity containing an uncollapsed tab',
     body: bodyOf([baseSubmission({ activity: 'Chess\tClub' })]),
   },
   {
@@ -2683,11 +2830,19 @@ describe('load validation of a hand-edited store', () => {
  * because a ceiling only tested from above is indistinguishable from a module
  * that refuses everything:
  *
- *   - bytes, on load, as `E_STORE_UNREADABLE`;
+ *   - bytes, on load, as `E_STORE_UNREADABLE`, and before a write — measured
+ *     on the bytes the document would serialize to — as `E_STORE_AT_CAPACITY`;
  *   - records, on load as `E_STORE_UNREADABLE` and before an append as
- *     `E_STORE_WRITE_FAILED` — which is the code that exists because the
- *     module's vocabulary is exactly four codes and a fifth would reach a
- *     client as `500 internal_error` rather than as the write failure it is.
+ *     `E_STORE_AT_CAPACITY`.
+ *
+ * The write-side code is the store's own, and not the general
+ * `E_STORE_WRITE_FAILED`, because a full store and a failed write are
+ * different events with different remedies; `activities.js` maps it to
+ * `500 store_at_capacity` so a client can tell them apart too. Every code the
+ * store raises must be mapped there — an unmapped one would reach a client as
+ * `500 internal_error`, which is true about the process and useless about the
+ * fault — so a case below asserts the two codes are genuinely different for
+ * the two events rather than interchangeable labels for one.
  *
  * Each fixture here is VALID in every other respect — the byte-ceiling
  * documents differ from a loadable one only by legal JSON whitespace, and the
@@ -2924,7 +3079,7 @@ describe('the byte and record ceilings on the store document', () => {
 
     const error = await captureRejection(store.addActivity('S001', 'Brand New Club'), context);
 
-    assertCode(error, E_STORE_WRITE_FAILED, context);
+    assertCode(error, E_STORE_AT_CAPACITY, context);
     assertMessageMentions(
       error,
       /ceiling/,
@@ -3050,7 +3205,7 @@ describe('the byte and record ceilings on the store document', () => {
       context
     );
 
-    assertCode(error, E_STORE_WRITE_FAILED, context);
+    assertCode(error, E_STORE_AT_CAPACITY, context);
     assertMessageMentions(
       error,
       /ceiling/,
@@ -3090,6 +3245,295 @@ describe('the byte and record ceilings on the store document', () => {
       await exists(temporaryFile),
       false,
       `${context}: and the repeat may stage nothing either`
+    );
+  });
+
+  it('reports a full store and a failed write as two different codes', async (t) => {
+    /* WHY THIS CASE EXISTS. Both events refuse a submission and both leave the
+     * previous document intact, and for a while both reported the same code
+     * and the same sentence — so a submitter, and an operator reading a log,
+     * could not tell a store that had run out of room from a disk that could
+     * not be written. The two need different actions: retry clears a write
+     * failure, and only reclaiming room clears a full store. The codes are
+     * therefore asserted TOGETHER, in one case, because what matters is not
+     * what either one is called but that they are not the same. */
+    const capacityContext = 'a submission against a store at the record ceiling';
+    const full = await makeIsolatedStore(t, 'distinguishable-full.json');
+    await writeBytes(
+      full.storeFile,
+      `${JSON.stringify(documentOf(recordsNumbering(MAX_ACTIVITY_RECORDS)))}\n`
+    );
+    const capacityError = await captureRejection(
+      full.store.addActivity('S001', 'Brand New Club'),
+      capacityContext
+    );
+    assertCode(capacityError, E_STORE_AT_CAPACITY, capacityContext);
+
+    /* The write fault, with room to spare in the document, so nothing about
+     * capacity can be what refuses it: a directory planted at the staging path
+     * cannot be opened for writing, which is deterministic on every platform
+     * this project runs on. */
+    const faultContext = 'a submission whose staging file cannot be opened';
+    const faulted = await makeIsolatedStore(t, 'distinguishable-fault.json');
+    assert.strictEqual((await faulted.store.addActivity('S001', 'Chess Club')).created, true);
+    await fs.mkdir(faulted.temporaryFile);
+    const writeError = await captureRejection(
+      faulted.store.addActivity('S001', 'Quiz Club'),
+      faultContext
+    );
+    assertCode(writeError, E_STORE_WRITE_FAILED, faultContext);
+
+    assert.notStrictEqual(
+      capacityError.code,
+      writeError.code,
+      'a full store and a failed write must not answer with the same code, or a caller cannot tell which happened'
+    );
+  });
+});
+
+
+/* ========================================================================= *
+ * The cost of the whole-document work, and the warning before the ceiling
+ *
+ * The store is read from disk, parsed and validated in full on EVERY request,
+ * which is what makes a hand edit visible immediately and a lost update
+ * impossible. This process is single-threaded, so the question that decides
+ * whether that design is safe is not how long the work takes but whether it
+ * lets anything else run while it happens: run to completion, and one request
+ * for a large document stalls every other request in flight, including the
+ * routes that touch no store at all.
+ *
+ * MEASURED before these cases existed, at 4900 records — a document both
+ * ceilings accept: a load held the event loop for one uninterrupted 9.2 ms
+ * stretch, a submission for 13.2 ms, and while four readers and four writers
+ * were in flight the `GET /` path — which performs no I/O whatsoever — went
+ * from a p50 of 0.4 ms to 6.8 ms. The work is unchanged and still uncached;
+ * what changed is that it is now broken into bounded runs.
+ *
+ * The cases below assert that WITHOUT A CLOCK. A latency threshold on a shared
+ * build host measures the host, so instead they count the yields themselves:
+ * the store hands the loop back by calling `setImmediate`, so the number of
+ * those calls during one operation says whether the work was broken up, and
+ * says it the same way on a fast host and a loaded one.
+ * ========================================================================= */
+
+describe('bounding the work one request may hold the event loop for', () => {
+  /**
+   * Builds a document of `count` valid records that is DENSE: minified, with
+   * the shortest labels the rules allow, so many records occupy few bytes.
+   *
+   * Density is the point. The load path reads the file in 64 KiB chunks and
+   * awaits each one, so a physically large document would yield for reasons
+   * that have nothing to do with validation, and a case built on one could not
+   * tell the two apart. Keeping the bytes small leaves validation as the only
+   * thing that can yield.
+   *
+   * @param {number} count How many records to build.
+   * @returns {string} A complete document body.
+   */
+  const denseDocument = (count) =>
+    `${JSON.stringify(
+      documentOf(
+        Array.from({ length: count }, (unused, index) =>
+          seededRecord(EXPECTED_KEY_SET[index % EXPECTED_KEY_SET.length], `C ${index}`)
+        )
+      )
+    )}\n`;
+
+  /**
+   * Counts the store's yields during one operation.
+   *
+   * `global.setImmediate` is what `yieldToEventLoop` calls, so wrapping it
+   * counts exactly the hand-backs and nothing else — verified by the small
+   * document below, which counts zero, so nothing in the runtime's own file
+   * handling contributes to the number. Restored in a `finally`, so a
+   * rejecting operation cannot leave the global patched for the rest of the
+   * suite.
+   *
+   * @param {() => Promise<unknown>} operation The store call to measure.
+   * @returns {Promise<{yields: number, result: unknown}>} The count and the
+   *   operation's own result.
+   */
+  const countYields = async (operation) => {
+    const real = global.setImmediate;
+    let yields = 0;
+    global.setImmediate = (...args) => {
+      yields += 1;
+      return real(...args);
+    };
+    try {
+      const result = await operation();
+      return { yields, result };
+    } finally {
+      global.setImmediate = real;
+    }
+  };
+
+  it('breaks a large document up on read, and leaves an ordinary one untouched', async (t) => {
+    const { store, storeFile } = await makeIsolatedStore(t, 'yielding-read.json');
+
+    /* THE ORDINARY DOCUMENT FIRST, because it is the assertion that keeps the
+     * other one honest. Eleven records is the seeded store, and the workload
+     * this feature is actually for; it must complete inside a single run and
+     * pay nothing at all for the bound. */
+    const ordinaryBytes = await writeBytes(storeFile, denseDocument(11));
+    await store.listActivities('S001');
+    const ordinary = await countYields(() => store.listActivities('S001'));
+    assert.strictEqual(
+      ordinary.yields,
+      0,
+      'a document of a handful of records must not yield once: the real workload pays nothing for the bound'
+    );
+    assert.strictEqual(ordinary.result.length, 2, 'and it must still answer the records it holds');
+
+    /* THE LARGE DOCUMENT, well inside both ceilings and deliberately dense. */
+    const largeCount = 4000;
+    const largeBytes = await writeBytes(storeFile, denseDocument(largeCount));
+    assert.ok(
+      largeBytes.length < MAX_STORE_BYTES && largeCount < MAX_ACTIVITY_RECORDS,
+      'the fixture must be a document this build accepts, or it proves nothing about documents it serves'
+    );
+    assert.ok(
+      largeBytes.length > ordinaryBytes.length,
+      'and it must be the larger of the two, or the comparison below is backwards'
+    );
+
+    const large = await countYields(() => store.listActivities('S001'));
+
+    /* Not an exact count: how many times a millisecond-scale budget is spent
+     * depends on the host. What is asserted is that it was spent REPEATEDLY —
+     * the work was handed back more than once, so it was neither run to
+     * completion nor broken at a single lucky point. */
+    assert.ok(
+      large.yields >= 2,
+      `a large document must hand the event loop back repeatedly while it is validated; it yielded ${large.yields} times`
+    );
+    assert.strictEqual(
+      large.result.length,
+      largeCount / EXPECTED_KEY_SET.length,
+      'and every record must still be validated and returned — the bound changes the granularity of the work, never the work'
+    );
+  });
+
+  it('breaks a submission up too, and serializes in a run of its own', async (t) => {
+    const { store, storeFile } = await makeIsolatedStore(t, 'yielding-write.json');
+
+    /* A submission against an ordinary document yields EXACTLY ONCE, and that
+     * one yield is the hand-back before serializing. `JSON.stringify` of a
+     * document at the byte ceiling is a single 1.9 ms call that cannot be
+     * broken up, so the only thing that can be done about it is to stop it
+     * extending whatever run the validation before it was in the middle of. */
+    await writeBytes(storeFile, denseDocument(11));
+    await store.listActivities('S001');
+    const ordinary = await countYields(() => store.addActivity('S001', 'Chess Club'));
+    assert.strictEqual(ordinary.result.created, true, 'the submission must be persisted');
+    assert.strictEqual(
+      ordinary.yields,
+      1,
+      'an ordinary submission must yield once and only once: the hand-back before serializing, with nothing added for validation'
+    );
+
+    /* AN IDEMPOTENT REPEAT OF THE SAME DOCUMENT YIELDS NOTHING AT ALL, which
+     * is what places the hand-back on the serialization rather than on the
+     * route: a repeat appends nothing, so it never serializes, so there is
+     * nothing to hand the loop back for. Asserted against the same ordinary
+     * document as the append above, so the only difference between the two
+     * counts is whether a write happened. */
+    const repeat = await countYields(() => store.addActivity('S001', 'chess club'));
+    assert.strictEqual(
+      repeat.result.created,
+      false,
+      'the repeat must be recognized rather than appended'
+    );
+    assert.strictEqual(
+      repeat.yields,
+      0,
+      'a repeat writes nothing, so it must not pay the pre-serialization hand-back at all'
+    );
+
+    /* A submission against a large document yields for its validation as well,
+     * so strictly more than the one. */
+    await writeBytes(storeFile, denseDocument(4000));
+    const large = await countYields(() => store.addActivity('S001', 'Quiz Club'));
+    assert.strictEqual(large.result.created, true, 'the submission must be persisted');
+    assert.ok(
+      large.yields > ordinary.yields,
+      `a submission against a large document must yield more than one against a small one; it yielded ${large.yields} against ${ordinary.yields}`
+    );
+  });
+
+  it('warns once when the document crosses into the last tenth of the record ceiling', async (t) => {
+    /* A CEILING WITH NO APPROACH SIGNAL IS A CLIFF. This one is reachable in
+     * about twenty-six seconds of saturating submission, which is no time at
+     * all for a person to notice a store filling up, so the last thing an
+     * operator should learn from is the first refusal. The warning is LATCHED:
+     * one line when the band is crossed, then silence — a line on each of the
+     * last five hundred submissions would be the noisiest evidence in the log
+     * exactly when somebody is trying to read it. */
+    const context = 'a store crossing into the capacity warning band';
+    const { store, storeFile } = await makeIsolatedStore(t, 'warning-band.json');
+
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...args) => {
+      warnings.push(args.join(' '));
+    };
+    t.after(() => {
+      console.warn = realWarn;
+    });
+
+    /* One record short of the band, so the submission below is the crossing. */
+    await writeBytes(storeFile, denseDocument(CAPACITY_WARNING_RECORDS - 1));
+    assert.strictEqual(
+      (await store.addActivity('S001', 'Crossing Club')).created,
+      true,
+      `${context}: the crossing submission must still be accepted — a warning is not a refusal`
+    );
+
+    assert.strictEqual(
+      warnings.length,
+      1,
+      `${context}: crossing the band must be reported exactly once`
+    );
+    const reported = JSON.parse(warnings[0].slice(warnings[0].indexOf('{')));
+    assert.deepStrictEqual(
+      reported,
+      {
+        event: 'store_capacity_warning',
+        records: CAPACITY_WARNING_RECORDS,
+        ceiling: MAX_ACTIVITY_RECORDS,
+      },
+      `${context}: the line must say what the store holds and what it will hold at most, and carry nothing a submitter sent`
+    );
+
+    assert.strictEqual(
+      (await store.addActivity('S001', 'Second Club')).created,
+      true,
+      `${context}: the next submission must still be accepted`
+    );
+    assert.strictEqual(
+      warnings.length,
+      1,
+      `${context}: and it must add no second line — the latch is what keeps the warning from flooding the log`
+    );
+
+    /* Pruned back below the band — which is exactly what an operator acting on
+     * the warning does — and then crossed again. The latch must have re-armed,
+     * or a store that fills a second time fills it silently. */
+    await writeBytes(storeFile, denseDocument(10));
+    assert.strictEqual((await store.addActivity('S001', 'After Pruning Club')).created, true);
+    assert.strictEqual(
+      warnings.length,
+      1,
+      `${context}: a submission well below the band must not warn`
+    );
+
+    await writeBytes(storeFile, denseDocument(CAPACITY_WARNING_RECORDS - 1));
+    assert.strictEqual((await store.addActivity('S001', 'Crossing Again Club')).created, true);
+    assert.strictEqual(
+      warnings.length,
+      2,
+      `${context}: crossing the band a second time must warn again`
     );
   });
 });
@@ -5476,11 +5920,16 @@ describe('atomic replacement and the write mutex', () => {
     /* That the staging file sits in the STORE's own directory — which is what
      * keeps the rename on one filesystem, and therefore atomic — is proven by
      * observing the filesystem, not by comparing two paths this case computed
-     * for itself. Refusing the rename stops the write with the staged file
-     * still on disk, and the directory listing then reports where the
-     * implementation actually put it. */
+     * for itself. The listing is taken INSIDE the rename, which is the one
+     * moment a staged file provably exists: the rename is what would adopt it,
+     * and a publish refused for good removes it, so a listing taken after the
+     * refusal reports nothing. Observing it here rather than afterwards is
+     * what keeps this assertion about WHERE the implementation stages instead
+     * of about what it leaves lying around. */
     const frozen = 'a rename refused after the staging file was written';
+    const listingsAtPublish = [];
     t.mock.method(fs, 'rename', async () => {
+      listingsAtPublish.push((await fs.readdir(nested)).sort());
       const refusal = new Error('scripted rename refusal, raised by the test harness');
       refusal.code = 'EPERM';
       throw refusal;
@@ -5492,9 +5941,14 @@ describe('atomic replacement and the write mutex', () => {
       frozen
     );
     assert.deepStrictEqual(
-      (await fs.readdir(nested)).sort(),
+      listingsAtPublish[0],
       ['submissions.json', 'submissions.json.tmp'],
       'the staged document must be observable in the store directory, under the name derived from the configured path'
+    );
+    assert.deepStrictEqual(
+      (await fs.readdir(nested)).sort(),
+      ['submissions.json'],
+      'and a publish refused for good must leave nothing staged at rest beside it'
     );
 
     t.mock.restoreAll();
@@ -5728,10 +6182,16 @@ describe('atomic replacement and the write mutex', () => {
     }
 
     /* The STAGED file's own mode, which is only observable while a staged
-     * file exists — so the rename is refused to keep one. This is the file
-     * that becomes the store, so a permissive mode here would be published by
-     * the next successful rename. */
+     * file exists — so it is statted INSIDE the rename, the moment before the
+     * publish would adopt it, and the rename is then refused. Statting it
+     * afterwards is not an option: a publish refused for good removes the
+     * staged file. This is the file that becomes the store, so a permissive
+     * mode here would be published by the next successful rename. */
+    let stagedAtPublish;
     t.mock.method(fs, 'rename', async () => {
+      if (stagedAtPublish === undefined) {
+        stagedAtPublish = await fs.stat(temporaryFile);
+      }
       const refusal = new Error('scripted rename refusal, raised by the test harness');
       refusal.code = 'EPERM';
       throw refusal;
@@ -5743,7 +6203,12 @@ describe('atomic replacement and the write mutex', () => {
       context
     );
 
-    const staged = await fs.stat(temporaryFile);
+    const staged = stagedAtPublish;
+    assert.notStrictEqual(
+      staged,
+      undefined,
+      `${context}: the publish must have been attempted, or there was no staged file to describe`
+    );
     assert.strictEqual(staged.isFile(), true, `${context}: the staged file must be a regular file`);
     assert.strictEqual(staged.nlink, 1, `${context}: with exactly one name`);
     if (posix) {
@@ -5753,6 +6218,11 @@ describe('atomic replacement and the write mutex', () => {
         `${context}: the staged file must be owner-only before it ever becomes the store`
       );
     }
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: and the refused publish must leave nothing staged at rest`
+    );
 
     t.mock.restoreAll();
   });
@@ -5862,7 +6332,7 @@ describe('atomic replacement and the write mutex', () => {
     assert.strictEqual(await exists(temporaryFile), false);
   });
 
-  it('translates a failed rename, keeps the previous document, and leaves the staged bytes behind', async (t) => {
+  it('translates a failed rename, keeps the previous document, and clears the staged bytes', async (t) => {
     const context = 'a staging write that succeeds and a rename that refuses';
     const { store, storeFile, temporaryFile, directory } = await makeIsolatedStore(t);
     const first = await store.addActivity('S007', 'Chess Club');
@@ -5891,7 +6361,11 @@ describe('atomic replacement and the write mutex', () => {
     const error = await captureRejection(store.addActivity('S007', 'Quiz Club'), context);
 
     assertCode(error, E_STORE_WRITE_FAILED, context);
-    assert.strictEqual(renameCalls, 1, 'the rename must have been attempted exactly once');
+    assert.strictEqual(
+      renameCalls,
+      MAX_PUBLISH_ATTEMPTS,
+      `the publish must retry a collision and give up at ${MAX_PUBLISH_ATTEMPTS} attempts — retrying forever would spin inside the write mutex and hold up every later submission`
+    );
     assert.strictEqual(
       error.cause instanceof Error ? error.cause.code : undefined,
       'EPERM',
@@ -5899,33 +6373,28 @@ describe('atomic replacement and the write mutex', () => {
     );
     await assertBytesUnchanged(storeFile, intactBytes, context);
 
-    /* The staged file survives, holding the document that was never adopted.
-     * That is the documented consequence of a failed rename — nothing cleans
-     * it up, and nothing needs to, because a staging file is only ever
-     * truncated and rewritten. It is also the observation that shows WHERE the
-     * implementation stages: beside the store, in the same directory, which is
-     * what keeps the rename atomic rather than a cross-filesystem copy. */
+    /* The staged document held the submission the publish could not adopt, and
+     * once the publish is refused for good it is REMOVED. Leaving it was
+     * permitted — nothing ever reads a staging file, and the next write clears
+     * it — but it parked a complete document at rest beside the store for as
+     * long as no further write arrived, which on a service whose last write
+     * failed is indefinitely. What the staging file must never do is
+     * contribute to a read, and that is asserted below. */
     assert.strictEqual(
       await exists(temporaryFile),
-      true,
-      'the staging file must still be there: the write reached the disk and only the rename failed'
-    );
-    const staged = await readDocument(temporaryFile);
-    assert.strictEqual(
-      staged.activities.some((record) => record.activity === 'Quiz Club'),
-      true,
-      'and it must hold the document the rename failed to adopt'
+      false,
+      'a publish refused after every attempt must leave nothing staged at rest'
     );
     assert.deepStrictEqual(
       (await fs.readdir(directory)).sort(),
-      ['activities.json', 'activities.json.tmp'],
-      'the store and its staging sibling, in one directory and under the derived name — nothing staged anywhere else'
+      ['activities.json'],
+      'the store alone, with no staging residue anywhere in its directory'
     );
 
     assert.deepStrictEqual(
       (await store.listActivities('S007')).map((record) => record.activity),
       ['Cricket Team', 'Chess Club'],
-      'the refused submission must not appear in a read: a stale staging file is never read, only overwritten'
+      'the refused submission must not appear in a read: a staging file is never read, and this one is gone besides'
     );
 
     t.mock.restoreAll();
@@ -5946,6 +6415,175 @@ describe('atomic replacement and the write mutex', () => {
       false,
       'the retry must have consumed the staging file through the rename that finally succeeded'
     );
+  });
+
+  it('publishes every concurrent submission while read loops run continuously', async (t) => {
+    /* THE DEFECT THIS CASE EXISTS FOR, and why the concurrency case above
+     * could not see it. That case fires twenty-five submissions through one
+     * `Promise.all` and never interleaves a READ, so the only contention it
+     * creates is between writers — which the mutex already orders. The
+     * publishing rename, though, is refused by this platform while ANY
+     * descriptor is open on the destination, and the read path holds exactly
+     * such a descriptor, deliberately outside the mutex. Measured on this host
+     * before the publish window existed: one continuous reader refused 37% of
+     * concurrent submissions and four refused 98.5%, every refusal a valid
+     * submission from a known student answered `store_write_failed` and lost,
+     * while every read succeeded. So the reader won the race and the writer
+     * paid for it, and no writer-only case could ever have caught it. */
+    const context = 'twenty concurrent submissions against four continuous read loops';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t);
+
+    let stop = false;
+    let reads = 0;
+    const readFailures = [];
+    const loops = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (!stop) {
+          try {
+            await store.listActivities('S003');
+            reads += 1;
+          } catch (error) {
+            readFailures.push(error);
+          }
+        }
+      })()
+    );
+
+    const labels = Array.from({ length: 20 }, (unused, index) => `Interleaved Club ${index}`);
+    /* `allSettled` rather than `all`: a refusal is the defect under test, so it
+     * has to be collected and named rather than thrown from the first one. */
+    const outcomes = await Promise.allSettled(
+      labels.map((label) => store.addActivity('S003', label))
+    );
+    stop = true;
+    await Promise.all(loops);
+
+    assert.deepStrictEqual(
+      outcomes
+        .filter((outcome) => outcome.status === 'rejected')
+        .map((outcome) => `${outcome.reason.code} (${outcome.reason.diagnostic?.detail})`),
+      [],
+      `${context}: every submission must be published — a refusal here is a record lost, not a request slowed`
+    );
+    assert.strictEqual(
+      outcomes.filter((outcome) => outcome.value.created).length,
+      labels.length,
+      `${context}: each distinct label must be created exactly once`
+    );
+
+    assert.ok(reads > 0, `${context}: the read loops must have run, or this case proves nothing`);
+    assert.deepStrictEqual(
+      readFailures.map((error) => error.code),
+      [],
+      `${context}: and no read may fail while writes are publishing`
+    );
+
+    const document = await readDocument(storeFile);
+    const forStudent = document.activities.filter((record) => record.studentId === 'S003');
+    assert.strictEqual(
+      forStudent.length,
+      labels.length + 1,
+      `${context}: twenty submissions plus the one seeded record — a lost update would show up as fewer`
+    );
+    const keys = document.activities.map(compositeKeyOf);
+    assert.strictEqual(
+      new Set(keys).size,
+      keys.length,
+      `${context}: the document must hold no duplicate composite key`
+    );
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: and nothing staged may be left at rest`
+    );
+  });
+
+  it('publishes on a retry when the first attempt hits a collision that clears', async (t) => {
+    /* What the bound is FOR. A descriptor held by something outside this
+     * module — an operator running `cat`, a backup agent, a scanner — is
+     * invisible to the read window, so a retry is the only cover for it. The
+     * collision is scripted rather than timed: a real foreign descriptor
+     * released mid-backoff would make this case a race, and a race that
+     * usually passes proves less than nothing. */
+    const context = 'a publish whose first attempt collides and whose second succeeds';
+    const { store, temporaryFile } = await makeIsolatedStore(t);
+    const realRename = fs.rename;
+
+    let renameCalls = 0;
+    t.mock.method(fs, 'rename', async (from, to) => {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        const refusal = new Error('scripted collision, raised by the test harness');
+        refusal.code = 'EPERM';
+        throw refusal;
+      }
+      return realRename(from, to);
+    });
+
+    const outcome = await store.addActivity('S010', 'Quiz Club');
+
+    assert.strictEqual(
+      outcome.created,
+      true,
+      `${context}: the submission must be published rather than refused`
+    );
+    assert.strictEqual(renameCalls, 2, `${context}: the second attempt is what published it`);
+
+    t.mock.restoreAll();
+
+    assert.deepStrictEqual(
+      (await store.listActivities('S010')).map((record) => record.activity),
+      ['Debate Society', 'Quiz Club'],
+      `${context}: and the record is in the document a read returns`
+    );
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: with nothing staged left behind`
+    );
+  });
+
+  it('refuses a publish whose failure cannot clear after a single attempt', async (t) => {
+    /* The other half of the retry predicate. A refusal that would recur
+     * identically — a cross-device rename, a destination that has become a
+     * directory, a missing directory — is decided on the first attempt, so
+     * retrying it three times would hold the write mutex three times as long
+     * for exactly the same answer. Only a collision code is worth a second
+     * look. */
+    const context = 'a rename refused with a code that cannot clear';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t);
+    await store.addActivity('S009', 'Chess Club');
+    const intactBytes = await fs.readFile(storeFile);
+
+    let renameCalls = 0;
+    t.mock.method(fs, 'rename', async () => {
+      renameCalls += 1;
+      const refusal = new Error('scripted rename refusal, raised by the test harness');
+      refusal.code = 'EXDEV';
+      throw refusal;
+    });
+
+    const error = await captureRejection(store.addActivity('S009', 'Quiz Club'), context);
+
+    assertCode(error, E_STORE_WRITE_FAILED, context);
+    assert.strictEqual(
+      renameCalls,
+      1,
+      `${context}: a refusal that cannot clear must cost exactly one attempt`
+    );
+    assert.strictEqual(
+      error.diagnostic.detail,
+      'EXDEV',
+      `${context}: and the errno must reach the diagnostic unchanged, so a log can tell the two apart`
+    );
+    await assertBytesUnchanged(storeFile, intactBytes, context);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: with nothing staged left at rest`
+    );
+
+    t.mock.restoreAll();
   });
 
   it('keeps serving reads while a write fault persists', async (t) => {
@@ -6295,6 +6933,77 @@ function assertProtectedRefusal(error, repositoryRelativeName, context) {
   );
 }
 
+/**
+ * Captures what is on disk at `filePath` before a call that must not touch
+ * it: whether it is there at all, and its exact bytes if it is.
+ *
+ * The one legitimate destination this group exercises inside the checkout is
+ * the default `activities.json` and its derived staging sibling, and those
+ * are runtime-generated paths the service itself writes at exactly that
+ * location. Whether they exist when this file starts is therefore a property
+ * of the machine it runs on, not of the code under test: a clean checkout has
+ * neither, and a developer who has run the documented `npm start` and
+ * submitted once has the first. Capturing the state first is what lets the
+ * assertion afterwards say UNCHANGED — which is the guard's actual intent —
+ * rather than ABSENT, which would fail that developer for a file this suite
+ * never touched.
+ *
+ * Bytes rather than existence alone, because the stronger comparison costs
+ * nothing here and catches the two faults existence cannot: a store rewritten
+ * in place, and one truncated. Both still exist.
+ *
+ * @param {string} filePath The path to capture.
+ * @returns {Promise<{existed: boolean, bytes: Buffer|null}>} The state, with
+ *   `bytes` null exactly when the path was absent.
+ */
+async function captureAmbientState(filePath) {
+  if (!(await exists(filePath))) {
+    return { existed: false, bytes: null };
+  }
+  return { existed: true, bytes: await fs.readFile(filePath) };
+}
+
+/**
+ * Asserts a path is exactly as `captureAmbientState` found it, in both
+ * directions: a path that was absent must still be absent — the clean
+ * checkout every CI run starts from, whose strength must not be diluted —
+ * and a path that was there must still be there with identical bytes.
+ *
+ * The failure message names what the suite did to the path, since the fault
+ * being reported is the suite's own write, removal or repair. Per the output
+ * safety rule above it quotes the repository-relative name and never the
+ * absolute path it was given.
+ *
+ * @param {string} filePath The path that was captured.
+ * @param {{existed: boolean, bytes: Buffer|null}} before The state
+ *   `captureAmbientState` returned before the call under test.
+ * @param {string} repositoryRelativeName The name the message may quote.
+ * @returns {Promise<void>}
+ */
+async function assertAmbientStateUnchanged(filePath, before, repositoryRelativeName) {
+  const existsNow = await exists(filePath);
+
+  if (!before.existed) {
+    assert.strictEqual(
+      existsNow,
+      false,
+      `this suite created ${repositoryRelativeName}: it was not in the checkout when the case started and is now. Nothing here may write the developer's store.`
+    );
+    return;
+  }
+
+  assert.strictEqual(
+    existsNow,
+    true,
+    `this suite removed ${repositoryRelativeName}: it was in the checkout when the case started and is gone. The developer's own store must be left exactly as it was found.`
+  );
+  await assertBytesUnchanged(
+    filePath,
+    before.bytes,
+    `this suite modified ${repositoryRelativeName}, which was already in the checkout when the case started`
+  );
+}
+
 describe('the store refuses a protected destination', () => {
   const PROTECTED_CASES = [
     { relativeName: 'student_details.xlsx', filePath: DETAILS_WORKBOOK },
@@ -6617,7 +7326,22 @@ describe('the store refuses a protected destination', () => {
     assert.strictEqual(outcome.created, true, 'a legitimate destination must still be writable');
     assert.strictEqual(await exists(storeFile), true);
 
+    /* Loading the module performs no read and no write, so the developer's
+     * own store — the one artifact this module exists to write, and the one
+     * destination here deliberately NOT protected — must be left exactly as
+     * it was FOUND. Found rather than absent: `activities.json` and its
+     * staging sibling are runtime-generated paths the service creates at
+     * precisely this location, so their presence is the documented outcome of
+     * running the service once and says nothing about this suite. Both are
+     * captured before the load and asserted unchanged after it, in both
+     * directions — absent stays absent, which is the clean checkout CI runs
+     * and the stronger half of the guard, and present stays byte-identical,
+     * which is the half that catches a write to a developer's real data. */
     const defaultStore = path.join(REPOSITORY_ROOT, 'activities.json');
+    const defaultStoreStaging = `${defaultStore}${TEMPORARY_SUFFIX}`;
+    const defaultStoreBefore = await captureAmbientState(defaultStore);
+    const defaultStoreStagingBefore = await captureAmbientState(defaultStoreStaging);
+
     try {
       const inTree = freshStore(defaultStore);
       assert.strictEqual(
@@ -6629,14 +7353,12 @@ describe('the store refuses a protected destination', () => {
       freshStore(BOOTSTRAP_STORE_PATH);
     }
 
-    /* Loading the module neither reads nor writes, so the developer's store
-     * must still not exist in this checkout. */
-    assert.strictEqual(
-      await exists(defaultStore),
-      false,
-      'this suite must never create activities.json in the checkout'
+    await assertAmbientStateUnchanged(defaultStore, defaultStoreBefore, 'activities.json');
+    await assertAmbientStateUnchanged(
+      defaultStoreStaging,
+      defaultStoreStagingBefore,
+      `activities.json${TEMPORARY_SUFFIX}`
     );
-    assert.strictEqual(await exists(`${defaultStore}${TEMPORARY_SUFFIX}`), false);
   });
 });
 

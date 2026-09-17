@@ -75,13 +75,31 @@ Four notes separate these commands *working* from merely *appearing* to work:
 - **`npm install` generates the lockfile; `npm ci` consumes it.** `npm ci` *requires*
   `package-lock.json` to exist and fails without it — it never creates one. The lockfile was generated
   once, at implementation time, and is committed. With zero dependencies both commands download
-  nothing, and `npm ci` serves as the manifest-to-lockfile consistency check.
+  nothing, and what `npm ci` checks is narrower than "the manifest and the lockfile agree": the
+  lockfile must be **present**, and its **dependency tree** must match the dependencies the manifest
+  declares. With none declared, the tree comparison has nothing to compare and the check reduces to
+  the presence one. **Root-metadata drift is not detected** — a bumped `version` or a widened
+  `engines` range with the lockfile left untouched still exits `0`, so a lockfile disagreeing with
+  those two fields is not what this command is going to tell you about. Re-run `npm install` after
+  editing either field; it rewrites the lockfile's copy of them and downloads nothing.
 - **The test command passes no positional argument.** Do not run `node --test test/`: on the pinned
   runtime that treats `test/` as a module to load rather than as a directory to discover, exits `1`,
   and runs no tests at all. Node discovers the test files itself, which is also why no shell glob is
   needed and none is portable.
 - **There is no graceful-shutdown handler**, and the feature adds none. Stop the service with
-  `Ctrl-C`, exactly as before.
+  `Ctrl-C`, exactly as before. Measured on Windows PowerShell 5.1 (`$Host.Name` = `ConsoleHost`),
+  that is all it takes: a single `Ctrl-C` in the console running `npm start` stops the service and
+  returns the ordinary prompt, with no `^C` echoed and nothing printed on the way out. The silence
+  is the design rather than a message that went missing — there is no signal or exit listener
+  anywhere in the service to print one. Two Windows specifics are worth knowing even so. First,
+  `npm start` reaches the service through a PowerShell *script* shim rather than an executable:
+  `npm` resolves to `npm.ps1`, whose last statement is `exit $LASTEXITCODE`. PowerShell's own
+  debugger can claim an interrupt while a script is on the call stack, so if `Ctrl-C` ever answers
+  with `Entering debug mode` or a `[DBG]:` prompt instead of your shell prompt, the service is
+  already going down and `q` leaves the debugger; `node server.js` has no shim in the way at all.
+  Second, for a scripted stop, where there is no console to press anything in, terminate whatever
+  owns the port:
+  `Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProcess`.
 
 ## Endpoint contract
 
@@ -177,9 +195,10 @@ Every JSON response is `application/json; charset=utf-8`; every HTML response is
 | `POST /activities` | `400` | `body_not_an_object` | JSON parses to `null`, an array, or a non-object | — |
 | `POST /activities` | `400` | `student_id_required` | `studentId` absent, `undefined`, or `null` | — |
 | `POST /activities` | `400` | `student_id_malformed` | `studentId` non-string, or fails `/^S\d{3}$/` | — |
-| `POST /activities` | `400` | `activity_invalid` | `activity` absent, non-string, empty after normalization, over 60 characters, or containing a control character | — |
+| `POST /activities` | `400` | `activity_invalid` | `activity` absent, non-string, empty after normalization, over 60 characters, or still carrying a control character after normalization (a tab is collapsed to a space, not refused — see [Normalization](#normalization)) | — |
 | `POST /activities` | `404` | `student_not_found` | well-formed `studentId` absent from the key set | — |
 | `POST /activities` | `413` | `payload_too_large` | body over 8,192 bytes | — |
+| `POST /activities` | `500` | `store_at_capacity` | the store is at a ceiling, so the record cannot be added — distinct from a write failure because the remedy is different | — |
 | `POST /activities` | `415` | `unsupported_media_type` | `Content-Type` missing, **declared more than once**, or neither accepted type | — |
 | any other method on `/activities` | `405` | `method_not_allowed` | — | `Allow: GET, POST` |
 | any namespace path resolving to no route | `404` | `not_found` | e.g. `/activities/S001/extra` | — |
@@ -249,8 +268,12 @@ The same fault is recorded server-side as one line of allow-listed fields, for e
 `request_handler_failed method=GET path=/activities/S001 error=Error code=-`. It carries the stable
 event code, the request method, the request **pathname** with the query string dropped, and the
 thrown value's name and code — never its message, its stack or its `cause`, because those name source
-and store paths and can carry record values. There are exactly **four distinct `500` codes** in
-total: `reference_data_unavailable`, `store_unreadable`, `store_write_failed` and `internal_error`.
+and store paths and can carry record values. There are exactly **five distinct `500` codes** in
+total: `reference_data_unavailable`, `store_unreadable`, `store_at_capacity`, `store_write_failed`
+and `internal_error`. The last two are deliberately separate, because a submission refused for want
+of room and a submission refused by a broken disk call for different actions: a **retry** clears a
+write failure, and only **reclaiming room** clears a full store. The capacity section under
+Configuration says how much room there is, what warns you before it runs out, and how to reclaim it.
 
 **The envelope is a statement about JSON responses.** A form-encoded `POST /activities` whose outcome
 a person can act on answers with HTML instead, as the paragraph above sets out, and that page
@@ -322,7 +345,7 @@ array:
 | Field | Type | Required | Rule |
 | --- | --- | --- | --- |
 | `studentId` | string | yes | matches `/^S\d{3}$/` **and** must exist in the key set below |
-| `activity` | string | yes | 1 to 60 characters after normalization; no control characters |
+| `activity` | string | yes | 1 to 60 characters after normalization; no control characters, a tab having already been collapsed to a space by [Normalization](#normalization) |
 | `source` | string | yes | `"submission"` or `"workbook"`. Server-set; **never** accepted from the client |
 | `submittedAt` | string | only when `source` is `"submission"` | ISO-8601 UTC, generated by the server; never accepted from the client. **Absent** on a seeded record |
 | `schemaVersion` | number | yes (document level) | the literal `1`. A document declaring any other version is refused rather than guessed at |
@@ -397,12 +420,20 @@ from the submission itself.
 
 Applied before a record is stored:
 
-- leading and trailing whitespace is trimmed;
-- every run of internal whitespace is collapsed to a single space;
-- any string containing a control character, U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR is
-  rejected as `400 activity_invalid` — a tab, a newline and either line separator are refused,
-  never laundered into a space, because laundering a line terminator would let two visually
-  identical labels dedupe differently;
+- leading and trailing **horizontal whitespace** is trimmed. Horizontal whitespace means every
+  Unicode space separator — U+0020 SPACE, U+00A0 NO-BREAK SPACE, U+2003 EM SPACE, U+3000
+  IDEOGRAPHIC SPACE and the rest of `\p{Zs}` — **plus U+0009 TAB**;
+- every run of internal horizontal whitespace is collapsed to a single ASCII space, so
+  `Chess<TAB>Club`, `Chess  Club` and `Chess Club` are one activity rather than three. The tab is
+  included because it is horizontal whitespace and nothing else inside a single-line label, and
+  because it is what a spreadsheet copy-paste produces — which is where this project's data comes
+  from;
+- any string **still** carrying a control character after those two steps, or U+2028 LINE SEPARATOR
+  or U+2029 PARAGRAPH SEPARATOR, is rejected as `400 activity_invalid`. A newline, a carriage
+  return, a vertical tab, a form feed, NUL, DEL and the C1 block are refused rather than laundered
+  into a space, because laundering a line terminator would let two visually identical labels dedupe
+  differently. A tab never reaches this rule: the collapse above has already replaced it, so no
+  stored label contains one;
 - the 1-to-60-character bound is enforced **after** the two steps above, and is measured in
   **UTF-16 code units** — exactly how the form's `maxlength="60"` is evaluated, so the JSON API and
   the native form agree on the boundary for every label, astral characters included;
@@ -457,6 +488,13 @@ anywhere in this project.
 
 - It **overrides the store path**.
 - It **defaults to `activities.json` beside the source**, next to `activity-store.js`.
+- A value that is **present but empty counts as unset**, so the default applies and the store lands
+  *inside* the checkout with nothing said about it. Worth knowing, because `ACTIVITY_STORE=` in a
+  launcher script reads like "no store path configured" and behaves like it, and the result is only
+  harmless because that one default name is among the patterns the ignore policy covers. Only a
+  genuinely empty value is read as unset: a whitespace-only value is **not** trimmed and **not**
+  treated as absent, it is taken literally as a relative path, so a stray space configures a store
+  file named for that space in the working directory.
 - The path is **resolved once at module load**, so changing the variable mid-process has no effect.
   A relative value is interpreted against the working directory; an absolute path is recommended.
 - Its **directory must already exist and be writable**, or a submission that has to **persist a new
@@ -469,6 +507,31 @@ anywhere in this project.
   The staging path is *derived* from the resolved path, so the temp sibling follows `ACTIVITY_STORE`
   wherever it points and always sits in the same directory — hence on the same filesystem, which is
   what makes the rename atomic. With the default store path the staging file is `activities.json.tmp`.
+- **The publishing rename is held apart from the reads, because on Windows it has to be.** The call
+  behind `fs.rename` refuses with `EPERM` while *any* descriptor is open on the destination, and
+  `GET /activities/{id}` holds exactly such a descriptor while it reads the store. Measured on this
+  platform before the service coordinated the two: with submissions arriving at concurrency five,
+  one continuous reader had **37%** of them refused `500 store_write_failed` and four readers had
+  **98.5%** refused — valid submissions from known students, lost to nothing but another client
+  reading at the same moment, while every read succeeded. So a read now waits for a rename that is
+  already in flight, and a rename waits for the reads that are, **for the duration of that one
+  syscall and nothing else**. A read is still never queued behind another submission's load,
+  validation, serialization or staging write: that separation is the point of the design and it is
+  unchanged. With the coordination in place the same measurements refuse **none** of 200
+  submissions at nought, one, four and sixteen concurrent readers.
+- **A descriptor held by another process is retried, not coordinated.** Nothing in this process can
+  see an operator running `cat`, a backup agent or a virus scanner holding the store open, so the
+  rename is attempted up to **three** times with a short backoff before the write is refused —
+  the same bounded idiom as the staging-file creation above, and enough for a descriptor that
+  closes. A foreign process that holds the store open *continuously* will still see submissions
+  refused `500 store_write_failed`, with the previous document intact and a retry safe to issue.
+  Coordinating across processes would need file locking, which this single-instance service does
+  not have.
+- **No failure path leaves a staging file at rest.** A write that never completed removes it, a
+  descriptor that could not be closed removes it, and a publish refused after every attempt removes
+  it. So the only `.tmp` that can exist beside the store belongs to a write in flight, or to a
+  process that died mid-write — and that one is still never read, only cleared and re-created by
+  the next write.
 - The staging file is **created exclusively and never truncated in place**. The open is
   `O_CREAT | O_EXCL | O_WRONLY`, plus `O_NOFOLLOW` on the platforms that define it — it is
   `undefined` on Windows, where exclusive creation already refuses to open anything that exists,
@@ -490,9 +553,10 @@ anywhere in this project.
   `500 store_unreadable`, and in every one of those cases the file is left exactly as found — never
   truncated, repaired or overwritten — so a hand edit that trips a ceiling is still there to correct.
   A submission that would push the document past 5,000 records **or past 2 MiB once serialized** is
-  refused with `500 store_write_failed` before anything is staged, and the previous document stays
-  intact and readable; an idempotent repeat of an activity already recorded appends nothing and still
-  returns `200`, and reads keep working throughout. The write-side byte check is not redundant with
+  refused with `500 store_at_capacity` — its own code, not the generic `store_write_failed`, so a full
+  store is distinguishable from a broken disk — before anything is staged, and the previous document
+  stays intact and readable; an idempotent repeat of an activity already recorded appends nothing and
+  still returns `200`, and reads keep working throughout. The write-side byte check is not redundant with
   the record count: the 60-character label bound counts UTF-16 code units while the ceiling counts
   UTF-8 bytes, so a document inside the record ceiling can still serialize past 2 MiB, and without
   the check one accepted submission could publish a store that every later request refused. **The
@@ -518,7 +582,12 @@ anywhere in this project.
   is not refused for merely resembling one. A protected destination is refused at module load,
   before any store read or write, with a `RangeError` carrying `code: 'E_STORE_PATH_PROTECTED'` that
   names `ACTIVITY_STORE` and the protected file, so the service fails fast at startup instead of
-  renaming a store document over student data. The check exists because a write is a `rename`
+  renaming a store document over student data. **Started directly, the service reports that as two
+  stderr lines and nothing else** — `server error: E_STORE_PATH_PROTECTED`, then the sentence naming
+  the file it resolved to and telling you to point the variable outside the repository — with nothing
+  on stdout, exit status `1`, and **no stack trace**: the same one-line-plus-exit disposition a
+  refused bind gets. A program that loads the module itself receives that `RangeError` unchanged and
+  decides for itself what to report. The check exists because a write is a `rename`
   **over** the target: a mistyped variable would not append to a workbook or to `LICENSE`, it would
   replace it. `activities.json` and `activities.json.tmp` are of course still accepted — they are
   the default.
@@ -570,6 +639,108 @@ configurable by any environment variable, flag or config file. That is a recogni
 left out of scope for this change: externalising them is a worthwhile improvement but is not what was
 asked for, and widening the bind would expose an unauthenticated write endpoint.
 
+**What that means in practice: only one instance can run at a time, and the second one to start does
+not.** When something already holds `127.0.0.1:3000`, `npm start` writes **nothing** to stdout — no
+readiness line, because that line lives inside the listen callback and the bind never succeeded —
+writes exactly one line to stderr, `server error: EADDRINUSE`, and exits `1`. There is no stack
+trace and no retry: the service did not start, and that single line is the whole diagnosis. The
+remedy is to find the holder and release it, then start again:
+
+```bash
+lsof -iTCP:3000 -sTCP:LISTEN            # POSIX; or: ss -ltnp 'sport = :3000'
+```
+
+```powershell
+Get-NetTCPConnection -LocalPort 3000 -State Listen | Select-Object OwningProcess
+```
+
+On a host shared with other checkouts or other work the port is therefore a **take-turns resource**:
+wait for it, rather than assuming a failure to start is a fault in the service. The same applies to
+`npm test`, whose `test/lifecycle.test.js` needs the literal port exclusively — see **Testing** below.
+
+A program that needs the service on some other port can `require('./server')` and call
+`listen` itself: the export exists for exactly that, and loading the module binds nothing. That is a
+composition seam for a caller, **not** a supported way to reconfigure the service — `npm start` always
+uses the literals above, and the readiness line is printed only by direct execution, since it sits
+inside the `require.main === module` guard.
+
+### Capacity limits, and what to do when the store fills up
+
+The store holds at most **5,000 activity records** and **2 MiB**, and those numbers are a bound on a
+runaway rather than a quota on a class of students. The workload this feature is for — ten students
+with a handful of activities each — is about **11 records and 2 KB**, three orders of magnitude inside
+either ceiling, so no ordinary use of the service can approach them.
+
+**Where the ceiling actually is, in time.** A saturating client submits **several hundred distinct
+activities per second into a small store and steadily fewer as the document grows** — measured on this
+class of machine at roughly 440 per second when the store is nearly empty and under 100 per second
+near the ceiling, because every submission reads, validates and rewrites the whole document. Averaged
+over the whole climb that fills the store in about **26 seconds**, so this is a limit a script reaches
+and a person never does. Once it is full, every genuinely new activity is refused with
+`500 store_at_capacity`; everything that does not grow the document keeps working exactly as before:
+
+| At the record ceiling | Result |
+| --- | --- |
+| `POST /activities` with a new activity | `500 store_at_capacity`, nothing staged, the document unchanged |
+| `POST /activities` repeating an activity already recorded | `200` with the existing record — a repeat appends nothing, so capacity cannot refuse it |
+| `GET /activities/{id}` | `200`, the full list, as always |
+| `GET /activities`, and every path outside the namespace | `200`, unaffected |
+
+**You are warned before you get there.** When the document first crosses **4,500 records** — ninety
+per cent of the ceiling — the service writes exactly one line to standard error and then stays quiet,
+so a filling store is not something you first learn about from a refusal:
+
+```
+activity-store: {"event":"store_capacity_warning","records":4500,"ceiling":5000}
+```
+
+The line is written once per crossing, not once per submission, and it re-arms if the count later
+falls back below the band, so a store that is pruned and fills again warns again.
+
+**Reclaiming room is an operator action, by design.** This service intentionally offers no way to
+edit, delete, bulk-import or export an activity, so there is no in-product eviction, rotation or
+archival, and none is planned. The remedy is to prune the store file:
+
+1. Read `activities.json` — it is plain UTF-8 JSON, indented, and safe to open with any text tool.
+2. Remove the records you no longer need from the `activities` array. Keep the document **valid**:
+   `schemaVersion` must stay `1`, every remaining record must keep its exact `studentId`, `activity`,
+   `source` and — for a `submission` only — `submittedAt` fields, labels must stay in normalized form
+   (trimmed, single spaces), and no two remaining records may share a Student ID and label compared
+   case-insensitively. A document that breaks any of those is refused on load with
+   `500 store_unreadable`, naming what is wrong, and is **never** rewritten for you.
+3. Save it. **No restart is needed** — the store is read from disk on every request, so the next one
+   sees the pruned document immediately.
+
+Removing the file entirely is also valid: the next read answers from the workbook seed, and the next
+submission materialises a fresh document from it. That discards every submitted activity, which is
+exactly what it sounds like, so copy the file somewhere first if the records matter.
+
+### What the service costs as the store grows
+
+The store is deliberately **never cached**: every request reads it from disk, parses it and validates
+every record in it, which is what makes a hand edit visible immediately and a lost update impossible.
+The cost of that is real and grows with the document, so it is stated here rather than left to be
+discovered. Measured on this project's runtime:
+
+| Store | Read latency, one client | Read throughput | Longest single stretch of CPU per request |
+| --- | --- | --- | --- |
+| 11 records / 2 KB — the real workload | ~0.4 ms | thousands per second | ~0.6 ms |
+| 4,900 records / 828 KB — near the ceiling | ~11 ms | ~90 per second | ~2.6 ms |
+
+Two consequences worth planning around. **Read throughput falls roughly linearly with the size of the
+document**, because the whole of it is read and validated per request; at the ceiling the service
+answers reads in the region of a hundred per second rather than thousands, and adding concurrent
+clients past that point adds latency rather than throughput, as it must for a single-threaded process.
+And **no single request monopolises the process**: record validation hands the event loop back
+whenever it has run for a quarter of a millisecond, and a submission hands it back before serializing,
+so a request that touches no store at all — `GET /`, or the form — stays responsive while large
+documents are being read and written. That bound is the reason the numbers above are the whole story:
+a big store makes its own route slower and leaves the rest of the service alone.
+
+If you need read throughput at the ceiling that this shape cannot give, the answer is a different
+storage design — an index, pagination or a cached document — and each of those is a deliberate
+exclusion of this project rather than a tuning knob it left unturned.
+
 ## Testing
 
 ```bash
@@ -601,7 +772,7 @@ The three test files and their division of labour:
 | --- | --- | --- |
 | `test/store.test.js` | **none** — reads and writes a temporary store via `ACTIVITY_STORE`, so it is safely parallel | store behaviour: seeding and all three initial states, normalization, composite-key dedupe, the load-validation refusals, the workbook reader's supported format subset, the write mechanics (atomic replacement, a configured store path and its derived temp sibling, a stale temp file, concurrent submissions, recovery after a transient write fault), and the four workbook invariants |
 | `test/activities.test.js` | **ephemeral** — creates its own server on port `0` and closes it afterwards, so it contends for nothing | every feature-originated row of the response matrix, one named case each and in both request modes where HTML applies: the form's content type, `201` with `Location`, the idempotent `200` with its original `submittedAt`, a seeded record's `source`, read-back, the route-correct `Allow`, the `413` boundary at 8,192 and 8,193 bytes, the validation precedence order, and a `<script>` label served escaped |
-| `test/lifecycle.test.js` | **the literal `3000`** — spawns `node server.js`, so it must run serially | process behaviour: the readiness line emitted exactly once with its exact text, `GET /` byte for byte against the recorded sha256, each namespace-boundary lookalike individually, and the `EADDRINUSE` disposition of a second instance |
+| `test/lifecycle.test.js` | **the literal `3000`** — spawns `node server.js`, so it must run serially | process behaviour: the readiness line emitted exactly once with its exact text, `GET /` byte for byte against the recorded sha256, each namespace-boundary lookalike individually, and each of the service's three failure dispositions as the exact bytes it writes — the `EADDRINUSE` refusal of a second instance, the startup refusal of a protected `ACTIVITY_STORE`, and a refused store write the process survives |
 
 **The tests must run on the same host as the service.** The loopback bind refuses off-host requests,
 so a split runner-and-service topology is impossible and a container-published port would not reach
@@ -705,6 +876,17 @@ echo "evidence retained in $RUN"
 
 The timestamped `mktemp -d` template guarantees a fresh directory even for two runs in the same
 second, so one run never overwrites another's results. A coverage gate must assert that `server.js`
-appears as a **row** in the per-file table, not merely that a percentage cleared — a suite that
-spawns the service as a child process prints an empty file table and an "all files 100%" summary, so
-a gate reading only the percentage would pass a run that executed none of the file.
+appears as a **row** in the per-file table, not merely that a percentage cleared. The reason is that
+an **include pattern matching no file the suite loads in-process** prints an empty file table and an
+"all files 100.00" summary and still **exits zero** — even with a line threshold demanded, since a
+threshold on nothing is met. A gate reading only the percentage would therefore pass a run that
+measured none of the file. The pattern can miss for a plain reason or a subtle one: it can name a
+file nothing loads, or it can be quoted such that the shell passes the quote characters through as
+part of the pattern, which is the same failure wearing a different hat.
+
+The delivered suite does not itself fall into this. Both `test/activities.test.js` and
+`test/lifecycle.test.js` `require('../server')`, so `server.js` is always loaded in the runner's own
+process and always produces a real row — the gate is satisfiable, not aspirational. That row
+*understates* the testing: `test/lifecycle.test.js` exercises the direct-execution paths in a
+spawned `node server.js` child, and the parent runner does not collect a child's execution. Coverage
+figures here are meaningful for the in-process seam and should be read as a floor.

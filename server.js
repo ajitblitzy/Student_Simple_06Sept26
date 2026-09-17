@@ -14,10 +14,15 @@
  * `/nonsense`, and the lookalikes `/activities-old` and `/activitieslist` —
  * is answered by those fall-through statements at the foot of the handler.
  *
- * ERROR OWNERSHIP, SPLIT TWO WAYS
- * -------------------------------
- * This file owns exactly two failures, and they are not interchangeable:
+ * ERROR OWNERSHIP, SPLIT THREE WAYS
+ * ---------------------------------
+ * This file owns exactly three failures, and they are not interchangeable:
  *
+ *   - STARTUP faults — a misconfiguration that stops the feature loading at
+ *     all, such as an `ACTIVITY_STORE` naming a file of this repository. Owned
+ *     by the `try`/`catch` around the feature require below, which reports the
+ *     condition in one legible line and leaves without composing or binding
+ *     anything.
  *   - REQUEST faults — anything thrown or rejected inside `activities.handle`
  *     that the feature does not anticipate. Owned by the `try`/`catch` around
  *     the delegation, answered `500 internal_error` in the same two-field
@@ -27,6 +32,11 @@
  *   - LISTENER faults — a failure to bind, such as `EADDRINUSE`. Owned by the
  *     `'error'` listener below, which logs the code and exits non-zero instead
  *     of terminating on an unhandled `'error'` event.
+ *
+ * All three report the same way, which is the point of stating them together:
+ * one line an operator can read and a start script can gate on, a non-zero
+ * exit where the process cannot continue, and never a stack trace where a
+ * `code` and a sentence say it better.
  *
  * The `try` is mandatory rather than stylistic: when an `async` handler
  * rejects with nothing catching it, `server.on('error')` does not fire and
@@ -49,7 +59,152 @@
  */
 
 const http = require('http');
-const activities = require('./activities');
+
+/* ------------------------------------------------------------------------- *
+ * The startup boundary
+ *
+ * Loading the feature is the one thing this file does that can fail before
+ * there is a listener to report it or a request to answer with. The store's
+ * destination is resolved and vetted while `activity-store.js` is loading, so
+ * an `ACTIVITY_STORE` naming a file of this repository throws out of the
+ * require below — and, left uncaught, that becomes Node's default
+ * uncaught-throw dump: the throwing line, twenty-odd lines of stack with the
+ * absolute path of every source file in it, seven of the frames belonging to
+ * the CommonJS loader rather than to this project, the inspected error object,
+ * and the runtime's own version banner.
+ *
+ * None of that is diagnosis. The error's `message` already names the variable,
+ * the file it resolved to, and what to do instead, and its `code` already
+ * names the condition — so this boundary prints exactly those two things and
+ * nothing else. That is the same treatment the `'error'` listener at the foot
+ * of this file gives a refused bind, and an operator or a start script gating
+ * on the shape `server error: <CODE>` gets one line to read either way rather
+ * than a parseable line for one fault and a stack dump for the other.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The codes that name a STARTUP CONFIGURATION fault: a condition the operator
+ * caused through the environment and can fix there, raised while a module is
+ * loading, where the only useful output is the condition itself.
+ *
+ * An allow-list rather than a catch-all, because the two kinds of load failure
+ * want opposite treatment. A misconfiguration is the operator's to correct and
+ * a stack trace tells them nothing they can act on. A genuine defect — a
+ * syntax error, an absent module, a broken require in a file this one composes
+ * — is a developer's to correct, and there the stack trace IS the diagnosis:
+ * anything not listed here is re-thrown untouched, so no defect is ever
+ * flattened into one tidy line that hides where it came from.
+ *
+ * Frozen so a fault path cannot extend the set of faults it is allowed to
+ * swallow.
+ */
+const STARTUP_CONFIGURATION_FAULT_CODES = Object.freeze(['E_STORE_PATH_PROTECTED']);
+
+/**
+ * 400 characters sits well above the longest sentence any startup refusal
+ * composes — the protected-destination sentence is under 200, with the
+ * repository-relative file name already in it — so a real message is never
+ * truncated, while a message from some future refusal cannot grow the line
+ * without bound.
+ */
+const STARTUP_FAULT_DETAIL_MAX_CHARS = 400;
+
+/**
+ * Whether a thrown value is one of the startup configuration faults above.
+ *
+ * Nothing about the value is assumed: `require` can reject with anything a
+ * loaded module chose to throw, including a primitive, so the type and the
+ * property are both checked before the code is compared.
+ *
+ * @param {unknown} error Whatever came out of the require.
+ * @returns {boolean} True only for an allow-listed configuration fault.
+ */
+function isStartupConfigurationFault(error) {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    typeof error.code === 'string' &&
+    STARTUP_CONFIGURATION_FAULT_CODES.includes(error.code)
+  );
+}
+
+/**
+ * Reduces a startup fault's message to the one line this boundary may print.
+ *
+ * The message is worth printing — it is the only part of the dump that tells
+ * an operator what to change — but it is printed as DATA rather than trusted
+ * as a line: control characters become spaces so nothing can forge a second
+ * log line, runs of whitespace collapse so the sentence stays one line
+ * whatever it was composed from, and the length is capped. The error object
+ * itself is never handed to `console.error`, because that prints its inspected
+ * form — stack, absolute paths, and any `cause` — which is precisely the dump
+ * this boundary exists to replace.
+ *
+ * @param {object} error An allow-listed configuration fault.
+ * @returns {string|null} One bounded printable line, or `null` when the fault
+ *   carries no usable message and the code line stands alone.
+ */
+function startupFaultDetail(error) {
+  if (typeof error.message !== 'string') {
+    return null;
+  }
+
+  const oneLine = error.message
+    // C0 controls, DEL, the C1 range, and the two Unicode line separators —
+    // every character that could end this line early and start another.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (oneLine === '') {
+    return null;
+  }
+
+  return oneLine.length > STARTUP_FAULT_DETAIL_MAX_CHARS
+    ? `${oneLine.slice(0, STARTUP_FAULT_DETAIL_MAX_CHARS)}...`
+    : oneLine;
+}
+
+/**
+ * The feature, loaded behind that boundary.
+ *
+ * `let` with a guarded require rather than a bare `const` initializer: the
+ * require is the statement that can fail, and it has to fail INTO something.
+ *
+ * Two deliberate asymmetries in the `catch`:
+ *
+ *   - A fault that is not an allow-listed configuration fault is re-thrown, so
+ *     a defect keeps the full diagnosis a developer needs.
+ *   - A fault raised while this file is being loaded AS A MODULE is re-thrown
+ *     too. The caller is composing the service itself, so the error object is
+ *     more use to it than a line on this process's stderr — it can inspect the
+ *     `code`, report it in its own terms, or decide to carry on. Only direct
+ *     execution, where this file IS the program, reports and leaves.
+ *
+ * The `return` ends the module body, which is the whole point of reporting
+ * here rather than further down: no server is constructed, no `'error'`
+ * listener is attached, and above all `listen` is never reached, so a
+ * misconfigured process cannot take port 3000 and then answer every request
+ * with a fault. `process.exitCode` rather than `process.exit()` for the reason
+ * the listener below documents — the exit must not race the log it just
+ * wrote, and with nothing bound the loop drains immediately anyway.
+ */
+let activities;
+try {
+  activities = require('./activities');
+} catch (error) {
+  if (require.main !== module || !isStartupConfigurationFault(error)) {
+    throw error;
+  }
+
+  console.error(`server error: ${error.code}`);
+  const detail = startupFaultDetail(error);
+  if (detail !== null) {
+    console.error(detail);
+  }
+  process.exitCode = 1;
+  return;
+}
 
 const hostname = '127.0.0.1';
 const port = 3000;

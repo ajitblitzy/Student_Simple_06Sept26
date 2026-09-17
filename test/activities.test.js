@@ -714,7 +714,7 @@ const EXPECTED_MESSAGES = Object.freeze({
   student_id_malformed:
     'A Student ID must be the letter S followed by exactly three digits, for example S001.',
   activity_invalid:
-    'An activity must be a label of 1 to 60 characters and must not contain control characters.',
+    'An activity must be a label of 1 to 60 characters and must not contain a line break or any other control character; a tab counts as a space.',
   student_not_found: 'No student exists with that Student ID.',
   not_found: 'That resource does not exist.',
   method_not_allowed: 'That method is not allowed for this resource.',
@@ -723,6 +723,8 @@ const EXPECTED_MESSAGES = Object.freeze({
     'A submission must be sent as application/x-www-form-urlencoded or application/json.',
   reference_data_unavailable: 'The student reference data could not be read.',
   store_unreadable: 'The activity store could not be read.',
+  store_at_capacity:
+    'The activity store has reached the capacity this service accepts, so the activity could not be saved.',
   store_write_failed: 'The activity could not be saved.',
   internal_error:
     'The request could not be completed because of an unexpected internal error.',
@@ -772,6 +774,27 @@ const HTML_ENTITIES = Object.freeze({
  */
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (character) => HTML_ENTITIES[character]);
+}
+
+/**
+ * A value as the page's OUTCOME SENTENCE carries it: escaped, and wrapped in
+ * the bidi isolate the page puts around every value it did not write itself.
+ *
+ * The isolate is why an expectation cannot simply state the sentence as one
+ * run of text any more. It exists because an accepted label may carry U+202E
+ * RIGHT-TO-LEFT OVERRIDE — Unicode category Cf, so the normalization rules
+ * permit it — and an unterminated override reverses the REST of the sentence,
+ * the Student ID included, unless the label is isolated from it.
+ *
+ * Stating the expectation through this helper keeps the assertion about the
+ * WHOLE sentence rather than about the fragments it survives as: a page that
+ * dropped the words between two values, or reordered them, still fails.
+ *
+ * @param {string} value The submitted or stored value.
+ * @returns {string} The markup the page emits for it inside a message.
+ */
+function isolatedInMessage(value) {
+  return `<bdi>${escapeHtml(value)}</bdi>`;
 }
 
 /**
@@ -1376,6 +1399,49 @@ describe('GET /activities — the submission form', () => {
     assert.ok(markup.includes('maxlength="60"'), `${context}: the activity length hint`);
   });
 
+  it('states the required Student ID format in the input title the native bubble reads', async () => {
+    const context = 'GET /activities Student ID format hint';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // `pattern` is a convenience that INTERCEPTS: for a non-empty malformed
+    // Student ID the browser blocks the submission with no request at all, so
+    // the authoritative server-side sentence never renders and the browser's
+    // own transient bubble is the only signal there is. With no `title` to read
+    // from, that bubble says "Please match the requested format." and never
+    // says what the format is.
+    //
+    // The expectation comes from the SAME map the 400 assertions use, so a
+    // hint rewritten for the bubble — drifting from the sentence the server
+    // sends when a submission does reach it — fails here.
+    const hint = escapeHtml(expectedMessageFor('student_id_malformed', context));
+    assert.ok(
+      markup.includes(`pattern="S[0-9]{3}" title="${hint}"`),
+      `${context}: the Student ID input carries that sentence as its title, directly after the pattern it explains`
+    );
+  });
+
+  it('declares a mobile viewport so the layout viewport is the device width', async () => {
+    const context = 'GET /activities viewport';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // Without this element a mobile browser lays the page out against its own
+    // ~980 CSS-pixel default viewport and then scales the result down, so a
+    // form that is fine at any desktop width arrives on a phone shrunk. The
+    // content string is asserted exactly rather than by substring:
+    // `width=device-width` on its own leaves the initial scale to the browser,
+    // and the two halves are what make the declaration complete.
+    assert.ok(
+      markup.includes('<meta name="viewport" content="width=device-width, initial-scale=1">'),
+      `${context}: the viewport meta, with its exact content`
+    );
+    const declarations = markup.match(/<\s*meta\s+name="viewport"/gi) ?? [];
+    assert.strictEqual(
+      declarations.length,
+      1,
+      `${context}: declared exactly once, not ${declarations.length} times`
+    );
+  });
+
   it('serves no client-side script and no external asset reference', async () => {
     const context = 'GET /activities has no script or asset';
     const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
@@ -1386,11 +1452,15 @@ describe('GET /activities — the submission form', () => {
     // and a reference to one would be a request this service cannot answer.
     //
     // Every pattern is case-insensitive: HTML element and attribute names are,
-    // so `<LINK>` and `SRC=` would fetch exactly as their lowercase spellings
-    // do while sailing past a lowercase substring check.
+    // so `<SCRIPT>` and `SRC=` would fetch exactly as their lowercase
+    // spellings do while sailing past a lowercase substring check.
+    //
+    // `<link>` is NOT forbidden outright here, because the page declares one
+    // deliberately; the case below pins it to the single inline icon and to a
+    // `data:` href, which is the property that actually matters — a `<link>`
+    // that fetches something.
     for (const [description, pattern] of [
       ['a script element', SCRIPT_ELEMENT],
-      ['a link element', /<\s*link/i],
       ['an asset-fetching src attribute', /\bsrc\s*=/i],
       ['a CSS @import', /@import/i],
       ['a CSS url() reference', /url\s*\(/i],
@@ -1398,6 +1468,45 @@ describe('GET /activities — the submission form', () => {
       assert.ok(
         !pattern.test(markup),
         `${context}: the page must not contain ${description} (${pattern})`
+      );
+    }
+  });
+
+  it('declares exactly one link, the inline icon, so no favicon request is provoked', async () => {
+    const context = 'GET /activities icon declaration';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // A document declaring no icon makes the browser fetch `/favicon.ico` on
+    // its own, which the out-of-namespace fall-through answers 200 with 34
+    // bytes of `text/plain` that no image decoder accepts — so every page view
+    // costs a second, wasted round trip. The declaration below is what stops
+    // the request being made; it is asserted as ONE element rather than merely
+    // as present, because a second `<link>` is the shape a real asset
+    // reference would take.
+    //
+    // Case-insensitive for the same reason the loop above is: `<LINK>` fetches
+    // exactly as `<link>` does.
+    const links = markup.match(/<\s*link\b[^>]*>/gi) ?? [];
+    assert.strictEqual(
+      links.length,
+      1,
+      `${context}: exactly one <link> element, not ${links.length}`
+    );
+    assert.ok(
+      markup.includes('<link rel="icon" href="data:,">'),
+      `${context}: that one <link> is the empty inline icon`
+    );
+
+    // The load-bearing property, stated independently of the exact spelling
+    // above: nothing the page links to may be off-document. An empty `data:`
+    // URL carries its own zero-byte payload, so it is not a fetch at all,
+    // which is why it does not breach the page's self-containment.
+    for (const link of links) {
+      const href = /\bhref\s*=\s*"([^"]*)"/i.exec(link);
+      assert.ok(href !== null, `${context}: the <link> declares an href — ${link}`);
+      assert.ok(
+        href[1].startsWith('data:'),
+        `${context}: no <link> may reference anything outside a data: URL — ${link}`
       );
     }
   });
@@ -1436,10 +1545,17 @@ describe('GET /activities — the submission form', () => {
  *   page has grown to a hundred lines.
  *
  *   The STYLESHEET is a fixed list of declarations, every value in it
- *   authorized individually. A shorthand is the easy way to introduce a literal
- *   nobody approved — `border` smuggles in a width and a style keyword
- *   alongside the one colour that was specified — so the declarations are
- *   compared as a LIST rather than merely counted.
+ *   authorized individually, and compared as an ordered LIST rather than
+ *   merely counted — a count passes while the wrong property carries the right
+ *   number of characters. The list holds two kinds of entry: the values the
+ *   design specifies, and the declarations that make those values render. The
+ *   second kind is not decoration. Left out, a browser supplies its own
+ *   answer: a border colour it derives into two edges instead of painting, a
+ *   black bevel on the button, a fixed 13.3333px face on every control, a
+ *   margin that does nothing on an inline box, and a focus outline drawn over
+ *   the border it was meant to sit outside. Each was measured on the rendered
+ *   page, which is why a separate case below names the consequence of dropping
+ *   each one.
  *
  *   The ERROR WIRING must connect the reason to the field. `aria-invalid` on
  *   its own says only THAT a field is wrong; a screen-reader user who tabs
@@ -1448,7 +1564,17 @@ describe('GET /activities — the submission form', () => {
  * ========================================================================= */
 
 describe('the rendered page — inventory, stylesheet and error association', () => {
-  /** In the order the page emits them: the comparison below is order-sensitive. */
+  /**
+   * In the order the page emits them: the comparison below is order-sensitive.
+   *
+   * Two groups. The first is every value the design specifies, all of them
+   * still here at their specified values. The second is the declarations that
+   * make those values RENDER, each one marked with what it delivers — because
+   * a specified value a user-agent default overrides or derives is not a value
+   * the page actually shows, and each of these was added after a rendered
+   * measurement proved exactly that. Every one of them reuses a colour the
+   * design already names, so the palette assertion below still finds six.
+   */
   const AUTHORIZED_DECLARATIONS = Object.freeze([
     ['font-family', 'system-ui, sans-serif'],
     ['color', '#1a1a1a'],
@@ -1456,14 +1582,21 @@ describe('the rendered page — inventory, stylesheet and error association', ()
     ['max-width', '32rem'],
     ['margin', '2rem auto'],
     ['padding', '0 1rem'],
+    ['display', 'block'], // so the label's margin-bottom applies at all
     ['margin-bottom', '0.25rem'],
     ['width', '100%'],
     ['padding', '0.5rem'],
-    ['border-color', '#767676'],
+    ['border', '1px solid #767676'], // style and width, so the colour is painted
+    ['color', '#1a1a1a'], // typed text, rather than the user agent's black
     ['background-color', '#1a4f8b'],
     ['color', '#ffffff'],
     ['padding', '0.5rem 1rem'],
+    ['border', '1px solid #1a4f8b'], // replaces a 2px outset black default
+    ['box-sizing', 'border-box'], // so width:100% means the column, not more
+    ['font', 'inherit'], // the specified typeface reaches the controls
     ['border-radius', '4px'],
+    ['outline', '2px solid #1a4f8b'], // a real focus ring, not a borrowed one
+    ['outline-offset', '2px'], // held clear of the control's own border
     ['color', '#b3261e'],
     ['color', '#146c2e'],
   ]);
@@ -1488,14 +1621,20 @@ describe('the rendered page — inventory, stylesheet and error association', ()
   /**
    * Every `property: value` pair in a stylesheet, in source order.
    *
+   * Anchored to a line, and the value may not cross one. Both halves of that
+   * are load-bearing now that a selector carries a colon of its own: a pattern
+   * free to run on would read `input:focus-visible,` as a property named
+   * `input` and swallow the newline and the declaration beneath it, reporting a
+   * value nobody wrote. A selector line never ends in a semicolon and a
+   * declaration line always does, which is the distinction this draws.
+   *
    * @param {string} styleBlock The stylesheet text.
    * @returns {Array<[string, string]>} The declarations.
    */
   function declarationsOf(styleBlock) {
-    return [...styleBlock.matchAll(/([a-z-]+)\s*:\s*([^;]+);/g)].map(([, property, value]) => [
-      property,
-      value.trim(),
-    ]);
+    return [...styleBlock.matchAll(/^[ \t]*([a-z-]+)[ \t]*:[ \t]*([^;\r\n]+);[ \t]*$/gm)].map(
+      ([, property, value]) => [property, value.trim()]
+    );
   }
 
   it('places nothing between the heading and the form on the empty page', async () => {
@@ -1536,7 +1675,7 @@ describe('the rendered page — inventory, stylesheet and error association', ()
     );
   });
 
-  it('serves exactly the sixteen authorized declarations, in order', async () => {
+  it('serves exactly the authorized declarations, in order', async () => {
     const context = 'GET /activities stylesheet';
     const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
 
@@ -1560,20 +1699,91 @@ describe('the rendered page — inventory, stylesheet and error association', ()
     );
   });
 
-  it('styles the input border with the authorized colour and no shorthand literals', async () => {
-    const context = 'GET /activities input border';
+  it('leaves no control property to the user agent, so every specified value renders', async () => {
+    const context = 'GET /activities control baseline';
     const styleBlock = styleBlockOf(assertHtmlPage(await get(NAMESPACE), 200, context), context);
 
-    // The inventory authorizes one value for this border: the colour. A
-    // shorthand would add a width and a style keyword that nothing authorized.
-    assert.ok(
-      styleBlock.includes('border-color: #767676;'),
-      `${context}: the border is declared as its authorized colour`
-    );
-    for (const unauthorized of ['border:', '1px', 'solid']) {
+    // Each entry is a measured rendering defect this declaration closed. The
+    // declaration list above already forbids anything unlisted; this pins the
+    // reason each of these is present, so a tidy-up that drops one fails here
+    // with the consequence named rather than as an arithmetic mismatch.
+    const baseline = [
+      [
+        'box-sizing: border-box;',
+        'without it width:100% adds the padding and border outside the column, putting each field 20px past the 32rem measure and 4px outside every viewport under 552px',
+      ],
+      [
+        'border: 1px solid #767676;',
+        "declaring only the colour leaves the browser's inset style in force, which derives a light and a dark edge from the colour instead of painting it — the specified grey then appears at no pixel and the pale edge sits at 1.64:1",
+      ],
+      [
+        'border: 1px solid #1a4f8b;',
+        'without it the button takes a 2px outset border in pure black, painting three colours the design never named onto its primary action',
+      ],
+      [
+        'font: inherit;',
+        "form controls do not inherit a font, so both fields and the button otherwise render in the browser's own face at a fixed 13.3333px that no text-size setting moves",
+      ],
+      [
+        'color: #1a1a1a;',
+        "without it the text a student types is the browser's pure black rather than the page's own text colour",
+      ],
+      [
+        'display: block;',
+        'a vertical margin does nothing on an inline box, so the label\'s specified 0.25rem otherwise renders as no separation at all',
+      ],
+      [
+        'outline: 2px solid #1a4f8b;',
+        "the browser's own outline is drawn over the control's border footprint, leaving visible focus dependent on how pale that border happens to be",
+      ],
+      [
+        'outline-offset: 2px;',
+        'the offset is what holds the ring clear of the control\'s own border, which is what makes it a ring rather than a recolouring of the border',
+      ],
+    ];
+    for (const [declaration, consequence] of baseline) {
       assert.ok(
-        !styleBlock.includes(unauthorized),
-        `${context}: the stylesheet must not contain the unauthorized literal ${JSON.stringify(unauthorized)}`
+        styleBlock.includes(declaration),
+        `${context}: ${JSON.stringify(declaration)} is missing — ${consequence}`
+      );
+    }
+
+    // The values a user agent supplies when the sheet stays silent. Each was
+    // measured on the rendered page before these declarations existed, and
+    // none of them is in the palette, so their reappearance in the sheet
+    // itself would mean the defect had been written back in deliberately.
+    const userAgentDerived = ['border-color:', 'inset', 'outset', '#000000', 'black'];
+    for (const value of userAgentDerived) {
+      assert.ok(
+        !styleBlock.includes(value),
+        `${context}: the stylesheet must not contain ${JSON.stringify(value)} — it is a user-agent-derived value outside the palette`
+      );
+    }
+
+    // The overflow is fixed by the box model, not by a breakpoint: the design
+    // has no media query and needs none, since border-box sizing holds at
+    // every width.
+    assert.ok(
+      !styleBlock.includes('@media'),
+      `${context}: no breakpoint — border-box sizing holds at every viewport width, so the design stays free of media queries`
+    );
+  });
+
+  it('separates each label from its field with the specified margin, not a line break', async () => {
+    const context = 'GET /activities label rhythm';
+    const markup = assertHtmlPage(await get(NAMESPACE), 200, context);
+
+    // The margin only applies because the label is a block, and once it does,
+    // a <br> would add a second gap on top of the specified one. So the
+    // absence of the element is part of the fix rather than incidental to it.
+    assert.ok(
+      !markup.includes('<br'),
+      `${context}: the label's own margin provides the separation, so no <br> stands in for it`
+    );
+    for (const inputId of ['student-id', 'activity']) {
+      assert.ok(
+        new RegExp(`</label>\\s*<input id="${inputId}"`).test(markup),
+        `${context}: the <input id="${inputId}"> follows its label directly, with only whitespace between them`
       );
     }
   });
@@ -1641,6 +1851,103 @@ describe('the rendered page — inventory, stylesheet and error association', ()
         );
       }
     }
+  });
+});
+
+
+/* ========================================================================= *
+ * The document title — the first thing each outcome announces
+ *
+ * Every outcome this feature produces is a FULL PAGE NAVIGATION: the page
+ * ships no client-side script, so nothing is ever updated in place. That makes
+ * the title the first thing a screen reader announces after a submission, and
+ * the only label the tab, the window and the history entry carry.
+ *
+ * A title that named the feature and nothing else would be identical on all
+ * eight screens — Lighthouse's `document-title` rule would still pass on every
+ * one of them, because it only asks whether the current document HAS a title
+ * and never compares two. So the property is asserted across screens here, in
+ * one case, which is the only place it can be seen at all.
+ * ========================================================================= */
+
+describe('the document title across the outcome screens', () => {
+  /** Restated rather than imported, like every other expectation in this file. */
+  const TITLE_BASE = 'Extracurricular activities';
+
+  /** Space, em dash, space — written as an escape so this file stays ASCII. */
+  const TITLE_SEPARATOR = ' \u2014 ';
+
+  /**
+   * The served document title.
+   *
+   * @param {string} markup A served page.
+   * @param {string} context The case name.
+   * @returns {string} The text between the `<title>` pair.
+   */
+  function titleOf(markup, context) {
+    const found = /<title>([\s\S]*?)<\/title>/.exec(markup);
+    assert.ok(found !== null, `${context}: the page declares a <title>`);
+    return found[1];
+  }
+
+  it('names the outcome on the form, the 201, the idempotent 200 and a 400 as four distinct titles', async () => {
+    const context = 'document titles across the outcome screens';
+    const label = 'Kabaddi Club';
+
+    const form = assertHtmlPage(await get(NAMESPACE), 200, context);
+    const created = assertHtmlPage(await postForm('S002', label), 201, context);
+    const repeat = assertHtmlPage(await postForm('S002', label), 200, context);
+    const failed = assertHtmlFailure(
+      await postForm('S0012', label),
+      400,
+      'student_id_malformed',
+      context
+    );
+
+    // Compared as one object so a single failure reports every screen's title
+    // at once: which screens drifted, and to what, is the whole diagnosis.
+    assert.deepStrictEqual(
+      {
+        form: titleOf(form, context),
+        created: titleOf(created, context),
+        repeat: titleOf(repeat, context),
+        failed: titleOf(failed, context),
+      },
+      {
+        form: TITLE_BASE,
+        created: `Activity recorded${TITLE_SEPARATOR}${TITLE_BASE}`,
+        repeat: `Activity already recorded${TITLE_SEPARATOR}${TITLE_BASE}`,
+        failed: `Problem with your submission${TITLE_SEPARATOR}${TITLE_BASE}`,
+      },
+      `${context}: each screen's title names its own outcome, ahead of the feature's name`
+    );
+  });
+
+  it('distinguishes the outcomes from each other, not merely from the empty form', async () => {
+    const context = 'document titles are pairwise distinct';
+    const label = 'Sepak Takraw Club';
+
+    const titles = [
+      titleOf(assertHtmlPage(await get(NAMESPACE), 200, context), context),
+      titleOf(assertHtmlPage(await postForm('S002', label), 201, context), context),
+      titleOf(assertHtmlPage(await postForm('S002', label), 200, context), context),
+      titleOf(
+        assertHtmlFailure(await postForm('S0012', label), 400, 'student_id_malformed', context),
+        context
+      ),
+    ];
+
+    // Stated independently of the wording above, because the wording is the
+    // part most likely to be revised and this is the part that must survive
+    // the revision: four screens that did four different things must not
+    // announce themselves identically. A single shared prefix — "Activity" for
+    // both the 201 and the 200, say — would satisfy the exact-string case
+    // above only by being written into it, and would fail here.
+    assert.strictEqual(
+      new Set(titles).size,
+      titles.length,
+      `${context}: ${titles.length} screens, ${new Set(titles).size} distinct titles — ${JSON.stringify(titles)}`
+    );
   });
 });
 
@@ -1768,9 +2075,13 @@ describe('POST /activities — accepting a submission', () => {
     const first = await postForm('S002', label);
     const firstMarkup = assertHtmlPage(first, 201, `${context} (first)`);
     // Captured so the repeat can be told apart from it rather than merely
-    // shown to mention the label, which both pages do.
+    // shown to mention the label, which both pages do. Stated through
+    // `isolatedInMessage` because each value the page did not write itself sits
+    // inside a bidi isolate — the whole sentence is still asserted, markup
+    // included.
+    const confirmation = `Recorded ${isolatedInMessage(label)} for ${isolatedInMessage('S002')}.`;
     assert.ok(
-      firstMarkup.includes(`Recorded ${label} for S002.`),
+      firstMarkup.includes(confirmation),
       `${context}: the 201 confirms that the activity WAS recorded`
     );
 
@@ -1792,11 +2103,13 @@ describe('POST /activities — accepting a submission', () => {
     // page that happened to mention it — none of which tells the submitter
     // what became of their submission.
     assert.ok(
-      markup.includes(`${label} was already submitted for S002, so nothing was added.`),
+      markup.includes(
+        `${isolatedInMessage(label)} was already submitted for ${isolatedInMessage('S002')}, so nothing was added.`
+      ),
       `${context}: the page states the activity was already submitted and nothing was added`
     );
     assert.ok(
-      !markup.includes(`Recorded ${label} for S002.`),
+      !markup.includes(confirmation),
       `${context}: and it is NOT the 201 confirmation wording`
     );
   });
@@ -2302,21 +2615,109 @@ describe('POST /activities — activity validation', () => {
   });
 
   for (const [description, value] of [
-    ['a tab', 'Chess\tClub'],
     ['a newline', 'Chess\nClub'],
+    ['a carriage return', 'Chess\rClub'],
+    ['a vertical tab', 'Chess\u000bClub'],
     ['a NUL', 'Chess\u0000Club'],
     ['a DEL', 'Chess\u007fClub'],
+    ['a Unicode line separator', 'Chess\u2028Club'],
   ]) {
     it(`answers 400 activity_invalid for an activity containing ${description}`, async () => {
       const context = `POST /activities with an activity containing ${description}`;
       const response = await postJson({ studentId: KNOWN_STUDENT_ID, activity: value });
 
-      // A control character is NOT laundered into a space by normalization:
-      // only space separators are trimmed and collapsed, so the character
-      // survives to be refused.
+      // These are NOT laundered into a space by normalization: only
+      // horizontal whitespace is trimmed and collapsed, so each of them
+      // survives to be refused. A tab is the one exclusion, and the two cases
+      // below pin what it does instead.
       assertErrorEnvelope(response, 400, 'activity_invalid', context);
     });
   }
+
+  it('accepts a tab inside an activity and stores the collapsed label', async () => {
+    // The tab is horizontal whitespace, so it is collapsed by normalization
+    // before the control-character rule runs — the step order the
+    // specification states. This is the request a spreadsheet copy-paste
+    // produces, and the label it stores must be the normalized form.
+    const context = 'POST /activities with a tab inside the activity';
+    const response = await postJson({ studentId: 'S005', activity: 'Rowing\tClub' });
+
+    assert.strictEqual(response.status, 201, `${context}: a tab is collapsed, not refused`);
+    const record = parseJsonResponse(response, context).record;
+    assertSubmissionRecord(record, 'S005', 'Rowing Club', context);
+    assert.strictEqual(
+      record.activity,
+      'Rowing Club',
+      `${context}: the stored label carries a single space where the tab was`
+    );
+
+    // And it is the SAME activity as the plain-space form, which is the whole
+    // point of collapsing it rather than refusing it: a repeat is recognized
+    // by the composite key and adds no second record.
+    const repeat = await postJson({ studentId: 'S005', activity: 'Rowing Club' });
+    assert.strictEqual(
+      repeat.status,
+      200,
+      `${context}: the plain-space form is the same composite key`
+    );
+    assert.strictEqual(
+      parseJsonResponse(repeat, context).created,
+      false,
+      `${context}: so nothing is created a second time`
+    );
+    const listed = await readActivities('S005', context);
+    assert.strictEqual(
+      listed.filter((entry) => entry.activity === 'Rowing Club').length,
+      1,
+      `${context}: exactly one record for the label, whichever whitespace was typed`
+    );
+  });
+
+  it('accepts a tab through the form path and re-displays the collapsed label', async () => {
+    // The intake form is where a pasted tab actually arrives: a browser posts
+    // `application/x-www-form-urlencoded`, in which a tab is `%09`. The form
+    // path must reach the same verdict as the JSON path, and the confirmation
+    // page must show the normalized label rather than the raw submission.
+    const context = 'POST /activities form-encoded with a tab inside the activity';
+    const response = await postFormBody('studentId=S006&activity=Sailing%09Club');
+
+    const markup = assertHtmlPage(response, 201, context);
+    assert.ok(
+      markup.includes('Sailing Club'),
+      `${context}: the confirmation page names the collapsed label`
+    );
+    assert.ok(
+      !markup.includes('Sailing\tClub'),
+      `${context}: and never the raw tab form`
+    );
+    const listed = await readActivities('S006', context);
+    assert.ok(
+      listed.some((entry) => entry.activity === 'Sailing Club'),
+      `${context}: the collapsed label is what was persisted`
+    );
+  });
+
+  it('trims a leading and a trailing tab, as it does a leading and a trailing space', async () => {
+    const context = 'POST /activities with a tab at each end of the activity';
+    const response = await postJson({ studentId: 'S009', activity: '\tFencing Club\t' });
+
+    assert.strictEqual(response.status, 201, `${context}: accepted`);
+    assert.strictEqual(
+      parseJsonResponse(response, context).record.activity,
+      'Fencing Club',
+      `${context}: both tabs are trimmed away`
+    );
+  });
+
+  it('answers 400 activity_invalid for an activity of tabs only, which normalizes to empty', async () => {
+    // The consequence of collapsing a tab: a label of nothing but tabs has no
+    // content once it is trimmed, so it is the same mistake as sending an
+    // empty string rather than a control-character refusal.
+    const context = 'POST /activities with an activity of tabs only';
+    const response = await postJson({ studentId: KNOWN_STUDENT_ID, activity: '\t\t' });
+
+    assertErrorEnvelope(response, 400, 'activity_invalid', context);
+  });
 
   it('accepts an activity of exactly 60 characters', async () => {
     const context = 'POST /activities with a 60-character activity';
@@ -3184,15 +3585,60 @@ describe('POST /activities — a request stream that fails part way', () => {
       console.error = originalError;
     });
 
+    // The server-side request object is captured so the reset can be timed
+    // against what the body reader has actually observed, instead of against a
+    // guessed interval. Both observations below are PASSIVE — a listener count
+    // and the socket's own byte counter — because attaching a listener of this
+    // suite's own to the captured request would change the very accumulation
+    // the case exists to pin.
+    let captured = null;
+    const capture = (incoming) => {
+      if (captured === null) {
+        captured = incoming;
+      }
+    };
+    server.prependListener('request', capture);
+
     const link = await openDeclaredSubmission(4096);
-    t.after(() => link.socket.destroy());
+    t.after(() => {
+      server.removeListener('request', capture);
+      link.socket.destroy();
+    });
 
     // A partial body well under the limit, then a reset: the read fails while
     // it is still accumulating. That is the branch this case pins — the request
     // is brought to a definite end and the fault is recorded, rather than the
     // read being left pending with nothing written down.
+    //
+    // The reset has to land INSIDE that read, and the two gates below are what
+    // establish it rather than assume it. First the body reader must be
+    // attached: it rejects with its stream-failure signal only from the
+    // `'error'` listener it installs alongside `'data'`, and only while its
+    // read is still pending. A reset delivered before that attach fails
+    // nothing, and the case would then burn its whole condition deadline
+    // waiting for a record the product was never asked to write — a false
+    // failure about correct behaviour, on a slower or more contended host.
+    // That is why this is a gate on an observable precondition, not a sleep.
+    await waitFor(
+      () => captured !== null && captured.listenerCount('data') > 0,
+      'the body reader to attach to the server-side request stream'
+    );
+
+    // Read AFTER that gate and BEFORE a single body byte is sent, so it is
+    // exactly the request head: any byte counted above it is body.
+    const headBytesRead = captured.socket.bytesRead;
+
     link.send('{"studentId"');
-    await delay(50);
+
+    // And the partial body must have REACHED the reader. The stream is already
+    // flowing by this point — the `'data'` listener the gate above waited for
+    // is what resumed it — so a body byte counted here has been handed to the
+    // accumulator, which is the state the reset must interrupt.
+    await waitFor(
+      () => captured.socket.bytesRead > headBytesRead,
+      'the partial body to reach the accumulating server-side request stream'
+    );
+
     link.socket.resetAndDestroy();
 
     await waitFor(
@@ -3984,6 +4430,82 @@ describe('HTML escaping of submitted values', () => {
     assert.ok(!markup.includes('<b>'), `${context}: no raw element survives from the rejected value`);
   });
 
+  it('re-displays control characters in a rejected label as numeric references', async () => {
+    const context = 'POST /activities form-encoded with control characters in the label';
+    // NUL, LF, CR, VT and DEL. Every one is refused by the label rules, which
+    // is precisely what puts it back on the page: the error state re-displays
+    // the submitted value so a correction does not mean retyping.
+    const label = 'Chess\u0000\u000a\u000d\u000b\u007fClub';
+
+    const markup = assertHtmlFailure(
+      await postForm(KNOWN_STUDENT_ID, label),
+      400,
+      'activity_invalid',
+      context
+    );
+
+    // Written out as the exact attribute rather than character by character,
+    // because the ORDER and the count are the fidelity claim: five characters
+    // in, five references out, in the positions they were submitted in.
+    assert.ok(
+      markup.includes('value="Chess&#0;&#10;&#13;&#11;&#127;Club"'),
+      `${context}: each control character is re-displayed as its decimal numeric reference`
+    );
+
+    // And none of them survives raw ANYWHERE in the response, which is the
+    // half that a correct attribute alone does not establish. A raw U+0000
+    // makes the parser substitute U+FFFD — a parse error the specification
+    // mandates — and a raw CR or LF is newline-normalised before the attribute
+    // value is even assembled, after which a single-line input strips what is
+    // left, so the field silently differs from what was sent.
+    //
+    // U+000A is excluded from the sweep and only from it: the page template is
+    // written across lines, so the document legitimately carries LF outside
+    // any value. CR is NOT excluded — the template carries none.
+    const surviving = [...markup]
+      .filter((character) => /[\u0000-\u0009\u000b-\u001f\u007f]/.test(character))
+      .map(
+        (character) =>
+          `U+${character.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+      );
+    assert.deepStrictEqual(
+      surviving,
+      [],
+      `${context}: no raw control character may survive anywhere in the response — found ${surviving.join(', ')}`
+    );
+  });
+
+  it('leaves a C1 control character in a rejected label RAW, because a reference would remap it', async () => {
+    const context = 'POST /activities form-encoded with a C1 control character in the label';
+    // U+0085 NEXT LINE, refused like every other control character and so
+    // re-displayed for correction — and it must be re-displayed RAW.
+    //
+    // THE TRAP, WRITTEN DOWN SO NOBODY "COMPLETES" THE ESCAPE SET: HTML's
+    // numeric-character-reference rules REMAP `&#128;` through `&#159;` onto
+    // the Windows-1252 repertoire. `&#133;` does not parse back as U+0085, and
+    // `&#128;` parses as U+20AC EURO SIGN rather than U+0080. Escaping the C1
+    // range for symmetry with the C0 range would therefore CORRUPT a value
+    // that round-trips intact today. Raw is the only faithful form, and this
+    // case fails if the range is ever added.
+    const label = 'Chess\u0085Club';
+
+    const markup = assertHtmlFailure(
+      await postForm(KNOWN_STUDENT_ID, label),
+      400,
+      'activity_invalid',
+      context
+    );
+
+    assert.ok(
+      markup.includes(`value="${label}"`),
+      `${context}: the C1 character is re-displayed exactly as submitted`
+    );
+    assert.ok(
+      !markup.includes('&#133;'),
+      `${context}: it must NOT be emitted as a numeric reference, which would parse back as a different character`
+    );
+  });
+
   it('round-trips a quoted label through the JSON response without corruption', async () => {
     const context = 'POST /activities with a quoted label in JSON mode';
     const label = 'Quiz "Bowl" Club';
@@ -4026,6 +4548,105 @@ describe('HTML escaping of submitted values', () => {
     const stored = findRecord(records, label);
     assert.ok(stored !== undefined, `${context}: the record is readable back`);
     assert.strictEqual(stored.activity, label, `${context}: JSON carries the raw stored label`);
+  });
+});
+
+
+/* ========================================================================= *
+ * Bidi isolation of the values in an outcome sentence
+ *
+ * Escaping is not the whole of safely interpolating a value. A submitted label
+ * may carry U+202E RIGHT-TO-LEFT OVERRIDE, which is Unicode category Cf — not
+ * a control character, not a line separator — so the normalization rules
+ * legitimately ACCEPT it and the store legitimately keeps it. Unterminated, it
+ * escapes the label and reverses the remainder of the service's own sentence,
+ * the Student ID included: `Recorded Chess <U+202E> buLC for S003.` renders as
+ * `Recorded Chess .300S rof CLub`, so the one channel that says what happened
+ * to which student becomes unreadable.
+ *
+ * The fix is rendering, not validation, and the case below asserts it as such:
+ * the value still arrives whole and the sentence still reads as itself.
+ * ========================================================================= */
+
+describe('bidi isolation of an accepted direction override', () => {
+  /**
+   * The message element's inner markup.
+   *
+   * @param {string} markup A served page.
+   * @param {string} context The case name.
+   * @returns {string} What sits between the message element's tags.
+   */
+  function messageMarkupOf(markup, context) {
+    const found = /<p id="form-message"[^>]*>([\s\S]*?)<\/p>/.exec(markup);
+    assert.ok(found !== null, `${context}: the page carries a message element`);
+    return found[1];
+  }
+
+  it('confines a RIGHT-TO-LEFT OVERRIDE to the value, leaving the sentence around it intact', async () => {
+    const context = 'POST /activities form-encoded with U+202E in the label';
+    const label = 'Chess \u202e buLC';
+
+    // Accepted — 201 — and correctly so. A case that expected a refusal here
+    // would be asserting a vocabulary the rules deliberately do not impose.
+    const markup = assertHtmlPage(await postForm('S003', label), 201, context);
+    const message = messageMarkupOf(markup, context);
+
+    // The whole sentence, stated through the isolate the page adds, so the
+    // words between the two values are still part of the expectation.
+    assert.strictEqual(
+      message,
+      `Recorded ${isolatedInMessage(label)} for ${isolatedInMessage('S003')}.`,
+      `${context}: both values are isolated and the sentence is otherwise unchanged`
+    );
+
+    // Each value in an isolate of its own, rather than one isolate spanning
+    // them and the words in between — which would leave the override free to
+    // reach the Student ID it precedes.
+    const isolates = [...message.matchAll(/<bdi>([\s\S]*?)<\/bdi>/g)].map(([, inner]) => inner);
+    assert.deepStrictEqual(
+      isolates,
+      [escapeHtml(label), 'S003'],
+      `${context}: the label and the Student ID each sit in their own isolate`
+    );
+
+    // The override is inside one, and nowhere else: what remains after the
+    // isolates are removed is the text this service wrote itself, and it must
+    // carry no direction control at all.
+    const outsideIsolates = message.replace(/<bdi>[\s\S]*?<\/bdi>/g, '');
+    assert.ok(
+      !outsideIsolates.includes('\u202e'),
+      `${context}: the override does not appear in the sentence outside the isolate`
+    );
+
+    // And the isolate adds no VISIBLE characters, which is what keeps the
+    // outcome conveyed as text: the description an `aria-describedby` reader
+    // announces, and the sentence a sighted reader sees, are both still the
+    // plain sentence.
+    assert.strictEqual(
+      message.replace(/<\/?bdi>/g, ''),
+      `Recorded ${label} for S003.`,
+      `${context}: <bdi> contributes no characters, so the message's text content is unchanged`
+    );
+  });
+
+  it('stores and reads back the overridden label unchanged, because rendering was the only gap', async () => {
+    const context = 'GET /activities/S004 after submitting U+202E';
+    const label = 'Rowing \u202e buLC';
+
+    const created = await postJson({ studentId: 'S004', activity: label });
+    assert.strictEqual(created.status, 201, `${context}: the submission is accepted`);
+
+    // The isolate belongs to the HTML rendering and to nothing else. A JSON
+    // consumer must receive the label exactly as submitted — a `<bdi>` or an
+    // isolate character in the stored value would be this feature editing data
+    // it was only asked to display.
+    const stored = findRecord(await readActivities('S004', context), label);
+    assert.ok(stored !== undefined, `${context}: the record is readable back`);
+    assert.strictEqual(
+      stored.activity,
+      label,
+      `${context}: the stored label carries the override and no isolation markup`
+    );
   });
 });
 
@@ -4245,6 +4866,201 @@ describe('500 store_write_failed — the write cannot complete', () => {
       KNOWN_STUDENT_ID,
       SEEDED_LABELS[KNOWN_STUDENT_ID],
       context
+    );
+    await assertStillServing(context, { port: isolated.port });
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * The record ceiling, as a client sees it
+ *
+ * Restated here rather than imported, for the reason every other limit in this
+ * file is: a case that read the ceiling out of the module under test would
+ * agree with whatever that module said.
+ * ------------------------------------------------------------------------- */
+const MAX_ACTIVITY_RECORDS = 5000;
+
+/**
+ * A valid document holding exactly the record ceiling, minified so that many
+ * records occupy few bytes.
+ *
+ * Minified on purpose: the case is about the RECORD ceiling, so the fixture has
+ * to stay comfortably inside the byte ceiling, or a refusal could be the other
+ * limit wearing this one's clothes. Every record satisfies the loader — a
+ * Student ID from the key set, an already-normalized label, distinct composite
+ * keys, and no `submittedAt` on a `workbook` record.
+ *
+ * @returns {string} The document body, ready to write.
+ */
+function documentAtRecordCeiling() {
+  const keySet = Object.keys(SEEDED_LABELS);
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    activities: Array.from({ length: MAX_ACTIVITY_RECORDS }, (unused, index) => ({
+      studentId: keySet[index % keySet.length],
+      activity: `C ${index}`,
+      source: 'workbook',
+    })),
+  })}\n`;
+}
+
+describe('500 store_at_capacity — the store cannot grow', () => {
+  it('refuses a new activity at the record ceiling, with a code of its own, and keeps answering everything else', async (t) => {
+    /* WHY THIS CODE IS NOT `store_write_failed`. Both refuse a submission, but
+     * the remedies differ: retry clears a write failure, and only reclaiming
+     * room clears a full store. Reported as one code they are indistinguishable
+     * to the submitter and to whoever reads the log, which is what this case
+     * pins down — and the case above, driving the SAME route to
+     * `store_write_failed` through a real disk fault, is the other half of the
+     * pair. */
+    const context = 'store_at_capacity';
+    const directory = await makeCaseDirectory('store-at-capacity');
+    const storePath = path.join(directory, 'activities.json');
+    const full = documentAtRecordCeiling();
+    await fsp.writeFile(storePath, full, { encoding: 'utf8' });
+
+    const isolated = await startIsolatedServer(storePath);
+    t.after(() => isolated.stop());
+
+    const refused = await postJson(
+      { studentId: KNOWN_STUDENT_ID, activity: 'Brand New Club' },
+      { port: isolated.port }
+    );
+    assertErrorEnvelope(refused, 500, 'store_at_capacity', context);
+
+    const formRefused = await postForm(KNOWN_STUDENT_ID, 'Brand New Club', {
+      port: isolated.port,
+    });
+    assertErrorEnvelope(formRefused, 500, 'store_at_capacity', `${context} (form mode)`);
+    assert.ok(
+      !formRefused.body.includes('<!DOCTYPE'),
+      `${context}: a form-mode 500 is the JSON envelope, not a page`
+    );
+
+    assert.strictEqual(
+      await fsp.readFile(storePath, 'utf8'),
+      full,
+      `${context}: the refusal comes before anything is staged, so the document is byte-identical`
+    );
+
+    /* AVAILABILITY AT THE CEILING, which is the part of this behaviour that is
+     * right and must stay right. Nothing that fails to grow the document is
+     * refused: a repeat appends nothing, a read never appends at all, and the
+     * pre-existing response outside the namespace is untouched. */
+    const repeat = await postJson(
+      { studentId: KNOWN_STUDENT_ID, activity: 'c 0' },
+      { port: isolated.port }
+    );
+    assert.strictEqual(
+      repeat.status,
+      200,
+      `${context}: an idempotent repeat appends nothing, so capacity cannot refuse it`
+    );
+    assert.strictEqual(
+      parseJsonResponse(repeat, context).created,
+      false,
+      `${context}: and it answers with the record that was already there`
+    );
+
+    const records = await readActivities(KNOWN_STUDENT_ID, `${context} (read at the ceiling)`, {
+      port: isolated.port,
+    });
+    assert.strictEqual(
+      records.length,
+      MAX_ACTIVITY_RECORDS / Object.keys(SEEDED_LABELS).length,
+      `${context}: a full store still answers every read it could answer before`
+    );
+
+    const form = await get(NAMESPACE, { port: isolated.port });
+    assert.strictEqual(form.status, 200, `${context}: the form is still served at the ceiling`);
+    await assertStillServing(context, { port: isolated.port });
+  });
+});
+
+describe('201 under concurrent read traffic — the publish is not refused by a reader', () => {
+  it('creates every concurrent submission while GET loops read the same student', async (t) => {
+    // WHY THIS IS AN HTTP CASE AND NOT ONLY A STORE ONE. The store publishes a
+    // write by renaming its staging file over the store, and this platform
+    // refuses that rename while any descriptor is open on the destination —
+    // which is precisely what `GET /activities/{id}` holds while it reads. So
+    // ordinary concurrent traffic, with no fault of any kind present, used to
+    // convert valid submissions into `500 store_write_failed`: measured here,
+    // against this service, one continuous reader refused 37% of 200
+    // submissions and four refused 98.5%, while every read returned 200. The
+    // status codes are the contract, so the contract is what this asserts:
+    // every submission 201, nothing lost, and no staging residue.
+    const context = '20 concurrent submissions against three GET loops';
+    const directory = await makeCaseDirectory('concurrent-read-write');
+    const storePath = path.join(directory, 'activities.json');
+    const isolated = await startIsolatedServer(storePath);
+    t.after(() => isolated.stop());
+
+    // The loops must read THE STUDENT, not the service root: it is
+    // `GET /activities/{id}` that opens the store and holds the descriptor the
+    // publishing rename collides with, and a loop pointed anywhere else would
+    // make this case pass while proving nothing. So each response is checked
+    // for a coherent record list, not merely for a 200.
+    let stop = false;
+    let reads = 0;
+    const readProblems = [];
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 1));
+    const loops = Array.from({ length: 3 }, () =>
+      (async () => {
+        while (!stop) {
+          const response = await get(`${NAMESPACE}/${KNOWN_STUDENT_ID}`, { port: isolated.port });
+          if (response.status !== 200 || !response.body.includes('"activities"')) {
+            readProblems.push(`${response.status} ${response.body.slice(0, 120)}`);
+          } else {
+            reads += 1;
+          }
+          // One tick between reads. The shared client agent caps concurrent
+          // sockets, so an unpaced loop starves the submissions of a socket and
+          // measures the client rather than the service.
+          await pause();
+        }
+      })()
+    );
+
+    const labels = Array.from({ length: 20 }, (unused, index) => `Concurrent Club ${index}`);
+    const responses = await Promise.all(
+      labels.map((activity) =>
+        postJson({ studentId: KNOWN_STUDENT_ID, activity }, { port: isolated.port })
+      )
+    );
+    stop = true;
+    await Promise.all(loops);
+
+    // Named, not counted: a failure has to say which status arrived and what
+    // the service said about it, or the report is "some number was wrong".
+    assert.deepStrictEqual(
+      responses
+        .filter((response) => response.status !== 201)
+        .map((response) => `${response.status} ${response.body}`),
+      [],
+      `${context}: every submission must be created — a 500 here is a student's record lost, not a request slowed`
+    );
+    assert.deepStrictEqual(
+      readProblems,
+      [],
+      `${context}: and every read must answer 200 with a record list throughout`
+    );
+    assert.ok(reads > 0, `${context}: the read loops must have run at all`);
+
+    const records = await readActivities(KNOWN_STUDENT_ID, context, { port: isolated.port });
+    assert.strictEqual(
+      records.length,
+      labels.length + 1,
+      `${context}: all forty submissions plus the seeded record must be readable back`
+    );
+    for (const activity of labels) {
+      assert.ok(
+        findRecord(records, activity) !== undefined,
+        `${context}: ${activity} must be one of them`
+      );
+    }
+    await assert.rejects(
+      () => fsp.access(`${storePath}.tmp`),
+      `${context}: and no staging file may be left at rest afterwards`
     );
     await assertStillServing(context, { port: isolated.port });
   });

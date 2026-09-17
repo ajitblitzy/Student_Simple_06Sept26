@@ -272,7 +272,7 @@ const FAILURES = Object.freeze({
   ACTIVITY_INVALID: failure(
     400,
     'activity_invalid',
-    'An activity must be a label of 1 to 60 characters and must not contain control characters.'
+    'An activity must be a label of 1 to 60 characters and must not contain a line break or any other control character; a tab counts as a space.'
   ),
   STUDENT_NOT_FOUND: failure(
     404,
@@ -310,6 +310,24 @@ const FAILURES = Object.freeze({
     'store_write_failed',
     'The activity could not be saved.'
   ),
+  /* A FULL STORE IS NOT A FAILED WRITE, and telling a submitter otherwise
+   * costs them the only useful thing the response carries. Both refuse the
+   * submission, but a write failure is an environmental fault — an unwritable
+   * directory, a full disk, a refused rename — where retrying is the sensible
+   * next move, while this one says the store has reached the size this build
+   * can read back, where retrying is pointless and somebody has to reclaim
+   * room in it. The store has always drawn that line internally; until now the
+   * response collapsed the two into one code and one sentence, so a client
+   * could not tell a store that was full from a disk that was broken.
+   *
+   * The status stays `500`: the submission genuinely could not be honoured and
+   * nothing the submitter sent was wrong, so no 4xx describes it, and the
+   * documented status set is left as it was. */
+  STORE_AT_CAPACITY: failure(
+    500,
+    'store_at_capacity',
+    'The activity store has reached the capacity this service accepts, so the activity could not be saved.'
+  ),
 });
 
 /**
@@ -333,6 +351,7 @@ const STORE_FAILURES = Object.freeze({
   E_LABEL_INVALID: FAILURES.ACTIVITY_INVALID,
   E_REFERENCE_DATA: FAILURES.REFERENCE_DATA_UNAVAILABLE,
   E_STORE_UNREADABLE: FAILURES.STORE_UNREADABLE,
+  E_STORE_AT_CAPACITY: FAILURES.STORE_AT_CAPACITY,
   E_STORE_WRITE_FAILED: FAILURES.STORE_WRITE_FAILED,
 });
 
@@ -403,7 +422,21 @@ const HTML_ENTITIES = Object.freeze({
   "'": '&#39;',
 });
 
-const HTML_SPECIAL_CHARACTERS = /[&<>"']/g;
+/**
+ * Every character `escapeHtml` rewrites: the five markup-significant ones
+ * above, and the C0 control characters together with DEL.
+ *
+ * THE C1 RANGE `\u0080-\u009f` IS DELIBERATELY ABSENT, and "completing" the
+ * set would CORRUPT values that survive intact today. HTML's
+ * numeric-character-reference rules REMAP the references `&#128;` through
+ * `&#159;` onto the Windows-1252 repertoire, so `&#128;` parses back as
+ * U+20AC EURO SIGN and not as U+0080. Emitting a C1 character raw is therefore
+ * the only form in which an attribute can carry it back unchanged, and a
+ * rejected submission is re-displayed precisely so it can be corrected — so
+ * raw is what it stays. The same remap is why the range cannot simply be
+ * escaped "for symmetry" with the C0 range below, which has no such table.
+ */
+const HTML_ESCAPED_CHARACTERS = /[&<>"'\u0000-\u001f\u007f]/g;
 
 /**
  * Escapes a value for interpolation into markup.
@@ -414,10 +447,28 @@ const HTML_SPECIAL_CHARACTERS = /[&<>"']/g;
  * straight into the result page would permit script injection THROUGH A VALUE
  * THE FEATURE ITSELF ACCEPTED. The attack needs no malformed request at all.
  *
- * All five characters are converted, which covers HTML text context and
- * double-quoted attribute context with one function. Every attribute in the
- * templates below is double-quoted, so there is no third context to get wrong,
- * and an escaped `"` cannot terminate an attribute early.
+ * All five are converted to their entity forms, which covers HTML text context
+ * and double-quoted attribute context with one function. Every attribute in
+ * the templates below is double-quoted, so there is no third context to get
+ * wrong, and an escaped `"` cannot terminate an attribute early.
+ *
+ * The C0 control characters and DEL are converted as well, as DECIMAL NUMERIC
+ * REFERENCES, and that part is a fidelity requirement rather than a security
+ * one. A refused submission is re-displayed so a correction does not mean
+ * retyping, which puts its raw characters inside a `value="…"` attribute: a
+ * raw U+0000 there makes the parser substitute U+FFFD — an
+ * `unexpected-null-character` parse error the specification mandates — and a
+ * raw CR, LF or CRLF is newline-normalised before the attribute value is even
+ * assembled, after which a single-line input strips what survives. Either way
+ * the correction field ends up holding something other than what was
+ * submitted. A numeric reference is opaque to both of those passes, so the
+ * attribute carries the submitted characters and the response body carries no
+ * raw control byte at all.
+ *
+ * U+0000 is the one character this still cannot round-trip, and no escaping
+ * can: `&#0;` is DEFINED to yield U+FFFD, so HTML has no representation for a
+ * NUL in any form. What the reference buys there is the well-formed response
+ * body, not fidelity.
  *
  * A non-string is answered with the empty string rather than coerced: the only
  * values reaching markup are submitted strings and this module's own fixed
@@ -431,7 +482,10 @@ function escapeHtml(value) {
   if (typeof value !== 'string') {
     return '';
   }
-  return value.replace(HTML_SPECIAL_CHARACTERS, (character) => HTML_ENTITIES[character]);
+  return value.replace(
+    HTML_ESCAPED_CHARACTERS,
+    (character) => HTML_ENTITIES[character] ?? `&#${character.charCodeAt(0)};`
+  );
 }
 
 /* ------------------------------------------------------------------------- *
@@ -459,16 +513,51 @@ function escapeHtml(value) {
  * single site means a later migration to design tokens has exactly one place
  * to change.
  *
- * Only the values the design specifies may appear here, which is what decides
- * two details that would otherwise look arbitrary. Vertical rhythm between a
- * label and its input comes from a `<br>` in the markup rather than from a
- * `display` declaration on the label, and the input border is written as
- * `border-color` rather than as the `border` shorthand: the shorthand would
- * smuggle in a width literal and a style keyword that were never specified,
- * and an unspecified literal is a deviation from the design whether or not it
- * looks reasonable. The border still renders — a browser's own default
- * supplies the width and the style for a text input, and this declaration
- * recolours them.
+ * Every value the design specifies is here, unchanged: the typeface, the six
+ * colours, the 32rem column with its 1rem gutters, the 2rem auto centring, the
+ * label's 0.25rem, the input's full width and 0.5rem padding, the button's
+ * 0.5rem 1rem, and the 4px radius on both controls.
+ *
+ * Seven further declarations are here for one reason, which is worth stating
+ * because the block was once written without them: a specified value that a
+ * user-agent default overrides or derives is not a value the design delivers.
+ * Each of these exists so a specified value actually reaches the screen, and
+ * every one of them draws on the palette above — no colour enters here that
+ * the design did not already name.
+ *
+ *   `box-sizing: border-box` on the controls makes `width: 100%` mean the
+ *   column. Under the default content-box it means the column PLUS the padding
+ *   and the border, which put each field 20px past the 32rem measure and 4px
+ *   outside any viewport under 552px, taking the right gutter with it.
+ *
+ *   `border: 1px solid #767676` on the input paints that colour. Declaring the
+ *   colour alone leaves the browser's `inset` style in force, and `inset`
+ *   derives a light and a dark edge FROM the colour instead of painting it —
+ *   so the specified grey appeared at no pixel, and the pale derived edge sat
+ *   at 1.64:1 against the page, under the 3:1 a boundary needs to be seen.
+ *
+ *   `border: 1px solid #1a4f8b` on the button replaces a browser default of
+ *   `2px outset` in pure black, which painted three colours the design never
+ *   named onto its primary action. Flat, in the button's own fill colour.
+ *
+ *   `font: inherit` on the controls carries the specified typeface into them.
+ *   Form controls do not inherit a font, so both fields and the button rendered
+ *   in the browser's own face at its own fixed 13.3333px — smaller than the
+ *   label above them, and pinned there when a reader doubles the text size.
+ *
+ *   `color: #1a1a1a` on the input makes the text a student types the same
+ *   colour as the rest of the page, rather than the browser's pure black.
+ *
+ *   `display: block` on the label is what lets its 0.25rem apply at all: a
+ *   vertical margin does nothing on an inline box, so the specified spacing
+ *   rendered as nothing and the gap came from a `<br>` in the markup. With the
+ *   label a block, that `<br>` is gone and the declaration does the work.
+ *
+ *   The `:focus-visible` ring is a real indicator instead of a borrowed one.
+ *   The browser's own outline is drawn over the control's border footprint, so
+ *   whether focus could be seen depended on how pale that border happened to
+ *   be. Two pixels of the button's blue, held 2px clear of the control, is
+ *   visible on both controls without depending on anything inherited.
  */
 const STYLE_BLOCK = `      body {
         font-family: system-ui, sans-serif;
@@ -479,21 +568,31 @@ const STYLE_BLOCK = `      body {
         padding: 0 1rem;
       }
       label {
+        display: block;
         margin-bottom: 0.25rem;
       }
       input {
         width: 100%;
         padding: 0.5rem;
-        border-color: #767676;
+        border: 1px solid #767676;
+        color: #1a1a1a;
       }
       button {
         background-color: #1a4f8b;
         color: #ffffff;
         padding: 0.5rem 1rem;
+        border: 1px solid #1a4f8b;
       }
       input,
       button {
+        box-sizing: border-box;
+        font: inherit;
         border-radius: 4px;
+      }
+      input:focus-visible,
+      button:focus-visible {
+        outline: 2px solid #1a4f8b;
+        outline-offset: 2px;
       }
       .error {
         color: #b3261e;
@@ -541,31 +640,208 @@ function invalidAttribute(invalidField, fieldName) {
 }
 
 /**
+ * The mobile layout viewport.
+ *
+ * A document that declares none is laid out by a mobile browser against its
+ * own default layout viewport — around 980 CSS pixels — and the result is then
+ * scaled down to fit the screen, so a form that is perfectly usable at any
+ * desktop width arrives on a phone conspicuously shrunk. There are no
+ * breakpoints to opt into here, and none are being introduced: the whole of
+ * what this element says is that the layout viewport is the device's width.
+ *
+ * It declares no asset, runs no script and adds no CSS declaration, so the
+ * page stays self-contained and the style inventory stays exactly as
+ * authorized.
+ */
+const VIEWPORT_META = '<meta name="viewport" content="width=device-width, initial-scale=1">';
+
+/**
+ * The page's icon declaration. Its entire purpose is to PREVENT A REQUEST.
+ *
+ * A document that declares no icon makes the browser ask for `/favicon.ico` of
+ * its own accord, so every page view costs two round trips rather than one.
+ * The second one is worse than wasted: the path is outside this namespace, so
+ * it is answered by the preserved legacy response — 34 bytes of `text/plain` —
+ * which an image decoder then rejects, leaving the browser to fall back to its
+ * default tab icon after paying for bytes it could never use. Narrowing that
+ * response to a `204` or a `404` is not available: it is preserved byte for
+ * byte for every path outside the namespace, which is why the request is
+ * stopped at the document instead of answered differently at the server.
+ *
+ * An EMPTY `data:` URL is what stops it without introducing an asset. The URL
+ * carries its own payload inline, and that payload is zero bytes, so there is
+ * nothing to fetch: the page still issues no subresource request of any kind,
+ * and the repository root still gains no static file.
+ */
+const ICON_LINK = '<link rel="icon" href="data:,">';
+
+/** The feature's own name, and the tail of every title the page serves. */
+const PAGE_TITLE = 'Extracurricular activities';
+
+/**
+ * What separates an outcome from the feature's name in a title.
+ *
+ * Written as an escape sequence rather than as the character itself so this
+ * source file stays ASCII. The served bytes are identical either way, and a
+ * literal em dash is one more thing an editor, a terminal or a checkout with
+ * the wrong encoding assumption can corrupt silently.
+ */
+const TITLE_SEPARATOR = ' \u2014 ';
+
+/**
+ * The outcome each result page announces in its title.
+ *
+ * Every outcome this feature produces is a FULL PAGE NAVIGATION — the page
+ * ships no client-side script, so nothing is ever updated in place — which
+ * makes the title the first thing a screen reader announces after a submission
+ * and the only label the tab, the window and the history entry carry. A title
+ * that named the feature alone would say where the reader is and nothing about
+ * what just happened, identically on all eight screens this feature can serve.
+ *
+ * The distinction drawn is the one a submitter acts on: recorded, already
+ * recorded, or something to fix. The failure prefix deliberately does NOT name
+ * the offending field or repeat the reason — the message element carries both,
+ * bound to the field by `aria-describedby`, and a title long enough to restate
+ * them is a title that gets read out in full before every page.
+ */
+const TITLE_CREATED = 'Activity recorded';
+const TITLE_ALREADY_RECORDED = 'Activity already recorded';
+const TITLE_FAILURE = 'Problem with your submission';
+
+/**
+ * Composes one page title, outcome first.
+ *
+ * Outcome first because that is the part a narrow tab still shows, and the
+ * part a screen reader reaches before a listener has decided whether to keep
+ * listening.
+ *
+ * @param {string|null} outcome One of the prefixes above, or `null` for the
+ *   plain form, which has no outcome to announce and so carries the feature's
+ *   name alone.
+ * @returns {string} The composed title.
+ */
+function pageTitle(outcome) {
+  return outcome === null ? PAGE_TITLE : `${outcome}${TITLE_SEPARATOR}${PAGE_TITLE}`;
+}
+
+/**
+ * The format hint the browser's own validation bubble reads out for the
+ * Student ID field.
+ *
+ * `pattern="S[0-9]{3}"` is a convenience, but it is a convenience that
+ * INTERCEPTS. For a non-empty malformed Student ID the browser blocks the
+ * submission outright — no request leaves it at all — so the authoritative
+ * server-side check never runs, and the sentence it would have produced never
+ * reaches the page as document text bound to the field by `aria-invalid` and
+ * `aria-describedby`. All the submitter gets is the browser's transient
+ * bubble, and a bubble with no `title` to read from says only "Please match
+ * the requested format." while never stating what the format is.
+ *
+ * This is the failure's OWN sentence, read from the failure table rather than
+ * rewritten for the bubble, so the hint a blocked submission shows and the
+ * message a submission that does reach the server shows cannot drift apart. An
+ * EMPTY Student ID is not tested by `pattern` — there is no `required`
+ * attribute — so that case still reaches the server and still renders the full
+ * message, which is why this hint supplements the server path rather than
+ * standing in for it.
+ */
+const STUDENT_ID_FORMAT_HINT = FAILURES.STUDENT_ID_MALFORMED.message;
+
+/* ------------------------------------------------------------------------- *
+ * An outcome sentence as SEGMENTS, so a submitted value cannot reach past
+ * itself
+ *
+ * A sentence built by concatenation is one run of text to the bidi algorithm,
+ * and a submitted label is free to carry a paragraph-level direction control
+ * such as U+202E RIGHT-TO-LEFT OVERRIDE. Unterminated, that override escapes
+ * the label and reverses the REMAINDER OF THIS MODULE'S OWN SENTENCE,
+ * including the Student ID: `Recorded Chess <U+202E> buLC for S003.` renders
+ * as `Recorded Chess .300S rof CLub`, so the one channel that says what
+ * happened to which student becomes unreadable.
+ *
+ * Rejecting the character is not the answer and is not available: U+202E is
+ * Unicode category Cf, not a control character and not a line separator, so
+ * the label is legitimately accepted and correctly stored. The gap is in
+ * rendering, and `<bdi>` closes it — it isolates its contents from the
+ * surrounding text's direction resolution and contributes no characters of its
+ * own, so the message element's TEXT stays exactly the sentence it was.
+ *
+ * Which is why a message travels to `renderPage` as a LIST rather than as
+ * markup. Handing `renderPage` a pre-built, pre-escaped HTML string would
+ * destroy the invariant its own contract rests on — that every value it
+ * interpolates is escaped inside it — and would leave the next caller free to
+ * pass a string built from input. A list of segments carries the one thing
+ * `renderPage` cannot otherwise know, which segments are submitted values, and
+ * nothing else.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A fragment of a sentence THIS MODULE wrote: joining words, punctuation, a
+ * fixed failure sentence. Escaped, never isolated — isolating the connective
+ * tissue of a sentence from itself would be meaningless.
+ *
+ * @param {string} text The fixed fragment.
+ * @returns {{text: string, isolate: boolean}} One segment.
+ */
+function fixed(text) {
+  return { text, isolate: false };
+}
+
+/**
+ * A value that CAME FROM OUTSIDE — a stored label, a Student ID — spliced into
+ * the sentence. Escaped and isolated, because its direction resolution must
+ * not reach the words around it.
+ *
+ * @param {string} text The submitted or stored value.
+ * @returns {{text: string, isolate: boolean}} One segment.
+ */
+function isolated(text) {
+  return { text, isolate: true };
+}
+
+/**
  * Renders the page in one of its four states.
  *
  * Every dynamic value passes through `escapeHtml` on its way in — the two
- * submitted field values, which are arbitrary client input, and the message,
- * which is not but is escaped anyway so that no future caller can introduce
- * an unescaped path by supplying a message built from input.
+ * submitted field values, which are arbitrary client input, the title, and
+ * every segment of the message. The last two are this module's own text or
+ * values it has already accepted, and are escaped anyway so that no future
+ * caller can introduce an unescaped path by supplying either one built from
+ * input.
  *
- * @param {{message: string|null, kind: string, studentId: string, activity: string, invalidField: string|null}} view
- *   `message` is `null` for the plain form. `kind` selects the colour class.
- *   `studentId` and `activity` are pre-filled back into the inputs so a
+ * @param {{title: string, message: Array<{text: string, isolate: boolean}>|null, kind: string, studentId: string, activity: string, invalidField: string|null}} view
+ *   `title` is the composed document title, which distinguishes the outcome
+ *   because every outcome arrives as a full page navigation. `message` is
+ *   `null` for the plain form, and otherwise the sentence's segments in order;
+ *   an isolated segment is wrapped in `<bdi>` here. `kind` selects the colour
+ *   class. `studentId` and `activity` are pre-filled back into the inputs so a
  *   correction does not mean retyping. `invalidField` flags one input.
  * @returns {string} A complete HTML document.
  */
 function renderPage(view) {
   const messageClass = view.kind === MESSAGE_ERROR ? MESSAGE_ERROR : MESSAGE_SUCCESS;
-  const messageMarkup =
+  const messageText =
     view.message === null
+      ? null
+      : view.message
+          .map((segment) =>
+            segment.isolate
+              ? `<bdi>${escapeHtml(segment.text)}</bdi>`
+              : escapeHtml(segment.text)
+          )
+          .join('');
+  const messageMarkup =
+    messageText === null
       ? ''
-      : `    <p id="${MESSAGE_ELEMENT_ID}" class="${messageClass}">${escapeHtml(view.message)}</p>\n`;
+      : `    <p id="${MESSAGE_ELEMENT_ID}" class="${messageClass}">${messageText}</p>\n`;
 
   return `<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>Extracurricular activities</title>
+    ${VIEWPORT_META}
+    ${ICON_LINK}
+    <title>${escapeHtml(view.title)}</title>
     <style>
 ${STYLE_BLOCK}
     </style>
@@ -574,13 +850,15 @@ ${STYLE_BLOCK}
     <h1>Add an extracurricular activity</h1>
 ${messageMarkup}    <form method="post" action="${NAMESPACE_PATH}">
       <p>
-        <label for="student-id">Your Student ID, for example S001</label><br>
-        <input id="student-id" name="${FIELD_STUDENT_ID}" type="text" pattern="S[0-9]{3}" value="${escapeHtml(
+        <label for="student-id">Your Student ID, for example S001</label>
+        <input id="student-id" name="${FIELD_STUDENT_ID}" type="text" pattern="S[0-9]{3}" title="${escapeHtml(
+    STUDENT_ID_FORMAT_HINT
+  )}" value="${escapeHtml(
     view.studentId
   )}"${invalidAttribute(view.invalidField, FIELD_STUDENT_ID)}>
       </p>
       <p>
-        <label for="activity">The activity, for example Chess Club</label><br>
+        <label for="activity">The activity, for example Chess Club</label>
         <input id="activity" name="${FIELD_ACTIVITY}" type="text" maxlength="60" value="${escapeHtml(
     view.activity
   )}"${invalidAttribute(view.invalidField, FIELD_ACTIVITY)}>
@@ -596,6 +874,7 @@ ${messageMarkup}    <form method="post" action="${NAMESPACE_PATH}">
 
 function renderEmptyForm() {
   return renderPage({
+    title: pageTitle(null),
     message: null,
     kind: MESSAGE_SUCCESS,
     studentId: '',
@@ -622,6 +901,10 @@ const RECORD_SOURCE_WORKBOOK = 'workbook';
  * Student ID is kept in the form and the activity field is cleared, because
  * the likely next action is recording a second activity.
  *
+ * `created` decides the title as well as the sentence. The two outcomes differ
+ * in what they did — one appended a record, the other found one and left the
+ * store alone — and a reader who hears only the title has to be told which.
+ *
  * @param {boolean} created True when a record was appended, false when an
  *   identical one already existed and nothing was written.
  * @param {{studentId: string, activity: string, source: string, submittedAt?: string}} record
@@ -629,20 +912,34 @@ const RECORD_SOURCE_WORKBOOK = 'workbook';
  * @returns {string} A complete HTML document.
  */
 function renderOutcome(created, record) {
+  // Both values came from outside this module — the label as the submitter
+  // spelled it, the Student ID as they typed it — so both are isolated in
+  // every sentence below. The stored label is no safer than the submitted one:
+  // it IS the submitted one, normalized.
+  const activity = isolated(record.activity);
+  const studentId = isolated(record.studentId);
+
   let message;
   if (created) {
-    message = `Recorded ${record.activity} for ${record.studentId}.`;
+    message = [fixed('Recorded '), activity, fixed(' for '), studentId, fixed('.')];
   } else if (record.source === RECORD_SOURCE_WORKBOOK) {
-    message =
-      `${record.activity} is already on the student record for ${record.studentId}, ` +
-      'so nothing was added.';
+    message = [
+      activity,
+      fixed(' is already on the student record for '),
+      studentId,
+      fixed(', so nothing was added.'),
+    ];
   } else {
-    message =
-      `${record.activity} was already submitted for ${record.studentId}, ` +
-      'so nothing was added.';
+    message = [
+      activity,
+      fixed(' was already submitted for '),
+      studentId,
+      fixed(', so nothing was added.'),
+    ];
   }
 
   return renderPage({
+    title: pageTitle(created ? TITLE_CREATED : TITLE_ALREADY_RECORDED),
     message,
     kind: MESSAGE_SUCCESS,
     studentId: record.studentId,
@@ -658,6 +955,12 @@ function renderOutcome(created, record) {
  * person reading the page and a script reading the JSON envelope get the same
  * diagnosis in the same words rather than two descriptions to reconcile.
  *
+ * It is ONE fixed segment, and correctly so: a failure sentence and a failure
+ * code are both this module's own text, and per section 0.8.2.5 no error
+ * message interpolates the submitted value at all. There is nothing here to
+ * isolate. The submitted values still reach the page, but as the inputs'
+ * `value` attributes, where direction resolution cannot escape the attribute.
+ *
  * @param {{status: number, code: string, message: string}} outcome The failure.
  * @param {{studentId: string, activity: string}} submitted The values as they
  *   arrived, so a correction does not mean retyping.
@@ -666,7 +969,8 @@ function renderOutcome(created, record) {
  */
 function renderFailure(outcome, submitted, invalidField) {
   return renderPage({
-    message: `${outcome.message} (${outcome.code})`,
+    title: pageTitle(TITLE_FAILURE),
+    message: [fixed(`${outcome.message} (${outcome.code})`)],
     kind: MESSAGE_ERROR,
     studentId: submitted.studentId,
     activity: submitted.activity,
