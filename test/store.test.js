@@ -34,6 +34,12 @@ const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { Module } = require('node:module');
 const { execFileSync } = require('node:child_process');
+/* The module OBJECT as well as the one function destructured above: the store
+ * reaches the platform's access-control tool through `childProcess.execFile`,
+ * and a case below substitutes that method to prove the write is refused when
+ * the tool fails. Substituting it needs the object the store itself resolves
+ * to, which is this one — the same instance, from the same builtin. */
+const childProcess = require('node:child_process');
 
 /* ------------------------------------------------------------------------- *
  * THE ORDERING CONSTRAINT THAT HAS TO COME FIRST
@@ -346,6 +352,13 @@ const E_XLSX_UNSUPPORTED_CELL_TYPE = 'E_XLSX_UNSUPPORTED_CELL_TYPE';
 const E_XLSX_TRUNCATED = 'E_XLSX_TRUNCATED';
 const E_XLSX_MALFORMED_XML = 'E_XLSX_MALFORMED_XML';
 const E_XLSX_LIMIT_EXCEEDED = 'E_XLSX_LIMIT_EXCEEDED';
+/* The reader's caller-fault code, which classifies the CALL rather than the
+ * package and is therefore deliberately absent from READER_REFUSAL_CODES
+ * below. Both halves are asserted: an argument fault must carry this code, so
+ * a caller dispatching on `err.code` has a case for every failure the reader
+ * has; and it must not be one of the nine, so a caller can still tell its own
+ * bug from a package's fault by code alone. */
+const E_XLSX_INVALID_ARGUMENT = 'E_XLSX_INVALID_ARGUMENT';
 
 /**
  * The reader's documented resource ceilings, and the last column of the
@@ -359,10 +372,14 @@ const MAX_PART_BYTES = 4 * 1024 * 1024;
 const LAST_COLUMN_LETTERS = 'XFD';
 
 /**
- * The reader's complete declared refusal vocabulary, in the reader's own
- * order. Both consumers need it whole: the membership assertion has to admit
- * every code a refusal can carry, and the translation loop drives one case per
- * code.
+ * The reader's complete declared PACKAGE-refusal vocabulary, in the reader's
+ * own order. Both consumers need it whole: the membership assertion has to
+ * admit every code a package refusal can carry, and the translation loop
+ * drives one case per code.
+ *
+ * `E_XLSX_INVALID_ARGUMENT` is not a member and must not become one — it says
+ * the call was wrong, not that the bytes were, and every package a case here
+ * builds is read with valid arguments.
  */
 const READER_REFUSAL_CODES = [
   E_XLSX_UNSUPPORTED_COMPRESSION,
@@ -987,15 +1004,24 @@ function documentOf(activities) {
 
 /**
  * The composite key the store compares records by: `(studentId, label)` with
- * the label folded to lower case. Reimplemented here on purpose — a test that
- * imported the store's own comparison could not detect the store agreeing
- * with itself while both were wrong.
+ * the label canonicalized — the invisible formatting characters removed and
+ * the result in Unicode NFC — and then folded to lower case. Reimplemented
+ * here on purpose, spelled out rather than shared: a test that imported the
+ * store's own comparison could not detect the store agreeing with itself
+ * while both were wrong.
+ *
+ * The canonicalization belongs in this model and not only in the store's,
+ * because the duplicate-key assertions this feeds are what would otherwise
+ * pass over a document holding one label in two Unicode forms.
  *
  * @param {{studentId: string, activity: string}} record The record.
  * @returns {string} The comparison key.
  */
 function compositeKeyOf(record) {
-  return `${record.studentId}\u0000${record.activity.toLowerCase()}`;
+  const canonical = record.activity
+    .replace(/[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/gu, '')
+    .normalize('NFC');
+  return `${record.studentId}\u0000${canonical.toLowerCase()}`;
 }
 
 
@@ -1855,6 +1881,66 @@ describe('reference-data failure and the E_REFERENCE_DATA translation', () => {
     );
   });
 
+  it('treats a cell of invisible characters as blank, and seeds the canonical form of a padded one', async (t) => {
+    /* The invisible half of the leniency above, and it has to be leniency for
+     * the same reason: a cell holding nothing but a byte-order mark is blank
+     * to every eye that reads the spreadsheet. Tested RAW it would instead be
+     * a one-character label, fail normalization as empty, and fail the whole
+     * seed with E_REFERENCE_DATA — every request answered
+     * `500 reference_data_unavailable` because one workbook cell carried one
+     * invisible character. So the blank test canonicalizes the cell first,
+     * which is what keeps it in agreement with the normalizer by
+     * construction.
+     *
+     * The other two rows are the mirror: a cell that DOES carry visible
+     * content keeps it and is seeded in canonical form, invisible padding
+     * removed and the accent composed, so a workbook value and the same label
+     * submitted over HTTP arrive at one record rather than two. */
+    const context = 'reference data with invisible characters in the activity column';
+    const directory = await makeTemporaryDirectory(t);
+    const storeFile = path.join(directory, 'activities.json');
+    const { store, script } = storeWithScriptedReader(t, storeFile);
+    script.values.set(KEY_COLUMN, ['Student ID', 'S001', 'S002', 'S003']);
+    script.values.set(SEED_ID_COLUMN, ['Student ID', 'S001', 'S002', 'S003']);
+    script.values.set(SEED_LABEL_COLUMN, [
+      'Extracurricular Activity',
+      '\ufeff',
+      '\ufeffRobotics\u200b Club\u200b',
+      'Cafe\u0301 Club',
+    ]);
+
+    assert.deepStrictEqual(
+      await store.listActivities('S001'),
+      [],
+      `${context}: a cell holding only a byte-order mark records nothing, exactly as an empty cell does`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S002'),
+      [seededRecord('S002', 'Robotics Club')],
+      `${context}: an invisibly padded cell seeds the label with the padding removed`
+    );
+    assert.deepStrictEqual(
+      await store.listActivities('S003'),
+      [seededRecord('S003', 'Caf\u00e9 Club')],
+      `${context}: a decomposed cell seeds the composed form, so it cannot duplicate the composed spelling later`
+    );
+
+    /* And the seeded canonical label deduplicates against the same label
+     * submitted in either spelling — the guarantee that would be lost if the
+     * seed and the submission path canonicalized differently. */
+    const repeat = await store.addActivity('S003', store.normalizeLabel('caf\u00e9 club'));
+    assert.strictEqual(
+      repeat.created,
+      false,
+      `${context}: a submission matching the seeded canonical label adds nothing`
+    );
+    assert.deepStrictEqual(
+      await fs.readdir(directory),
+      [],
+      `${context}: nothing was created, so the store must still not exist`
+    );
+  });
+
   it('passes every read through when nothing is scripted, so the seam cannot mask a fault', async (t) => {
     const directory = await makeTemporaryDirectory(t);
     const storeFile = path.join(directory, 'activities.json');
@@ -2242,6 +2328,273 @@ describe('activity label normalization', () => {
       'the store keeps the label as typed; case is folded only for the composite-key comparison'
     );
   });
+
+  /**
+   * A string as a list of code points, so a difference between two values
+   * that render identically is reportable.
+   *
+   * `===` alone proves the two are the same string but says nothing legible
+   * when they are not: a failure message carrying two identical-looking
+   * labels is a failure nobody can read. Every case below that compares
+   * Unicode forms states its expectation through this.
+   *
+   * @param {string} value The string to describe.
+   * @returns {string} Its code points, `U+XXXX` separated by spaces.
+   */
+  function codePointsOf(value) {
+    return Array.from(value)
+      .map((character) => `U+${character.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`)
+      .join(' ');
+  }
+
+  it('removes an invisible formatting character at every position it can occupy', () => {
+    /* The invisible counterpart of the tab case above, and the reason it is
+     * a REMOVAL rather than a refusal: none of these characters is a space
+     * separator and none is a control character, so left unhandled every one
+     * of them survives normalization untouched and pads one label into a
+     * second composite key that renders identically to the first. A submitter
+     * cannot see the character, so a refusal naming it would describe a fault
+     * they cannot find in their own input.
+     *
+     * Each position is exercised because trimming, collapsing and removal are
+     * separate steps, and a removal wired into the trim alone would leave an
+     * internal one in place. */
+    const invisibles = [
+      ['\u00ad', 'U+00AD SOFT HYPHEN'],
+      ['\u180e', 'U+180E MONGOLIAN VOWEL SEPARATOR'],
+      ['\u200b', 'U+200B ZERO WIDTH SPACE'],
+      ['\u200c', 'U+200C ZERO WIDTH NON-JOINER'],
+      ['\u200d', 'U+200D ZERO WIDTH JOINER'],
+      ['\u200e', 'U+200E LEFT-TO-RIGHT MARK'],
+      ['\u200f', 'U+200F RIGHT-TO-LEFT MARK'],
+      ['\u2060', 'U+2060 WORD JOINER'],
+      ['\u2064', 'U+2064 INVISIBLE PLUS'],
+      ['\ufeff', 'U+FEFF BYTE ORDER MARK'],
+    ];
+    for (const [character, name] of invisibles) {
+      for (const [placement, label] of [
+        ['leading', `${character}Tennis Club`],
+        ['trailing', `Tennis Club${character}`],
+        ['internal', `Tennis${character} Club`],
+        ['inside a word', `Ten${character}nis Club`],
+      ]) {
+        const normalized = bootstrapStore.normalizeLabel(label);
+        assert.strictEqual(
+          normalized,
+          'Tennis Club',
+          `a ${placement} ${name} must be removed, leaving the label the submitter sees; received ${codePointsOf(normalized)}`
+        );
+      }
+    }
+
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('Zero\u200bWidth Club'),
+      'ZeroWidth Club',
+      'an invisible character between two letters is removed without a space taking its place'
+    );
+  });
+
+  it('removes the invisible characters BEFORE collapsing, so no doubled space is left behind', () => {
+    /* The case that pins the STEP ORDER, and the one an implementation that
+     * strips after the trim and collapse fails: in `Tennis \u200b Club` the
+     * zero-width space sits between two ordinary spaces, so removing it after
+     * the collapse has already run leaves `Tennis  Club` — two spaces — in
+     * the stored value, with no step left to tidy it, and the loader would
+     * then refuse that value as not normalized. Removing first hands the
+     * collapse one run to fold. */
+    const normalized = bootstrapStore.normalizeLabel('Tennis \u200b Club');
+    assert.strictEqual(
+      normalized,
+      'Tennis Club',
+      `the run around a removed invisible character must collapse to exactly one space; received ${codePointsOf(normalized)}`
+    );
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('\ufeff  Tennis \u200b\u00a0 Club \u200b '),
+      'Tennis Club',
+      'invisible characters mixed into leading, internal and trailing whitespace all disappear before the trim and the collapse'
+    );
+  });
+
+  it('refuses a label of invisible formatting characters only, as empty', () => {
+    /* A label with no visible content at all. Before the invisible class
+     * existed each of these was a "valid" label of one or two characters and
+     * was persisted as a record that renders as nothing — the message the
+     * refusal carries said the label must not be empty once surrounding
+     * whitespace is removed while the behaviour accepted it. Both now agree:
+     * whatever is invisible is removed, and what is left is empty. */
+    for (const raw of [
+      '\u200b',
+      '\ufeff',
+      '\u00ad\u2060',
+      '  \u200b \u00a0 ',
+      '\u200e\u200f',
+      '\t\ufeff\u180e',
+    ]) {
+      const context = `a label of invisible characters only, ${codePointsOf(raw)}`;
+      const error = captureThrow(() => bootstrapStore.normalizeLabel(raw), context);
+      assertCode(error, E_LABEL_INVALID, context);
+      assertMessageMentions(
+        error,
+        /empty/,
+        `${context}: the refusal must name the emptiness rule, since every character was removed before anything could refuse it`
+      );
+    }
+  });
+
+  it('treats canonically equivalent spellings of one label as the same label', () => {
+    /* `Caf\u00e9 Club` and `Cafe\u0301 Club` are the same text in Unicode's
+     * own terms — one precomposed, one an `e` followed by a combining acute —
+     * and they render identically in every font. Without normalization both
+     * are accepted as typed and persist as two records nobody can tell
+     * apart, which is the near-duplicate risk the dedupe rule exists to
+     * mitigate. NFC is the composed form, so both must arrive at the
+     * precomposed spelling. */
+    const composed = 'Caf\u00e9 Club';
+    const decomposed = 'Cafe\u0301 Club';
+    assert.notStrictEqual(
+      composed,
+      decomposed,
+      'the two inputs must genuinely differ, or this case proves nothing'
+    );
+
+    const fromComposed = bootstrapStore.normalizeLabel(composed);
+    const fromDecomposed = bootstrapStore.normalizeLabel(decomposed);
+
+    assert.strictEqual(
+      codePointsOf(fromComposed),
+      'U+0043 U+0061 U+0066 U+00E9 U+0020 U+0043 U+006C U+0075 U+0062',
+      'the composed spelling normalizes to itself, code point for code point'
+    );
+    assert.strictEqual(
+      codePointsOf(fromDecomposed),
+      codePointsOf(fromComposed),
+      'the decomposed spelling must normalize to the same code points, not merely to something that looks the same'
+    );
+    assert.strictEqual(fromDecomposed, composed, 'and the canonical form is the composed one');
+
+    /* A combining mark on a base that has no precomposed form is left as it
+     * is: NFC composes what Unicode says composes and invents nothing. */
+    const noPrecomposedForm = 'Che\u0301ss\u0332 Club';
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel(noPrecomposedForm),
+      'Ch\u00e9ss\u0332 Club',
+      'NFC composes the pair that has a precomposed form and leaves the one that does not'
+    );
+  });
+
+  it('is idempotent, so a label already normalized normalizes to itself', () => {
+    /* The property the LOADER depends on. It refuses any stored label that is
+     * not already in normalized form, so a normalizer whose output could need
+     * normalizing again would write documents its own loader then rejects
+     * forever. The decomposed-with-zero-width input is the one that fails if
+     * the canonicalization is ordered the other way round: composing before
+     * removing leaves the accent uncomposed, because the zero-width space
+     * between the base and the mark blocks the composition. */
+    const inputs = [
+      'Chess Club',
+      '  Chess   Club  ',
+      'Cafe\u0301 Club',
+      'e\u200b\u0301 Club',
+      'Tennis \u200b Club',
+      '\ufeffRobotics\tClub\u200b',
+      'Chess \u202e buLC',
+      '\u{1f680} Club',
+      'Ch\u00e9ss\u0332 Club',
+    ];
+    for (const raw of inputs) {
+      const once = bootstrapStore.normalizeLabel(raw);
+      const twice = bootstrapStore.normalizeLabel(once);
+      assert.strictEqual(
+        twice,
+        once,
+        `normalizing ${codePointsOf(raw)} twice must give the same value as once; got ${codePointsOf(once)} then ${codePointsOf(twice)}`
+      );
+    }
+  });
+
+  it('measures the sixty-character bound after canonicalization, not before it', () => {
+    /* Sixty decomposed `é`s are 120 code units on the wire and sixty once
+     * composed, so the order of the two steps decides whether a legitimate
+     * label is refused. The mirror case is a label at the bound padded with
+     * zero-width characters: the padding is removed before the count, so it
+     * is still exactly sixty. */
+    const decomposedAccent = 'e\u0301';
+    assert.strictEqual(decomposedAccent.length, 2, 'the decomposed accent is two code units');
+
+    const atTheBound = decomposedAccent.repeat(MAX_LABEL_LENGTH);
+    assert.strictEqual(atTheBound.length, MAX_LABEL_LENGTH * 2, 'and sixty of them are 120');
+
+    const normalized = bootstrapStore.normalizeLabel(atTheBound);
+    assert.strictEqual(
+      normalized.length,
+      MAX_LABEL_LENGTH,
+      'sixty composed accents are exactly at the bound, so the label must be accepted and returned at length sixty'
+    );
+    assert.strictEqual(
+      normalized,
+      '\u00e9'.repeat(MAX_LABEL_LENGTH),
+      'and each pair must have composed into the single precomposed character'
+    );
+
+    const overTheBound = decomposedAccent.repeat(MAX_LABEL_LENGTH + 1);
+    const context = 'a label of sixty-one decomposed accents';
+    const error = captureThrow(() => bootstrapStore.normalizeLabel(overTheBound), context);
+    assertCode(error, E_LABEL_INVALID, context);
+    assertMessageMentions(error, /60/, 'the refusal must name the bound it enforced');
+    assertMessageMentions(
+      error,
+      /61/,
+      'and the count it measured, which is the canonical length rather than the 122 code units submitted'
+    );
+
+    const paddedToTheBound = `\ufeff${'C'.repeat(MAX_LABEL_LENGTH)}\u200b\u00ad`;
+    assert.strictEqual(paddedToTheBound.length, MAX_LABEL_LENGTH + 3);
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel(paddedToTheBound),
+      'C'.repeat(MAX_LABEL_LENGTH),
+      'invisible padding is removed before the count, so a label at the bound stays inside it'
+    );
+  });
+
+  it('keeps a direction control, which reorders visible text rather than padding it', () => {
+    /* The deliberate EXCLUSION from the invisible class, pinned so that
+     * widening the class later shows up here rather than in production. The
+     * bidi controls — the embeddings and overrides U+202A-U+202E, the
+     * isolates U+2066-U+2069 and U+061C ARABIC LETTER MARK — reorder visible
+     * text, so a label carrying one is a label whose author meant something
+     * by it. They are accepted, and the served HTML isolates every
+     * interpolated value in a `<bdi>` element so an unterminated override
+     * cannot reverse the sentence around it; `test/activities.test.js`
+     * asserts that rendering. Removing them here would silently change an
+     * accepted, tested behaviour. */
+    for (const [character, name] of [
+      ['\u202a', 'U+202A LEFT-TO-RIGHT EMBEDDING'],
+      ['\u202b', 'U+202B RIGHT-TO-LEFT EMBEDDING'],
+      ['\u202c', 'U+202C POP DIRECTIONAL FORMATTING'],
+      ['\u202d', 'U+202D LEFT-TO-RIGHT OVERRIDE'],
+      ['\u202e', 'U+202E RIGHT-TO-LEFT OVERRIDE'],
+      ['\u2066', 'U+2066 LEFT-TO-RIGHT ISOLATE'],
+      ['\u2069', 'U+2069 POP DIRECTIONAL ISOLATE'],
+      ['\u061c', 'U+061C ARABIC LETTER MARK'],
+    ]) {
+      const label = `Chess ${character} buLC`;
+      const normalized = bootstrapStore.normalizeLabel(label);
+      assert.strictEqual(
+        normalized,
+        label,
+        `${name} must survive normalization unchanged; received ${codePointsOf(normalized)}`
+      );
+    }
+
+    /* A variation selector is excluded for a different reason — it changes
+     * how the character before it RENDERS, so dropping it would change the
+     * glyph the submitter chose. */
+    assert.strictEqual(
+      bootstrapStore.normalizeLabel('Chess \u2764\ufe0f Club'),
+      'Chess \u2764\ufe0f Club',
+      'a variation selector must survive too, because it selects a glyph rather than padding the text'
+    );
+  });
 });
 
 
@@ -2324,6 +2677,82 @@ describe('the composite primary key and idempotent submission', () => {
     assert.strictEqual(variant.created, false);
     assert.strictEqual(variant.record.activity, 'Chess Club');
     await assertBytesUnchanged(storeFile, bytesAfterFirst, 'a whitespace variant');
+  });
+
+  it('treats a canonically equivalent label as the same composite key', async (t) => {
+    /* `Cafe\u0301 Club` is `Caf\u00e9 Club` written with a combining acute:
+     * the same text in Unicode's terms, identical in every font, and a
+     * different sequence of code units. Without canonicalization the second
+     * submission is a new key and the store ends up holding two records
+     * nobody can tell apart — the near-duplicate outcome case-insensitive
+     * comparison alone does not cover. Nothing may be written, so the bytes
+     * are asserted unchanged rather than merely the flag. */
+    const { store, storeFile } = await makeIsolatedStore(t, 'canonical-dedupe.json');
+    const first = await store.addActivity('S001', 'Caf\u00e9 Club');
+    assert.strictEqual(first.created, true, 'the composed spelling is a new activity');
+    const bytesAfterFirst = await fs.readFile(storeFile);
+
+    const variant = await store.addActivity('S001', store.normalizeLabel('Cafe\u0301 Club'));
+
+    assert.strictEqual(
+      variant.created,
+      false,
+      'the decomposed spelling is the same activity and must add nothing'
+    );
+    assert.strictEqual(
+      variant.record.activity,
+      'Caf\u00e9 Club',
+      'the stored canonical form is returned, not the spelling just submitted'
+    );
+    assert.strictEqual(variant.record.submittedAt, first.record.submittedAt);
+    await assertBytesUnchanged(storeFile, bytesAfterFirst, 'a canonically equivalent label');
+
+    const document = await readDocument(storeFile);
+    assert.strictEqual(
+      document.activities.filter((record) => record.studentId === 'S001').length,
+      2,
+      'the seeded record plus exactly one Café Club — a second would render identically to the first'
+    );
+  });
+
+  it('treats an invisibly padded label as the same composite key', async (t) => {
+    /* A trailing zero-width space, a leading byte-order mark and a
+     * byte-order-mark-plus-case variant. Each is a paste artefact a submitter
+     * cannot see, so each is the same activity; before the invisible class
+     * existed each produced its own composite key and its own stored record.
+     * The case-folded variant is included because the two rules compose: the
+     * key is canonical AND case-insensitive, not one or the other. */
+    const { store, storeFile } = await makeIsolatedStore(t, 'invisible-dedupe.json');
+    const first = await store.addActivity('S001', 'Tennis Club');
+    assert.strictEqual(first.created, true);
+    const bytesAfterFirst = await fs.readFile(storeFile);
+
+    for (const [raw, description] of [
+      ['Tennis Club\u200b', 'a trailing ZERO WIDTH SPACE'],
+      ['\ufeffTennis Club', 'a leading BYTE ORDER MARK'],
+      ['\ufeffTENNIS club\u200b', 'a byte-order mark around a case variant'],
+      ['Tennis \u200b Club', 'an invisible character inside the space run'],
+    ]) {
+      const variant = await store.addActivity('S001', store.normalizeLabel(raw));
+      assert.strictEqual(
+        variant.created,
+        false,
+        `${description} must be recognized as the activity already recorded, not appended`
+      );
+      assert.strictEqual(
+        variant.record.activity,
+        'Tennis Club',
+        `${description} must return the stored label as it was first submitted`
+      );
+      await assertBytesUnchanged(storeFile, bytesAfterFirst, description);
+    }
+
+    const document = await readDocument(storeFile);
+    assert.strictEqual(
+      document.activities.filter((record) => record.activity.includes('Tennis')).length,
+      1,
+      'exactly one Tennis Club may exist after four visually identical submissions'
+    );
   });
 
   it('treats the same label for a different student as a different composite key', async (t) => {
@@ -2594,6 +3023,24 @@ const MALFORMED_STORE_DOCUMENTS = [
   {
     name: 'an activity of thirty-one astral characters, which is sixty-two code units',
     body: bodyOf([baseSubmission({ activity: '\u{1f680}'.repeat(MAX_LABEL_LENGTH / 2 + 1) })]),
+  },
+  {
+    /* A store written by this service can never hold a decomposed label: the
+     * normalizer composes every submission into NFC before it is persisted.
+     * Its presence therefore means a hand-edit, and accepting it would leave
+     * the store holding a label whose composite key differs from the composed
+     * spelling of the same text — two records nobody can tell apart. */
+    name: 'an activity in decomposed form rather than NFC',
+    body: bodyOf([baseSubmission({ activity: 'Cafe\u0301 Club' })]),
+  },
+  {
+    /* Likewise for an invisible formatting character: normalization removes
+     * every one of them, so a stored label carrying one was hand-edited in.
+     * Refusing it is what keeps the loader's guarantee — every stored label
+     * is already in canonical form — true for the invisible characters as
+     * well as for the visible ones. */
+    name: 'an activity carrying a zero-width character',
+    body: bodyOf([baseSubmission({ activity: 'Chess\u200bClub' })]),
   },
   {
     name: 'an activity with an uncollapsed internal whitespace run',
@@ -3722,24 +4169,125 @@ describe('the reader refuses packages outside its supported subset', () => {
     assert.deepStrictEqual(xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), ['Deflated']);
   });
 
-  it('rejects an argument fault as a TypeError, not as a package refusal', async (t) => {
+  it('rejects an argument fault as a coded TypeError, not as a package refusal', async (t) => {
     const directory = await makeTemporaryDirectory(t);
     const filePath = await writePackage(directory, 'argument.xlsx', [
       zipLocalEntry(WORKSHEET_PART, worksheetXml('')),
     ]);
 
-    /* A caller bug is not a property of the package, so it must not arrive
-     * wearing one of the declared refusal codes. */
-    for (const [callable, description] of [
-      [() => xlsxRead.listEntries(''), 'an empty file path'],
-      [() => xlsxRead.readEntry(filePath, ''), 'an empty part name'],
-      [() => xlsxRead.readColumn(filePath, WORKSHEET_PART, '1'), 'a non-letter column'],
-      [() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'ABCD'), 'four column letters'],
+    /* Two properties at once, and each is load-bearing on its own. A caller
+     * bug is not a property of the package, so it must NOT arrive wearing one
+     * of the nine package-refusal codes — a caller sorting its own mistakes
+     * from a substituted workbook depends on that. But it must still arrive
+     * with A code: a bare TypeError means a caller dispatching on `err.code`
+     * falls through to a generic handler for the one failure that is its own
+     * fault, which is the least useful place to lose the classification.
+     *
+     * Every entry point is covered, because each reaches the guards by its own
+     * route: `listEntries` and `readEntry` check the strings directly,
+     * `readColumn` goes through the single-letter guard, and `readSheetRows`
+     * through the selection guard. */
+    for (const [callable, description, expectedReason] of [
+      [() => xlsxRead.listEntries(''), 'an empty file path', 'argument_not_non_empty_string'],
+      [() => xlsxRead.listEntries(null), 'a null file path', 'argument_not_non_empty_string'],
+      [
+        () => xlsxRead.readEntry(filePath, ''),
+        'an empty part name',
+        'argument_not_non_empty_string',
+      ],
+      [
+        () => xlsxRead.readEntry(filePath, null),
+        'a null part name',
+        'argument_not_non_empty_string',
+      ],
+      [
+        () => xlsxRead.readColumn(filePath, WORKSHEET_PART, '1'),
+        'a non-letter column',
+        'argument_not_column_letters',
+      ],
+      [
+        () => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'ABCD'),
+        'four column letters',
+        'argument_not_column_letters',
+      ],
+      [
+        () => xlsxRead.readSheetRows(filePath, WORKSHEET_PART, []),
+        'an empty column selection',
+        'argument_not_column_selection',
+      ],
     ]) {
       const error = captureThrow(callable, description);
       assert.ok(error instanceof TypeError, `${description} must be a TypeError`);
-      assert.strictEqual(error.code, undefined, `${description} must carry no refusal code`);
+      assertCode(error, E_XLSX_INVALID_ARGUMENT, description);
+      assert.ok(
+        !READER_REFUSAL_CODES.includes(error.code),
+        `${description} must not wear one of the package-refusal codes, which describe the bytes rather than the call`
+      );
+      assert.strictEqual(
+        error.diagnostic?.reason,
+        expectedReason,
+        `${description}: the diagnostic must name WHICH argument contract was broken`
+      );
+      assert.deepStrictEqual(
+        [error.diagnostic.detail, error.diagnostic.at, error.diagnostic.number],
+        [null, null, null],
+        `${description}: nothing was opened, so there is no underlying fault, position or bounded field to report`
+      );
     }
+  });
+
+  it('refuses a package that cannot be opened at all, rather than leaking the errno', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+    const present = await writePackage(directory, 'present.xlsx', [
+      zipLocalEntry(WORKSHEET_PART, worksheetXml(inlineStringCell('A1', 'S001'))),
+    ]);
+
+    /* A missing workbook is the ordinary failure — a path typed wrong, a file
+     * not deployed — and `node:fs` answers it with `ENOENT`. An `ENOENT`
+     * reaching a caller is a code from a module this reader's contract never
+     * mentions, so a caller matching on the declared vocabulary has no case
+     * for the most common fault of all. The second path is the same answer for
+     * the same reason: a path whose parent is a file names nothing either, and
+     * the platform reports it as `ENOENT` or `ENOTDIR` depending on where it
+     * notices. */
+    for (const [candidate, description] of [
+      [path.join(directory, 'absent.xlsx'), 'a package that does not exist'],
+      [path.join(present, 'child.xlsx'), 'a path whose parent is a regular file'],
+    ]) {
+      const context = `${description} offered as a package`;
+
+      for (const [callable, entryPoint] of [
+        [() => xlsxRead.listEntries(candidate), 'listEntries'],
+        [() => xlsxRead.readEntry(candidate, WORKSHEET_PART), 'readEntry'],
+        [() => xlsxRead.readSheetRows(candidate, WORKSHEET_PART), 'readSheetRows'],
+        [() => xlsxRead.readColumn(candidate, WORKSHEET_PART, 'A'), 'readColumn'],
+      ]) {
+        const error = assertCode(
+          captureThrow(callable, `${context} (${entryPoint})`),
+          E_XLSX_UNSUPPORTED_SOURCE,
+          `${context} (${entryPoint})`
+        );
+        assert.strictEqual(
+          error.diagnostic?.reason,
+          'source_missing',
+          `${context} (${entryPoint}): absent is its own reason, distinct from unreadable and from not-a-regular-file`
+        );
+        assertMessageMentions(
+          error,
+          /does not exist/u,
+          `${context} (${entryPoint}): the refusal must say the package is not there`
+        );
+        assertMessageMentions(
+          error,
+          /ENOENT|ENOTDIR/u,
+          `${context} (${entryPoint}): the errno stays in the message, where this module puts every offending detail`
+        );
+      }
+    }
+
+    /* The contrast that makes the refusals above meaningful: the same calls
+     * against a package that IS there still read. */
+    assert.deepStrictEqual(xlsxRead.readColumn(present, WORKSHEET_PART, 'A'), ['S001']);
   });
 });
 
@@ -4495,6 +5043,91 @@ describe('the reader refuses malformed worksheet XML instead of salvaging it', (
     const bytes = xlsxRead.readEntry(filePath, WORKSHEET_PART);
     assert.ok(bytes.includes(0xff), `${context}: readEntry must return the bytes as they are`);
   });
+
+  it('refuses a part that is no worksheet at all, rather than reporting it as empty', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* An empty array is a STATEMENT ABOUT THE DATA: a worksheet whose
+     * `<sheetData>` holds no `<row>`. None of the parts below is a worksheet,
+     * so answering `[]` for one would report absence of data where the truth
+     * is absence of a worksheet — and the two call for opposite reactions. The
+     * key-set read is the caller that makes this concrete: it asks for column A
+     * of the identity workbook, and an empty column there is a key set that
+     * authorizes nothing. It refuses that on its own account, so nothing
+     * reaches a client either way; what changes is whether the fault is named
+     * where it happened or inferred one layer up from a silence. */
+    for (const [index, [description, xml, expectedReason]] of [
+      [
+        'an HTML document served in place of the part',
+        '<html><body><p>Not a worksheet</p></body></html>',
+        'worksheet_root_missing',
+      ],
+      ['a part holding whitespace only', '   \n\t  ', 'xml_no_root_element'],
+      ['a part holding no bytes at all', '', 'xml_no_root_element'],
+      [
+        'an XML declaration and nothing after it',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        'xml_no_root_element',
+      ],
+      [
+        'a worksheet holding no sheetData element',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+          '<dimension ref="A1:J11"/></worksheet>',
+        'worksheet_sheet_data_missing',
+      ],
+      ['a worksheet element with nothing inside it', '<worksheet/>', 'worksheet_sheet_data_missing'],
+    ].entries()) {
+      const context = `${description} asked for rows`;
+      const filePath = await writePackage(directory, `not-a-worksheet-${index}.xlsx`, [
+        zipLocalEntry(WORKSHEET_PART, xml),
+      ]);
+
+      for (const [callable, entryPoint] of [
+        [() => xlsxRead.readSheetRows(filePath, WORKSHEET_PART), 'readSheetRows'],
+        [() => xlsxRead.readSheetRows(filePath, WORKSHEET_PART, ['A']), 'readSheetRows(selection)'],
+        [() => xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), 'readColumn'],
+      ]) {
+        const error = assertCode(
+          captureThrow(callable, `${context} (${entryPoint})`),
+          E_XLSX_MALFORMED_XML,
+          `${context} (${entryPoint})`
+        );
+        assert.strictEqual(
+          error.diagnostic?.reason,
+          expectedReason,
+          `${context} (${entryPoint}): the token must tell the three ways of not being a worksheet apart`
+        );
+      }
+
+      /* `readEntry` is unaffected: it hands back bytes and interprets
+       * nothing, which is what the package-inertness assertions rely on. */
+      assert.strictEqual(
+        xlsxRead.readEntry(filePath, WORKSHEET_PART).toString('utf8'),
+        xml,
+        `${context}: readEntry must still return the part verbatim`
+      );
+    }
+
+    /* The other side of the same line, and the reason the refusals above are
+     * about the PART rather than about emptiness: a worksheet whose sheetData
+     * holds no row is a legitimate worksheet and still reads as no rows, in
+     * both the self-closing and the explicitly-empty form. */
+    for (const [index, empty] of [
+      '<worksheet><sheetData/></worksheet>',
+      '<worksheet><sheetData></sheetData></worksheet>',
+    ].entries()) {
+      const filePath = await writePackage(directory, `empty-sheet-${index}.xlsx`, [
+        zipLocalEntry(WORKSHEET_PART, empty),
+      ]);
+      assert.deepStrictEqual(
+        xlsxRead.readSheetRows(filePath, WORKSHEET_PART),
+        [],
+        `${empty}: an empty worksheet is a worksheet and must read as no rows`
+      );
+      assert.deepStrictEqual(xlsxRead.readColumn(filePath, WORKSHEET_PART, 'A'), []);
+    }
+  });
 });
 
 
@@ -5147,6 +5780,55 @@ describe('the reader refuses markup it does not interpret rather than reading th
     }
   });
 
+  it('refuses a sheetData hidden outside the worksheet element, whose rows would be read as the real ones', async (t) => {
+    const directory = await makeTemporaryDirectory(t);
+
+    /* The descent finds `<sheetData>` by scanning text, so before its parent
+     * was constrained, a `<sheetData>` sitting anywhere in the part was taken
+     * as the worksheet's own: each fixture below returned
+     * ['Student ID', 'S999'] outright. That is a whole fabricated grid — not
+     * one smuggled row — and in `student_details.xlsx` column A it is a
+     * fabricated member of the key set every submission is validated against.
+     *
+     * ECMA-376 makes `sheetData` a direct child of `worksheet`, so nothing
+     * legitimate lives in any of these places, and refusing them is also what
+     * makes the "a worksheet must hold a sheetData" refusal mean what it says
+     * rather than being satisfiable by a sheetData hidden anywhere. */
+    for (const [index, [description, xml]] of [
+      [
+        'inside sheetPr, with no real sheetData anywhere',
+        `<worksheet><sheetPr><sheetData>${HEADER_ROW}${INJECTED_ROW}</sheetData></sheetPr></worksheet>`,
+      ],
+      [
+        'nested two elements deep under the worksheet',
+        `<worksheet><sheetPr><x><sheetData>${HEADER_ROW}${INJECTED_ROW}</sheetData></x></sheetPr></worksheet>`,
+      ],
+      [
+        'under a root element that is not a worksheet at all',
+        `<html><body><sheetData>${HEADER_ROW}${INJECTED_ROW}</sheetData></body></html>`,
+      ],
+      [
+        'as the root element of the part',
+        `<sheetData>${HEADER_ROW}${INJECTED_ROW}</sheetData>`,
+      ],
+    ].entries()) {
+      const context = `a worksheet with a sheetData ${description}`;
+      const filePath = await packageOfPart(directory, `hidden-sheetdata-${index}.xlsx`, xml);
+
+      const error = assertRefusedEverywhere(filePath, E_XLSX_MALFORMED_XML, context);
+      assert.strictEqual(
+        error.diagnostic?.reason,
+        'xml_element_unexpected_parent',
+        `${context}: the refusal must name the misplaced element rather than the absence of one`
+      );
+      assertMessageOmits(
+        error,
+        /S999/u,
+        'the refusal must not carry the fabricated key back to the caller'
+      );
+    }
+  });
+
   it('refuses a second sheetData element, whose rows would shadow the real ones', async (t) => {
     const context = 'a worksheet holding two sheetData elements';
     const directory = await makeTemporaryDirectory(t);
@@ -5604,10 +6286,20 @@ describe('the reader accepts exactly the columns its contract promises', () => {
         () => xlsxRead.readColumn(DETAILS_WORKBOOK, WORKSHEET_PART, columnLetter),
         context
       );
-      /* A caller argument fault, not a property of the package, so it must
-       * stay a TypeError carrying none of the declared refusal codes. */
+      /* A caller argument fault, not a property of the package: a TypeError
+       * carrying the caller-fault code and none of the nine package
+       * refusals. */
       assert.ok(error instanceof TypeError, `${context} must be a TypeError`);
-      assert.strictEqual(error.code, undefined, `${context} must carry no refusal code`);
+      assertCode(error, E_XLSX_INVALID_ARGUMENT, context);
+      assert.ok(
+        !READER_REFUSAL_CODES.includes(error.code),
+        `${context} must not wear a package-refusal code`
+      );
+      assert.strictEqual(
+        error.diagnostic?.reason,
+        'argument_not_column_letters',
+        `${context}: the diagnostic must name the column-letter contract`
+      );
       assert.match(
         error.message,
         /A to XFD/,
@@ -5617,14 +6309,33 @@ describe('the reader accepts exactly the columns its contract promises', () => {
   });
 
   it('rejects a column selection that is not a non-empty array of column letters', () => {
-    for (const selection of [[], 'A', {}, ['A', 'XFE'], ['A', ''], 0]) {
+    /* The selection guard refuses the shape of the argument; a letter inside
+     * an otherwise well-shaped array is refused by the single-letter guard, so
+     * the two reasons below are both reachable through this one call. */
+    for (const [selection, expectedReason] of [
+      [[], 'argument_not_column_selection'],
+      ['A', 'argument_not_column_selection'],
+      [{}, 'argument_not_column_selection'],
+      [0, 'argument_not_column_selection'],
+      [['A', 'XFE'], 'argument_not_column_letters'],
+      [['A', ''], 'argument_not_non_empty_string'],
+    ]) {
       const context = `selection ${JSON.stringify(selection)}`;
       const error = captureThrow(
         () => xlsxRead.readSheetRows(DETAILS_WORKBOOK, WORKSHEET_PART, selection),
         context
       );
       assert.ok(error instanceof TypeError, `${context} must be a TypeError`);
-      assert.strictEqual(error.code, undefined, `${context} must carry no refusal code`);
+      assertCode(error, E_XLSX_INVALID_ARGUMENT, context);
+      assert.ok(
+        !READER_REFUSAL_CODES.includes(error.code),
+        `${context} must not wear a package-refusal code`
+      );
+      assert.strictEqual(
+        error.diagnostic?.reason,
+        expectedReason,
+        `${context}: the diagnostic must name which argument contract was broken`
+      );
     }
 
     /* Omitting the argument and passing null explicitly both mean "every
@@ -5965,8 +6676,85 @@ describe('atomic replacement and the write mutex', () => {
     );
   });
 
-  it('replaces a stale staging file rather than ever reading it, and never inherits its mode', async (t) => {
-    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t);
+  /* ----------------------------------------------------------------------- *
+   * Reading the access control the platform actually applies
+   *
+   * `fs.stat().mode` is the whole answer on POSIX and no answer at all on
+   * Windows, where it reports `0666` for every regular file whatever its real
+   * permissions are — so a mode assertion there would pass on a file every
+   * local user can rewrite. What has to be read there is the ACL, and the
+   * platform's own tool is what reads it.
+   *
+   * The assertions below are phrased over the SHAPE of the list rather than
+   * over account names, deliberately: a principal's display name is localized,
+   * so `OWNER RIGHTS` is not a string a test may depend on, while the inherited
+   * marker `(I)` and the permission code `(F)` are not. And every case that
+   * asserts a narrowed list also reads an unrestricted CONTROL file from the
+   * same directory, so a directory that happened to be private could never let
+   * one of these cases pass while proving nothing.
+   * ----------------------------------------------------------------------- */
+
+  /** Whether this platform expresses file permissions as an ACL. */
+  const RESTRICTS_BY_ACL = process.platform === 'win32';
+
+  /** The platform's access-control tool, by absolute path, or `null`. */
+  const ACL_TOOL = RESTRICTS_BY_ACL
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'icacls.exe')
+    : null;
+
+  /** The well-known identifier for every authenticated local principal. */
+  const EVERY_AUTHENTICATED_USER = '*S-1-5-11';
+
+  /**
+   * The access-control entries on one file or directory, as text.
+   *
+   * @param {string} target The path to inspect.
+   * @returns {Array<string>} One entry per ACE, the target's own name removed.
+   */
+  const aclEntriesOf = (target) =>
+    execFileSync(ACL_TOOL, [target], { encoding: 'utf8', windowsHide: true })
+      .split(/\r?\n/u)
+      .map((line) => line.replace(target, '').trim())
+      .filter((line) => line !== '' && !/^Successfully processed/u.test(line));
+
+  /**
+   * Asserts a file carries exactly one access-control entry, granting full
+   * control and inherited from nothing.
+   *
+   * One entry is the whole property: the directories this suite works in carry
+   * inheritable entries for `Authenticated Users` and `Users`, so a file that
+   * still has them has more than one entry and at least one marked `(I)`.
+   *
+   * @param {string} target The file to inspect.
+   * @param {string} controlFile An unrestricted file in the same directory.
+   * @param {string} context What is being described, for the failure message.
+   * @returns {void}
+   */
+  const assertAclNarrowedToOwner = (target, controlFile, context) => {
+    const control = aclEntriesOf(controlFile);
+    assert.ok(
+      control.length > 1 && control.some((entry) => entry.includes('(I)')),
+      `${context}: the control file must show the directory really does donate inherited entries (${control.join(' | ')}), or this case proves nothing`
+    );
+
+    const entries = aclEntriesOf(target);
+    assert.strictEqual(
+      entries.length,
+      1,
+      `${context}: exactly one access-control entry must remain, not ${entries.length} (${entries.join(' | ')})`
+    );
+    assert.ok(
+      !entries[0].includes('(I)'),
+      `${context}: the remaining entry must not be inherited from the directory (${entries[0]})`
+    );
+    assert.ok(
+      entries[0].includes('(F)'),
+      `${context}: and it must grant its owner full control, or the service could not read back what it wrote (${entries[0]})`
+    );
+  };
+
+  it('replaces a stale staging file rather than ever reading it, and never inherits its permissions', async (t) => {
+    const { store, storeFile, temporaryFile, directory } = await makeIsolatedStore(t);
     /* What a dead process might have left: a truncated document, or bytes
      * that are not a document at all. Either way the next write replaces it,
      * so its contents can never be mistaken for the store. */
@@ -5974,17 +6762,33 @@ describe('atomic replacement and the write mutex', () => {
 
     /* And planted PERMISSIVE, which is the second half of what a stale file
      * can donate. A writer that truncated this file in place would keep its
-     * mode, and the rename would then publish the store with it — so the
-     * store's own mode is what proves the staging file was recreated rather
-     * than reused. Windows honours only the write bit through `chmod`, hence
-     * the gate: the platform cannot express the fixture. */
+     * permissions, and the rename would then publish the store with them — so
+     * the published store's own permissions are what prove the staging file was
+     * recreated rather than reused.
+     *
+     * The fixture is planted in whichever terms the platform honours, because
+     * neither expression works on the other: a mode where the mode is the
+     * access control, and an explicit entry for every authenticated principal
+     * where it is an ACL. */
     const posix = typeof process.getuid === 'function';
+    const controlFile = path.join(directory, 'inherits-everything.json');
+    await writeBytes(controlFile, 'a file nothing restricted\n');
     await fs.chmod(temporaryFile, 0o666);
     if (posix) {
       assert.strictEqual(
         (await fs.stat(temporaryFile)).mode & 0o777,
         0o666,
         'the fixture must actually be permissive, or this case proves nothing about inheritance'
+      );
+    }
+    if (RESTRICTS_BY_ACL) {
+      execFileSync(ACL_TOOL, [temporaryFile, '/grant', `${EVERY_AUTHENTICATED_USER}:(F)`], {
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      assert.ok(
+        aclEntriesOf(temporaryFile).some((entry) => !entry.includes('(I)')),
+        'the fixture must really carry an entry of its own for every authenticated principal, or this case proves nothing about inheritance'
       );
     }
 
@@ -6010,6 +6814,13 @@ describe('atomic replacement and the write mutex', () => {
         stored.mode & 0o777,
         0o600,
         'the store must be owner-only: a stale staging file truncated in place would have donated its permissive mode to it'
+      );
+    }
+    if (RESTRICTS_BY_ACL) {
+      assertAclNarrowedToOwner(
+        storeFile,
+        controlFile,
+        'a store published over a stale staging file that every authenticated principal could write'
       );
     }
   });
@@ -6151,17 +6962,24 @@ describe('atomic replacement and the write mutex', () => {
   it('publishes the store as a private regular file, and stages it as one too', async (t) => {
     /* The store holds submitted student data, and loopback-only reachability
      * protects it from the network and not from another local principal. So
-     * the staging file is created `0600` and the rename carries that mode
-     * onto the store.
+     * the staged file is restricted to its owner BEFORE any byte is written,
+     * and the rename carries that restriction onto the store.
      *
-     * Both platforms get a real assertion. POSIX can state the mode exactly.
-     * Windows honours only the write bit and inherits the directory's ACLs,
-     * so what is assertable there is that the published file is a regular
-     * file with exactly one name — which is the property a planted link or an
-     * adopted directory would break. */
+     * Both platforms get a real assertion, of the mechanism each one actually
+     * honours: POSIX states the mode exactly, and where permissions are an
+     * inherited ACL the list itself is read — because there the mode is not
+     * the access control and `fs.stat` reports `0666` regardless. Both also
+     * assert the published file is a regular file with exactly one name, which
+     * is the property a planted link or an adopted directory would break. */
     const context = 'a store published by a successful write';
     const posix = typeof process.getuid === 'function';
-    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'private.json');
+    const { store, storeFile, temporaryFile, directory } = await makeIsolatedStore(
+      t,
+      'private.json'
+    );
+    /* Written the ordinary way, so it carries whatever the directory donates. */
+    const controlFile = path.join(directory, 'inherits-everything.json');
+    await writeBytes(controlFile, 'a file nothing restricted\n');
 
     await store.addActivity('S001', 'Chess Club');
 
@@ -6180,6 +6998,16 @@ describe('atomic replacement and the write mutex', () => {
         `${context}: and owned by the process that wrote it`
       );
     }
+    if (RESTRICTS_BY_ACL) {
+      assertAclNarrowedToOwner(storeFile, controlFile, `${context}, whose permissions are an ACL`);
+      /* And the service can still read the document it just restricted —
+       * otherwise the narrowing would have locked out its own read path. */
+      assert.strictEqual(
+        (await readDocument(storeFile)).schemaVersion,
+        1,
+        `${context}: the narrowed store must still be readable by the account that wrote it`
+      );
+    }
 
     /* The STAGED file's own mode, which is only observable while a staged
      * file exists — so it is statted INSIDE the rename, the moment before the
@@ -6188,9 +7016,11 @@ describe('atomic replacement and the write mutex', () => {
      * staged file. This is the file that becomes the store, so a permissive
      * mode here would be published by the next successful rename. */
     let stagedAtPublish;
+    let stagedAclAtPublish;
     t.mock.method(fs, 'rename', async () => {
       if (stagedAtPublish === undefined) {
         stagedAtPublish = await fs.stat(temporaryFile);
+        stagedAclAtPublish = RESTRICTS_BY_ACL ? aclEntriesOf(temporaryFile) : null;
       }
       const refusal = new Error('scripted rename refusal, raised by the test harness');
       refusal.code = 'EPERM';
@@ -6218,6 +7048,21 @@ describe('atomic replacement and the write mutex', () => {
         `${context}: the staged file must be owner-only before it ever becomes the store`
       );
     }
+    if (RESTRICTS_BY_ACL) {
+      /* The staged file is the one that BECOMES the store, so an inherited
+       * entry here is an inherited entry on every document this service ever
+       * publishes. Read at the publish moment, which is the only time a staged
+       * file exists: a publish refused for good removes it. */
+      assert.deepStrictEqual(
+        stagedAclAtPublish.length,
+        1,
+        `${context}: the staged file must carry exactly one access-control entry before the rename adopts it, not ${stagedAclAtPublish.length} (${stagedAclAtPublish.join(' | ')})`
+      );
+      assert.ok(
+        !stagedAclAtPublish[0].includes('(I)'),
+        `${context}: and that entry must not be one the directory donated (${stagedAclAtPublish[0]})`
+      );
+    }
     assert.strictEqual(
       await exists(temporaryFile),
       false,
@@ -6225,6 +7070,249 @@ describe('atomic replacement and the write mutex', () => {
     );
 
     t.mock.restoreAll();
+  });
+
+  it('refuses the write when the staged file cannot be restricted to its owner, and recovers once it can', async (t) => {
+    /* The restriction is not advisory. A staged file whose permissions could
+     * not be narrowed must never become the store: publishing it would leave a
+     * document every local principal can rewrite, and this service serves that
+     * document straight back out of the read route. So the disposition is the
+     * ordinary write refusal — `E_STORE_WRITE_FAILED`, the previous document
+     * intact, nothing left staged — and the queue behind it must not jam.
+     *
+     * The fault is injected into whichever mechanism the platform actually
+     * uses, because neither exists on the other: the access-control tool where
+     * permissions are an ACL, and the descriptor's own `chmod` where the mode
+     * is the access control. Both paths reach the same refusal, so both
+     * platforms get a real assertion rather than a case that skips. */
+    const context = 'a staged file whose permissions could not be restricted';
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'unrestrictable.json');
+
+    /* One successful write first, so "the previous document is intact" has a
+     * document to be true of. */
+    await store.addActivity('S001', 'Chess Club');
+    const before = await fs.readFile(storeFile);
+
+    if (RESTRICTS_BY_ACL) {
+      t.mock.method(childProcess, 'execFile', (file, args, options, callback) => {
+        const refusal = new Error(
+          'scripted access-control tool refusal, raised by the test harness'
+        );
+        /* A non-zero exit status, which is how the real tool reports that it
+         * could not set the list — on a filesystem that has none, for
+         * instance. A number rather than a string, exactly as the runtime
+         * reports it, so the store's own fault description is exercised too. */
+        refusal.code = 1;
+        process.nextTick(() => callback(refusal, '', ''));
+      });
+    } else {
+      const realOpen = fs.open;
+      t.mock.method(fs, 'open', async (...args) => {
+        const handle = await realOpen.apply(fs, args);
+        /* Shadows the prototype's method for this handle only, which is the
+         * one step of the write that restricts the file on this platform. */
+        handle.chmod = async () => {
+          const refusal = new Error('scripted chmod refusal, raised by the test harness');
+          refusal.code = 'EPERM';
+          throw refusal;
+        };
+        return handle;
+      });
+    }
+
+    assertCode(
+      await captureRejection(store.addActivity('S002', 'Quiz Club'), context),
+      E_STORE_WRITE_FAILED,
+      context
+    );
+    await assertBytesUnchanged(storeFile, before, context);
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: the file it could not restrict must not be left at rest either`
+    );
+
+    t.mock.restoreAll();
+
+    const recovered = await store.addActivity('S002', 'Quiz Club');
+    assert.strictEqual(
+      recovered.created,
+      true,
+      `${context}: once the fault clears the next submission must go through — a jammed write queue fails exactly here`
+    );
+    const document = await readDocument(storeFile);
+    assert.ok(
+      document.activities.some(
+        (record) => record.studentId === 'S002' && record.activity === 'Quiz Club'
+      ),
+      `${context}: and the record it refused earlier must be in the store now`
+    );
+    if (RESTRICTS_BY_ACL) {
+      assert.strictEqual(
+        aclEntriesOf(storeFile).length,
+        1,
+        `${context}: and the document published after the fault must be restricted like any other`
+      );
+    }
+  });
+
+  it('refuses the write when the platform access-control tool cannot be located, and recovers when it can', async (t) => {
+    /* The tool is found ONCE, at load, under the system root the platform
+     * publishes — by absolute path, because a bare name would be searched for
+     * in the working directory first and a file dropped there would be run in
+     * its place. Pointing that root at a directory holding no tool is
+     * therefore how a host without one is reproduced, and the disposition must
+     * be a refusal: a store this module cannot restrict must not be created at
+     * all, not created unprotected.
+     *
+     * Where the access control is the MODE there is no tool to lose, and the
+     * case asserts exactly that instead — a successful write that runs no
+     * external command at all. */
+    const context = 'a host whose access-control tool cannot be located';
+    const { store, storeFile, temporaryFile, directory } = await makeIsolatedStore(
+      t,
+      'tool-missing.json'
+    );
+    if (!RESTRICTS_BY_ACL) {
+      const commands = [];
+      t.mock.method(childProcess, 'execFile', (file) => {
+        commands.push(file);
+      });
+      await store.addActivity('S001', 'Chess Club');
+      t.mock.restoreAll();
+
+      assert.deepStrictEqual(
+        commands,
+        [],
+        `${context}: where the mode is the access control the store must run no external command at all`
+      );
+      assert.strictEqual(
+        (await fs.stat(storeFile)).mode & 0o777,
+        0o600,
+        `${context}: and the mode alone must have restricted the published store`
+      );
+      return;
+    }
+
+    const emptyRoot = path.join(directory, 'no-tool-here');
+    await fs.mkdir(emptyRoot);
+    const controlFile = path.join(directory, 'inherits-everything.json');
+    await writeBytes(controlFile, 'a file nothing restricted\n');
+    const realSystemRoot = process.env.SystemRoot;
+
+    await store.addActivity('S001', 'Chess Club');
+    const before = await fs.readFile(storeFile);
+
+    try {
+      process.env.SystemRoot = emptyRoot;
+      const withoutTool = freshStore(storeFile);
+      assertCode(
+        await captureRejection(withoutTool.addActivity('S002', 'Quiz Club'), context),
+        E_STORE_WRITE_FAILED,
+        context
+      );
+      await assertBytesUnchanged(storeFile, before, context);
+      assert.strictEqual(
+        await exists(temporaryFile),
+        false,
+        `${context}: and nothing may be staged by a write that could never have been published`
+      );
+    } finally {
+      /* Process-global, so it is restored whether the assertions held or not —
+       * and `delete` rather than an assignment, because assigning `undefined`
+       * would leave the string "undefined" behind for every later case. */
+      if (realSystemRoot === undefined) {
+        delete process.env.SystemRoot;
+      } else {
+        process.env.SystemRoot = realSystemRoot;
+      }
+      freshStore(BOOTSTRAP_STORE_PATH);
+    }
+
+    const recovered = freshStore(storeFile);
+    assert.strictEqual(
+      (await recovered.addActivity('S002', 'Quiz Club')).created,
+      true,
+      `${context}: and with the tool findable again the submission must go through`
+    );
+    assertAclNarrowedToOwner(storeFile, controlFile, `${context}, once the tool is findable again`);
+  });
+
+  it('refuses to publish a staged file whose name was taken over while its permissions were being set', async (t) => {
+    /* THE ONE WINDOW THE RESTRICTION CANNOT CLOSE BY ITSELF. Where permissions
+     * are an ACL they are set by PATH — the platform offers no by-descriptor
+     * equivalent — so between this module creating the staging file and the
+     * tool opening it, a principal with delete rights in the store directory
+     * could take that name over. The store compares the name's identity
+     * against its own descriptor's on both sides of the call, so the outcome
+     * is a refusal rather than a document published with someone else's
+     * permissions, or worse, someone else's bytes.
+     *
+     * The takeover is performed from inside the substituted tool, which is
+     * exactly the moment the real one would be running, and the substitute
+     * then reports SUCCESS — so nothing but the identity check can catch it.
+     *
+     * Where the access control is the mode there is no such window: it is set
+     * on the descriptor, which no name can redirect. That platform asserts the
+     * absence positively — no external command runs at all — in the case
+     * above. */
+    const context = 'a staging name taken over while permissions were being set';
+    if (!RESTRICTS_BY_ACL) {
+      /* Nothing to guard where no path is involved, and the mode path is
+       * pinned by the cases above. Asserting the shape of the platform here
+       * would restate `RESTRICTS_BY_ACL`, so this case simply does not apply. */
+      assert.strictEqual(
+        typeof process.getuid,
+        'function',
+        'a platform that is neither mode-based nor ACL-based would leave the staged file unrestricted by either mechanism'
+      );
+      return;
+    }
+
+    const { store, storeFile, temporaryFile } = await makeIsolatedStore(t, 'taken-over.json');
+    await store.addActivity('S001', 'Chess Club');
+    const before = await fs.readFile(storeFile);
+    const decoy = 'a document this store never staged\n';
+
+    t.mock.method(childProcess, 'execFile', (file, args, options, callback) => {
+      /* Remove the file the store created and put a different one at its name,
+       * which is what a local process with delete rights in the directory
+       * could do at precisely this instant. */
+      fsSync.unlinkSync(temporaryFile);
+      fsSync.writeFileSync(temporaryFile, decoy);
+      process.nextTick(() => callback(null, '', ''));
+    });
+
+    assertCode(
+      await captureRejection(store.addActivity('S002', 'Quiz Club'), context),
+      E_STORE_WRITE_FAILED,
+      context
+    );
+
+    t.mock.restoreAll();
+
+    await assertBytesUnchanged(storeFile, before, context);
+    assert.ok(
+      !(await fs.readFile(storeFile, 'utf8')).includes('never staged'),
+      `${context}: the substituted file's bytes must not have reached the store`
+    );
+    assert.strictEqual(
+      await exists(temporaryFile),
+      false,
+      `${context}: and the staging name must be clear again afterwards`
+    );
+
+    const recovered = await store.addActivity('S002', 'Quiz Club');
+    assert.strictEqual(
+      recovered.created,
+      true,
+      `${context}: with nothing interfering, the same submission must go through`
+    );
+    assert.strictEqual(
+      aclEntriesOf(storeFile).length,
+      1,
+      `${context}: and that document must be restricted like any other`
+    );
   });
 
   it('serializes twenty-five concurrent submissions with no lost update and no duplicate key', async (t) => {

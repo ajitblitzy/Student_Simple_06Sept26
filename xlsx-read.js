@@ -26,6 +26,25 @@
  * names the offending detail; the function that enforces a limit documents
  * that limit in full.
  *
+ * NOTHING LEAVES THIS MODULE UNCODED, and that is a stronger claim than "every
+ * declared limit is a refusal". Three kinds of failure can end a call here and
+ * all three carry a `code`, because a caller that has to tell them apart by
+ * matching message text has no contract at all:
+ *
+ *   - A PACKAGE REFUSAL — the nine codes below. The package, or the part inside
+ *     it, falls outside the subset this reader supports.
+ *   - A CALLER FAULT — `E_XLSX_INVALID_ARGUMENT`, described after the nine. It
+ *     is thrown as a `TypeError`, so a caller bug still reads as a caller bug,
+ *     and it carries a code so a caller dispatching on code does not fall
+ *     through to a generic handler for the one failure that is its own fault.
+ *   - A FILESYSTEM FAILURE THE RUNTIME RAISES — translated, never propagated.
+ *     `fs` reports a missing package as `ENOENT`, and an `ENOENT` escaping this
+ *     module would be a code from `node:fs` appearing in a contract that
+ *     nowhere declares one. Every such errno becomes
+ *     `E_XLSX_UNSUPPORTED_SOURCE` with the errno named in the message.
+ *
+ * The nine package refusals, each with the condition it names:
+ *
  *   E_XLSX_UNSUPPORTED_COMPRESSION  A compression method other than DEFLATE
  *                (8) or STORED (0). Still-compressed bytes are never handed
  *                back as though they were XML, which would be a silent
@@ -35,11 +54,16 @@
  *                set data-descriptor bit (0x8) means the local header's size
  *                fields are zero and cannot be trusted, which would make the
  *                walk itself wrong.
- *   E_XLSX_UNSUPPORTED_SOURCE  A package that is not a REGULAR FILE. A
- *                directory, a pipe, a socket or a device is refused naming the
- *                kind: such a source has no size that can be bounded before it
- *                is read, and several of them report a size of zero and then
- *                yield bytes without end.
+ *   E_XLSX_UNSUPPORTED_SOURCE  A package this reader cannot read AS A BOUNDED
+ *                REGULAR FILE, which covers two conditions. One is a source
+ *                that opens but is not a regular file: a directory, a pipe, a
+ *                socket or a device is refused naming the kind, because such a
+ *                source has no size that can be bounded before it is read, and
+ *                several of them report a size of zero and then yield bytes
+ *                without end. The other is a source that cannot be opened at
+ *                all — absent, or unreadable to this process — where the errno
+ *                the runtime reported is named in the message and the
+ *                diagnostic's `reason` distinguishes the cases.
  *   E_XLSX_PART_NOT_FOUND  A requested part the package does not hold. Any
  *                part it does hold can be fetched by name.
  *   E_XLSX_SHARED_STRINGS_UNSUPPORTED  A `t="s"` cell. The cell types read are
@@ -64,7 +88,12 @@
  *                leaves trailing junk behind it, and a part whose XML ends
  *                inside a start tag or without its closing tag.
  *   E_XLSX_MALFORMED_XML  An interpreted part that is not valid UTF-8, or whose
- *                structure this reader relies on is broken: an attribute with
+ *                structure this reader relies on is broken: a part holding NO
+ *                ROOT ELEMENT at all, a part whose root is NOT `<worksheet>`,
+ *                a `<worksheet>` holding NO `<sheetData>` — none of which can
+ *                yield cells, and answering "no rows" for one would report
+ *                absence of data where the truth is absence of a worksheet —
+ *                an attribute with
  *                no value, a stray delimiter where an attribute name belongs,
  *                an unquoted or repeated attribute, a raw `<` inside a tag or
  *                an attribute value, character data outside the root element,
@@ -92,6 +121,22 @@
  *                a part is measured while it inflates, so neither a large file,
  *                a file that grows under the reader, nor a small
  *                highly-compressed one can exhaust the process.
+ *
+ * And the tenth code, which is deliberately NOT one of the nine, because it
+ * describes the CALL rather than the package:
+ *
+ *   E_XLSX_INVALID_ARGUMENT  An argument this module cannot act on: a
+ *                `filePath` or `partName` that is not a non-empty string, a
+ *                `columnLetter` that does not name a column from A to XFD, or
+ *                a `columnLetters` selection that is neither null nor a
+ *                non-empty array of such letters. Thrown as a `TypeError`,
+ *                which is what it is — a programmer error, reported at the
+ *                call that made it and never a property of the bytes on disk.
+ *                It carries a code all the same, so a caller may dispatch on
+ *                `err.code` for every failure this module has rather than for
+ *                most of them, and it is kept out of the nine so that a caller
+ *                sorting its own bugs from a package's faults can still do so
+ *                by code alone.
  *
  * Every entry is checked as the chain is walked, not only the entry being
  * fetched: a package holding an entry this reader cannot read is not a package
@@ -202,6 +247,10 @@ const CODE_TRUNCATED = 'E_XLSX_TRUNCATED';
 const CODE_MALFORMED_XML = 'E_XLSX_MALFORMED_XML';
 const CODE_LIMIT_EXCEEDED = 'E_XLSX_LIMIT_EXCEEDED';
 
+/* The caller-fault code, separate from the nine above for the reason the
+ * header gives: it classifies the call, not the package. */
+const CODE_INVALID_ARGUMENT = 'E_XLSX_INVALID_ARGUMENT';
+
 /* ------------------------------------------------------------------------- *
  * Error codes raised by the runtime, translated into the refusals above so no
  * caller ever has to match on a zlib or encoding failure of its own.
@@ -215,6 +264,7 @@ const RUNTIME_TRAILING_JUNK = 'ERR_TRAILING_JUNK_AFTER_STREAM_END';
 const CELL_TYPE_INLINE_STRING = 'inlineStr';
 const CELL_TYPE_SHARED_STRING = 's';
 const CELL_TYPE_NUMBER = 'n';
+const ELEMENT_WORKSHEET = 'worksheet';
 const ELEMENT_SHEET_DATA = 'sheetData';
 const ELEMENT_ROW = 'row';
 const ELEMENT_CELL = 'c';
@@ -241,8 +291,19 @@ const NUMERIC_VALUE_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]
  * — a value hiding where the scan will find it and attribute it to the wrong
  * place. `is` and `r` both appear for `<t>`: `<is><t>` is the plain inline
  * string these workbooks write, and `<is><r><t>` is the rich-text form whose
- * runs make up one logical value. */
+ * runs make up one logical value.
+ *
+ * `sheetData` is on the list because the descent starts there, and its start is
+ * found by the same text scan: a `<sheetData>` sitting under `<sheetPr>`, under
+ * some element this reader does not interpret, or under a root that is not a
+ * worksheet at all would be found and its rows read as the worksheet's own.
+ * ECMA-376 makes `sheetData` a direct child of `worksheet` and requires exactly
+ * one, so constraining it costs no legitimate package and closes the one place
+ * a whole fabricated grid could hide — which also makes the "a worksheet must
+ * hold a `<sheetData>`" refusal in `readSheetRows` mean what it says, rather
+ * than being satisfiable by a `<sheetData>` hidden anywhere in the part. */
 const INTERPRETED_ELEMENT_PARENTS = new Map([
+  [ELEMENT_SHEET_DATA, [ELEMENT_WORKSHEET]],
   [ELEMENT_ROW, [ELEMENT_SHEET_DATA]],
   [ELEMENT_CELL, [ELEMENT_ROW]],
   [ELEMENT_VALUE, [ELEMENT_CELL]],
@@ -365,6 +426,10 @@ const NAMED_XML_ENTITIES = {
  * a caller that logs the whole object still writes no path and no cell value
  * anywhere.
  *
+ * `refuseArgument` below builds the same shape for a caller fault, so a caller
+ * reads `code`, `diagnostic.reason` and `message` off every error this module
+ * throws without first asking which kind it is.
+ *
  * @param {string} code One of the CODE_* constants above.
  * @param {string} message Names the offending detail.
  * @param {string} reason The stable token for this refusal.
@@ -377,6 +442,32 @@ function refuse(code, message, reason, at = null, number = null) {
   const error = new Error(message);
   error.code = code;
   error.diagnostic = Object.freeze({ reason, detail: null, at, number });
+  return error;
+}
+
+/**
+ * Builds a caller fault — an argument this module cannot act on.
+ *
+ * A `TypeError` rather than a plain `Error`, because that is what the failure
+ * is: the call is wrong, not the file. It nevertheless carries `code` and the
+ * same frozen `diagnostic` shape as `refuse` above, for the reason the module
+ * header gives — a caller dispatching on `err.code` must not have exactly one
+ * failure of this module fall through to a generic handler, least of all the
+ * one that is its own bug and the easiest to fix once named.
+ *
+ * `detail`, `at` and `number` are null here and always will be. There is no
+ * underlying fault to name, no position in a package to point at — nothing has
+ * been opened — and no bounded field to report. The `reason` token carries the
+ * whole classification: WHICH argument contract was broken.
+ *
+ * @param {string} message Names the parameter and what it must be.
+ * @param {string} reason The stable token for this argument fault.
+ * @returns {TypeError} An error carrying `code` and a frozen `diagnostic`.
+ */
+function refuseArgument(message, reason) {
+  const error = new TypeError(message);
+  error.code = CODE_INVALID_ARGUMENT;
+  error.diagnostic = Object.freeze({ reason, detail: null, at: null, number: null });
   return error;
 }
 
@@ -399,17 +490,20 @@ function describeValue(value) {
 
 /**
  * Guards a required string argument. An argument fault is a programmer error
- * rather than a property of the package, so it is a TypeError and carries none
- * of the declared XLSX refusal codes.
+ * rather than a property of the package, so it is a TypeError carrying
+ * `E_XLSX_INVALID_ARGUMENT` and none of the nine package-refusal codes.
  *
  * @param {unknown} value The argument to check.
  * @param {string} parameterName Name used in the message.
  * @returns {string} `value`, once proven to be a non-empty string.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when the value is not a
+ *   non-empty string.
  */
 function requireNonEmptyString(value, parameterName) {
   if (typeof value !== 'string' || value.length === 0) {
-    throw new TypeError(
-      `xlsx-read: ${parameterName} must be a non-empty string; received ${describeValue(value)}`
+    throw refuseArgument(
+      `xlsx-read: ${parameterName} must be a non-empty string; received ${describeValue(value)}`,
+      'argument_not_non_empty_string'
     );
   }
   return value;
@@ -427,12 +521,13 @@ function requireNonEmptyString(value, parameterName) {
  * checked against the last column of the ECMA-376 grid, so the accepted set
  * is exactly the A-to-XFD range this function's message promises. A column
  * outside it is a caller fault rather than a property of a package, so it is a
- * TypeError and carries none of the declared XLSX refusal codes.
+ * TypeError carrying `E_XLSX_INVALID_ARGUMENT` and none of the nine
+ * package-refusal codes.
  *
  * @param {unknown} columnLetter For example `'A'`, `'c'`, or `'AA'`.
  * @returns {string} The uppercase letters.
- * @throws {TypeError} When the value is not 1 to 3 ASCII letters naming a
- *   column from A to XFD.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when the value is not 1 to 3
+ *   ASCII letters naming a column from A to XFD.
  */
 function normalizeColumnLetter(columnLetter) {
   requireNonEmptyString(columnLetter, 'columnLetter');
@@ -440,8 +535,9 @@ function normalizeColumnLetter(columnLetter) {
     !ASCII_COLUMN_LETTERS_PATTERN.test(columnLetter) ||
     columnIndexFromLetters(columnLetter.toUpperCase()) > MAX_COLUMN_INDEX
   ) {
-    throw new TypeError(
-      `xlsx-read: columnLetter must be 1 to ${MAX_COLUMN_LETTERS} ASCII letters naming a column from A to ${LAST_COLUMN_LETTERS}; received ${JSON.stringify(columnLetter)}`
+    throw refuseArgument(
+      `xlsx-read: columnLetter must be 1 to ${MAX_COLUMN_LETTERS} ASCII letters naming a column from A to ${LAST_COLUMN_LETTERS}; received ${JSON.stringify(columnLetter)}`,
+      'argument_not_column_letters'
     );
   }
   return columnLetter.toUpperCase();
@@ -457,15 +553,17 @@ function normalizeColumnLetter(columnLetter) {
  *
  * @param {unknown} columnLetters `null`, `undefined`, or an array of letters.
  * @returns {Set<string>|null} The uppercase letters, or null for every column.
- * @throws {TypeError} When the value is neither of those shapes.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when the value is neither of
+ *   those shapes, or holds a letter that names no column.
  */
 function normalizeColumnSelection(columnLetters) {
   if (columnLetters === null || columnLetters === undefined) {
     return null;
   }
   if (!Array.isArray(columnLetters) || columnLetters.length === 0) {
-    throw new TypeError(
-      `xlsx-read: columnLetters must be null or a non-empty array of column letters; received ${Array.isArray(columnLetters) ? 'an empty array' : describeValue(columnLetters)}`
+    throw refuseArgument(
+      `xlsx-read: columnLetters must be null or a non-empty array of column letters; received ${Array.isArray(columnLetters) ? 'an empty array' : describeValue(columnLetters)}`,
+      'argument_not_column_selection'
     );
   }
   return new Set(columnLetters.map((letter) => normalizeColumnLetter(letter)));
@@ -624,15 +722,26 @@ function codePointToString(codePoint, original) {
 /**
  * Validates an interpreted part as XML, before a single element is matched.
  *
- * The index it returns is where the part's interpreted content begins — just
- * past the XML declaration, if there is one. Element matching starts THERE
- * rather than at zero, so no search ever re-enters the one region this pass
- * consumed whole instead of walking.
+ * `contentStart` is where the part's interpreted content begins — just past
+ * the XML declaration, if there is one. Element matching starts THERE rather
+ * than at zero, so no search ever re-enters the one region this pass consumed
+ * whole instead of walking.
+ *
+ * The other two fields are facts this pass establishes anyway, as the only
+ * code that sees the whole part in document order, and that the caller cannot
+ * recover afterwards: WHAT the root element is, and HOW MANY `<sheetData>`
+ * elements the part holds. A scan for `<sheetData` cannot answer either — it
+ * finds a first match or none, which is the same answer for a worksheet that
+ * holds no rows and for a part that is not a worksheet at all. Reporting them
+ * is what lets `readSheetRows` refuse a part that cannot yield cells instead of
+ * reporting it as empty.
  *
  * @param {string} xml The decoded part.
  * @param {string} partName Part name, for the refusal messages.
  * @param {string} filePath Package path, for the refusal messages.
- * @returns {number} The index at which interpreted content begins.
+ * @returns {{contentStart: number, rootName: string|null, sheetDataElements: number}}
+ *   Where interpreted content begins, the name of the root element or null
+ *   when the part holds none, and the number of `<sheetData>` elements found.
  * @throws {Error} E_XLSX_MALFORMED_XML for a comment, a CDATA section, a
  *   markup declaration, a malformed or over-permissive XML declaration, a
  *   processing instruction, a raw `<` inside a tag, character data outside the
@@ -645,6 +754,7 @@ function validateInterpretedStructure(xml, partName, filePath) {
   let index = contentStart;
   const open = [];
   let roots = 0;
+  let rootName = null;
   let sheetDataElements = 0;
 
   while (index < xml.length) {
@@ -685,6 +795,7 @@ function validateInterpretedStructure(xml, partName, filePath) {
           'xml_second_root_element'
         );
       }
+      rootName = tag.name;
     }
     if (tag.name === ELEMENT_SHEET_DATA) {
       sheetDataElements += 1;
@@ -714,7 +825,7 @@ function validateInterpretedStructure(xml, partName, filePath) {
       'xml_element_unclosed'
     );
   }
-  return contentStart;
+  return { contentStart, rootName, sheetDataElements };
 }
 
 /**
@@ -1530,16 +1641,24 @@ function describeFlag(flag) {
  *      a hint for how much to allocate and the CEILING as the only limit it
  *      trusts — it stops one byte past the ceiling and refuses that byte.
  *
+ * Every `node:fs` failure along that path is TRANSLATED rather than
+ * propagated. A missing package is the ordinary case — a caller naming a
+ * workbook that is not there — and letting `fs` answer it with a raw `ENOENT`
+ * would put a code this module never declared into a contract that promises
+ * `E_XLSX_*` and nothing else, leaving a caller that dispatches on `code` to
+ * fall through to a generic handler for the most common fault of all.
+ *
  * @param {string} filePath Path to the package, used exactly as given.
  * @returns {Buffer} The whole package.
- * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE when the source is not a regular
- *   file, or E_XLSX_LIMIT_EXCEEDED when its bytes are past the ceiling —
- *   whether that is what the descriptor reported or what the read found.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE when the source cannot be opened
+ *   at all or is not a regular file, or E_XLSX_LIMIT_EXCEEDED when its bytes
+ *   are past the ceiling — whether that is what the descriptor reported or
+ *   what the read found.
  */
 function readPackageBuffer(filePath) {
-  const descriptor = fs.openSync(filePath, 'r');
+  const descriptor = openPackageDescriptor(filePath);
   try {
-    const stats = fs.fstatSync(descriptor);
+    const stats = statPackageDescriptor(descriptor, filePath);
     if (!stats.isFile()) {
       throw refuse(
         CODE_UNSUPPORTED_SOURCE,
@@ -1559,6 +1678,80 @@ function readPackageBuffer(filePath) {
     return readDescriptorBounded(descriptor, filePath, stats.size);
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+/**
+ * Opens a package for reading, translating a failure to open it.
+ *
+ * The three classes are told apart by `reason` rather than lumped together,
+ * because they call for different actions and the difference is the whole
+ * diagnostic value of the refusal: a package that is absent is a path to
+ * correct, one that is unreadable is a permission to grant, and a directory
+ * offered as a package is a caller looking at the wrong thing. The errno stays
+ * in the message, which is where this module puts every offending detail.
+ *
+ * `EISDIR` shares `source_not_regular_file` with the `fstat` check below on
+ * purpose. Platforms disagree about whether a directory can be opened at all —
+ * it opens on Windows and fails with `EISDIR` elsewhere — and a caller should
+ * not have to know which platform it is on to recognize the same fault.
+ *
+ * @param {string} filePath Path to the package, used exactly as given.
+ * @returns {number} An open, readable descriptor positioned at 0.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE, always — no `node:fs` errno
+ *   leaves this module.
+ */
+function openPackageDescriptor(filePath) {
+  try {
+    return fs.openSync(filePath, 'r');
+  } catch (cause) {
+    const errno = typeof cause?.code === 'string' ? cause.code : null;
+    if (errno === 'ENOENT' || errno === 'ENOTDIR') {
+      /* ENOTDIR is the same answer for the same reason: a path whose parent is
+       * a file names nothing that exists either. */
+      throw refuse(
+        CODE_UNSUPPORTED_SOURCE,
+        `xlsx-read: ${filePath} does not exist, so there is no package to read (${errno})`,
+        'source_missing'
+      );
+    }
+    if (errno === 'EISDIR') {
+      throw refuse(
+        CODE_UNSUPPORTED_SOURCE,
+        `xlsx-read: ${filePath} is a directory rather than a regular file, so it cannot be opened as a package (${errno})`,
+        'source_not_regular_file'
+      );
+    }
+    throw refuse(
+      CODE_UNSUPPORTED_SOURCE,
+      `xlsx-read: ${filePath} could not be opened for reading (${errno ?? 'an unidentified fault'})`,
+      'source_unreadable'
+    );
+  }
+}
+
+/**
+ * Measures an open descriptor, translating a failure to measure it.
+ *
+ * Separate from the open above because it fails for its own reasons — a
+ * descriptor the platform will not `fstat` — and because a refusal that named
+ * the open would be pointing at the wrong operation.
+ *
+ * @param {number} descriptor An open descriptor.
+ * @param {string} filePath Package path, for the refusal message.
+ * @returns {import('node:fs').Stats} The descriptor's metadata.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE when the descriptor cannot be
+ *   measured, so its bytes cannot be bounded before they are read.
+ */
+function statPackageDescriptor(descriptor, filePath) {
+  try {
+    return fs.fstatSync(descriptor);
+  } catch (cause) {
+    throw refuse(
+      CODE_UNSUPPORTED_SOURCE,
+      `xlsx-read: ${filePath} could not be measured after it was opened (${typeof cause?.code === 'string' ? cause.code : 'an unidentified fault'}), so the bytes it would yield cannot be bounded before they are read`,
+      'source_unreadable'
+    );
   }
 }
 
@@ -1616,7 +1809,9 @@ function describeSourceKind(stats) {
  *   size the first allocation.
  * @returns {Buffer} Exactly the bytes read.
  * @throws {Error} E_XLSX_LIMIT_EXCEEDED when the source holds more than
- *   MAX_PACKAGE_BYTES bytes, whatever its metadata said.
+ *   MAX_PACKAGE_BYTES bytes, whatever its metadata said, or
+ *   E_XLSX_UNSUPPORTED_SOURCE when the read itself fails partway — the bytes
+ *   read so far are a fragment of a package and are never returned as one.
  */
 function readDescriptorBounded(descriptor, filePath, declaredSize) {
   const ceiling = MAX_PACKAGE_BYTES;
@@ -1640,7 +1835,17 @@ function readDescriptorBounded(descriptor, filePath, declaredSize) {
       buffer.copy(grown, 0, 0, filled);
       buffer = grown;
     }
-    const read = fs.readSync(descriptor, buffer, filled, capacity - filled, null);
+    let read;
+    try {
+      read = fs.readSync(descriptor, buffer, filled, capacity - filled, null);
+    } catch (cause) {
+      throw refuse(
+        CODE_UNSUPPORTED_SOURCE,
+        `xlsx-read: ${filePath} stopped being readable after ${filled} byte(s) (${typeof cause?.code === 'string' ? cause.code : 'an unidentified fault'})`,
+        'source_unreadable',
+        filled
+      );
+    }
     if (read === 0) {
       break;
     }
@@ -2054,8 +2259,10 @@ function decodePartText(bytes, partName, filePath) {
  *
  * @param {string} filePath Path to the .xlsx package, used exactly as given.
  * @returns {string[]} The part names, in package order.
- * @throws {TypeError} When `filePath` is not a non-empty string.
- * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE, E_XLSX_UNSUPPORTED_FLAGS,
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when `filePath` is not a
+ *   non-empty string.
+ * @throws {Error} E_XLSX_UNSUPPORTED_SOURCE — including for a package that is
+ *   absent or cannot be opened — E_XLSX_UNSUPPORTED_FLAGS,
  *   E_XLSX_UNSUPPORTED_COMPRESSION, E_XLSX_LIMIT_EXCEEDED or E_XLSX_TRUNCATED
  *   when the source or the package falls outside the supported subset.
  */
@@ -2078,7 +2285,8 @@ function listEntries(filePath) {
  *   `'xl/worksheets/sheet1.xml'` or `'[Content_Types].xml'`. Where a package
  *   holds the same name twice, the first entry wins.
  * @returns {Buffer} The part's bytes.
- * @throws {TypeError} When an argument is not a non-empty string.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when an argument is not a
+ *   non-empty string.
  * @throws {Error} E_XLSX_PART_NOT_FOUND when the part is absent, or one of the
  *   package-level refusals listed on `listEntries`.
  */
@@ -2108,9 +2316,20 @@ function readEntry(filePath, partName) {
  * object — and a column absent from a row produces no key on that row's
  * object.
  *
- * A part with no `<sheetData>` element yields an empty array rather than an
- * error, so asking a non-worksheet part for rows is answered with "no rows"
- * instead of a throw.
+ * A PART THAT IS NOT A WORKSHEET IS REFUSED, NOT REPORTED AS EMPTY. The part
+ * must hold a root element, that root must be `<worksheet>`, and it must hold a
+ * `<sheetData>`; a part failing any of those is refused with
+ * E_XLSX_MALFORMED_XML. An empty array means one thing only — a worksheet
+ * whose `<sheetData>` holds no `<row>` — and that distinction is the point:
+ * `[]` is a statement about the data, and this reader must not make it about a
+ * part that holds no data to speak of. A caller asking a non-worksheet part for
+ * rows has made a mistake, and hearing "no rows" would confirm it; the
+ * key-set read is exactly such a caller, and an empty key set is a service
+ * that validates nothing.
+ *
+ * `<sheetData/>` and `<sheetData></sheetData>` both still yield `[]`. An
+ * empty worksheet is a legitimate worksheet, and refusing one would refuse a
+ * package this reader can read perfectly well.
  *
  * `columnLetters` narrows WHICH VALUES are read, and nothing else. Omit it, or
  * pass null, and every populated column of each row is returned. Pass
@@ -2130,28 +2349,65 @@ function readEntry(filePath, partName) {
  *   document order, keyed by uppercase column letter. With a selection each
  *   object carries at most the selected columns; with no selection it carries
  *   every populated column of its row.
- * @throws {TypeError} When an argument is not a non-empty string, or
- *   `columnLetters` is neither null nor a non-empty array of column letters.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when an argument is not a
+ *   non-empty string, or `columnLetters` is neither null nor a non-empty array
+ *   of column letters.
  * @throws {Error} E_XLSX_SHARED_STRINGS_UNSUPPORTED for a `t="s"` cell,
  *   E_XLSX_UNSUPPORTED_CELL_TYPE for any other unsupported cell type or a
- *   numeric cell whose value is not a number, E_XLSX_MALFORMED_XML for
- *   undecodable or malformed worksheet XML — including a comment, a CDATA
- *   section, a processing instruction or a markup declaration, none of which
- *   this reader interprets or skips — or any of the refusals listed on
- *   `readEntry`.
+ *   numeric cell whose value is not a number, E_XLSX_MALFORMED_XML for a part
+ *   that is not a worksheet — no root element, a root other than
+ *   `<worksheet>`, or no `<sheetData>` — and for undecodable or malformed
+ *   worksheet XML, including a comment, a CDATA section, a processing
+ *   instruction or a markup declaration, none of which this reader interprets
+ *   or skips — or any of the refusals listed on `readEntry`.
  */
 function readSheetRows(filePath, partName, columnLetters = null) {
   const selection = normalizeColumnSelection(columnLetters);
   const xml = decodePartText(readEntry(filePath, partName), partName, filePath);
   /* Before a single element is matched: the scanning below is only sound on a
    * part whose markup-looking text is markup, and whose tags balance. The
-   * offset it returns is where interpreted content begins, so the search below
+   * offset it reports is where interpreted content begins, so the search below
    * never re-enters the XML declaration the pass consumed as a whole. */
-  const contentStart = validateInterpretedStructure(xml, partName, filePath);
+  const structure = validateInterpretedStructure(xml, partName, filePath);
+  const contentStart = structure.contentStart;
+
+  /* The three ways a part can fail to be a worksheet, each refused rather than
+   * answered with `[]`. The root checks come first because they describe the
+   * part as a whole: an HTML error page served in place of a package, or a
+   * file of whitespace, is not a worksheet holding no rows. */
+  if (structure.rootName === null) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} holds no root element at all, so it is not a worksheet and has no rows to read`,
+      'xml_no_root_element'
+    );
+  }
+  if (structure.rootName !== ELEMENT_WORKSHEET) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} has <${truncateForMessage(structure.rootName)}> as its root element where <${ELEMENT_WORKSHEET}> was expected, so it is not a worksheet part`,
+      'worksheet_root_missing'
+    );
+  }
+  if (structure.sheetDataElements === 0) {
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} is a <${ELEMENT_WORKSHEET}> holding no <${ELEMENT_SHEET_DATA}> element, which ECMA-376 requires, so it does not state its rows at all rather than stating that it has none`,
+      'worksheet_sheet_data_missing'
+    );
+  }
 
   const sheetDataStart = findElementStart(xml, ELEMENT_SHEET_DATA, contentStart, xml.length);
   if (sheetDataStart === -1) {
-    return [];
+    /* Unreachable while the pass above counts at least one: it walked this same
+     * text in document order. Kept as a refusal rather than a `[]` so that if
+     * the two ever disagree, the disagreement is reported instead of silently
+     * becoming "no rows". */
+    throw refuse(
+      CODE_MALFORMED_XML,
+      `xlsx-read: part ${partName} of ${filePath} holds a <${ELEMENT_SHEET_DATA}> element its structure pass counted but its element scan cannot locate`,
+      'worksheet_sheet_data_missing'
+    );
   }
   const sheetDataTag = parseStartTag(
     xml,
@@ -2230,9 +2486,10 @@ function readSheetRows(filePath, partName, columnLetters = null) {
  *   or `'C'`.
  * @returns {string[]} One value per `<row>` element in the part, in document
  *   order — the cell's value, or the empty string for a row with no cell in
- *   that column.
- * @throws {TypeError} When an argument is not a non-empty string, or
- *   `columnLetter` does not name a column from A to XFD.
+ *   that column. Empty only for a worksheet whose `<sheetData>` holds no row:
+ *   a part that is not a worksheet is refused, per `readSheetRows`.
+ * @throws {TypeError} E_XLSX_INVALID_ARGUMENT when an argument is not a
+ *   non-empty string, or `columnLetter` does not name a column from A to XFD.
  * @throws {Error} Any of the refusals listed on `readSheetRows`.
  */
 function readColumn(filePath, partName, columnLetter) {

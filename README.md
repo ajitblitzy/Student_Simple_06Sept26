@@ -185,10 +185,12 @@ Every JSON response is `application/json; charset=utf-8`; every HTML response is
 | Route and method | Status | Error code | Trigger | Extra headers |
 | --- | --- | --- | --- | --- |
 | `GET /activities` | `200` | — | the submission form (HTML) | — |
+| `HEAD /activities` | `200` | — | the form's headers, with no body | — |
 | `GET /activities/{id}` | `200` | — | `{"studentId":"S001","activities":[record,…]}` (JSON only) | — |
+| `HEAD /activities/{id}` | `200` | — | the read's headers, with no body | — |
 | `GET /activities/{id}` | `400` | `student_id_malformed` | path segment fails `/^S\d{3}$/` | — |
 | `GET /activities/{id}` | `404` | `student_not_found` | well-formed, absent from the key set | — |
-| `GET /activities/{id}` | `405` | `method_not_allowed` | any method other than `GET` | `Allow: GET` |
+| `GET /activities/{id}` | `405` | `method_not_allowed` | any method other than `GET` or `HEAD` | `Allow: GET, HEAD` |
 | `POST /activities` | `201` | — | `{"created":true,"record":{…}}`, or the HTML confirmation page | `Location: /activities/{studentId}` |
 | `POST /activities` | `200` | — | `{"created":false,"record":{…}}`, or the HTML already-recorded page | — |
 | `POST /activities` | `400` | `malformed_json` | body is not parseable JSON | — |
@@ -200,7 +202,7 @@ Every JSON response is `application/json; charset=utf-8`; every HTML response is
 | `POST /activities` | `413` | `payload_too_large` | body over 8,192 bytes | — |
 | `POST /activities` | `500` | `store_at_capacity` | the store is at a ceiling, so the record cannot be added — distinct from a write failure because the remedy is different | — |
 | `POST /activities` | `415` | `unsupported_media_type` | `Content-Type` missing, **declared more than once**, or neither accepted type | — |
-| any other method on `/activities` | `405` | `method_not_allowed` | — | `Allow: GET, POST` |
+| any method other than `GET`, `HEAD` or `POST` on `/activities` | `405` | `method_not_allowed` | — | `Allow: GET, HEAD, POST` |
 | any namespace path resolving to no route | `404` | `not_found` | e.g. `/activities/S001/extra` | — |
 | any route | `500` | `reference_data_unavailable` | a workbook read failed | — |
 | any route | `500` | `store_unreadable` | the store failed load validation | — |
@@ -210,8 +212,16 @@ Every JSON response is `application/json; charset=utf-8`; every HTML response is
 Two details of the table are easy to misread. A path is resolved to a route **before** its method is
 considered, so `DELETE /activities/S001/extra` is `404 not_found` and not `405` — a `405` with an
 `Allow` header would claim the resource exists and merely refuses the verb. And a `405` always names
-the methods of the route actually addressed, so `POST /activities/S001` answers `Allow: GET` rather
-than the namespace's `Allow: GET, POST`.
+the methods of the route actually addressed, so `POST /activities/S001` answers `Allow: GET, HEAD`
+rather than the namespace's `Allow: GET, HEAD, POST`.
+
+`HEAD` is answered wherever `GET` is, with the identical status and the identical headers —
+`Content-Length` included, announcing the size the `GET` body would have had — and no body at all.
+It does *not* stand in for `POST`: a `HEAD /activities` previews the form and never a submission, so
+it writes nothing and returns no `Location`, and every verb the `405` rows name is still refused. A
+`HEAD` on a malformed or unknown Student ID returns the same `400` or `404` a `GET` would, headers
+only, so the error envelope is announced by its content type and its length but is not carried —
+read the envelope itself with the `GET`.
 
 Only `POST /activities` with a **form-encoded** body renders HTML, and only for `201`, `200`, and the
 validation outcomes a person filling in the form can act on — `student_id_required`,
@@ -418,8 +428,26 @@ from the submission itself.
 
 ### Normalization
 
-Applied before a record is stored:
+Applied before a record is stored, in this order:
 
+- the **invisible formatting characters** are removed: U+00AD SOFT HYPHEN, U+180E MONGOLIAN VOWEL
+  SEPARATOR, U+200B–U+200F (the zero-width space, the zero-width non-joiner and joiner, and the
+  left-to-right and right-to-left marks), U+2060–U+2064 (the word joiner and the invisible math
+  operators) and U+FEFF. None of them is a space separator and none is a control character, so
+  without this step `Tennis Club` and `Tennis Club<ZWSP>` would be two activities that render
+  identically, and a label of nothing but zero-width characters would be stored as a record with
+  no visible content. They are removed rather than rejected because a paste from a web page or a
+  spreadsheet cell carries them unseen, and a refusal naming a character the submitter cannot see
+  is not actionable. The **direction controls** are deliberately *not* in that class —
+  U+202A–U+202E, U+2066–U+2069 and U+061C reorder visible text rather than padding it, so a label
+  carrying one is **accepted** and kept as submitted, and the served HTML wraps every interpolated
+  value in a `<bdi>` element so an unterminated override cannot reverse the sentence around it.
+  Variation selectors are kept for a related reason: they change how the character before them
+  renders, so dropping one would change the glyph the submitter chose;
+- the label is put into **Unicode NFC**, so a precomposed `é` and an `e` followed by a combining
+  acute are **one activity** rather than two records nobody can tell apart. Removal runs first on
+  purpose: a zero-width character sitting between a base and its combining mark blocks the
+  composition, so composing first would leave the accent decomposed;
 - leading and trailing **horizontal whitespace** is trimmed. Horizontal whitespace means every
   Unicode space separator — U+0020 SPACE, U+00A0 NO-BREAK SPACE, U+2003 EM SPACE, U+3000
   IDEOGRAPHIC SPACE and the rest of `\p{Zs}` — **plus U+0009 TAB**;
@@ -428,24 +456,32 @@ Applied before a record is stored:
   included because it is horizontal whitespace and nothing else inside a single-line label, and
   because it is what a spreadsheet copy-paste produces — which is where this project's data comes
   from;
-- any string **still** carrying a control character after those two steps, or U+2028 LINE SEPARATOR
+- any string **still** carrying a control character after the steps above, or U+2028 LINE SEPARATOR
   or U+2029 PARAGRAPH SEPARATOR, is rejected as `400 activity_invalid`. A newline, a carriage
   return, a vertical tab, a form feed, NUL, DEL and the C1 block are refused rather than laundered
   into a space, because laundering a line terminator would let two visually identical labels dedupe
   differently. A tab never reaches this rule: the collapse above has already replaced it, so no
   stored label contains one;
-- the 1-to-60-character bound is enforced **after** the two steps above, and is measured in
+- the 1-to-60-character bound is enforced **after** every step above, and is measured in
   **UTF-16 code units** — exactly how the form's `maxlength="60"` is evaluated, so the JSON API and
-  the native form agree on the boundary for every label, astral characters included;
+  the native form agree on the boundary for every label, astral characters included. Measuring
+  after canonicalisation is what accepts sixty decomposed accents, which are 120 code units on the
+  wire and sixty once composed;
 - the submitted casing is **preserved** in the stored value, so `Chess Club` is stored as typed;
-- comparison for the composite key is **case-insensitive**, so `chess club` submitted after
-  `Chess Club` is recognised as the same activity.
+- comparison for the composite key is **canonical and case-insensitive**, so `chess club`,
+  `Cafe<combining acute> Club` against `Café Club`, and `Chess Club<ZWSP>` are each recognised as
+  the activity already recorded and answered `200` rather than appended.
+
+A stored label that is **not** in this canonical form is refused when the store is read, as
+`500 store_unreadable`: the service only ever writes canonical labels, so a decomposed or
+zero-width-padded value in `activities.json` means the file was hand-edited, and accepting it would
+put a label in the store whose composite key differs from the same text written normally.
 
 **No closed vocabulary is imposed.** Any activity name is accepted. The existing column is
 unconstrained free text, and an enumeration invented here would reject a legitimate new club while
-claiming a constraint the data never carried. Case-insensitive deduplication is the mitigation for
-near-duplicates instead. The 60-character bound is generous against the data: the longest existing
-label, `Photography Club`, is sixteen characters.
+claiming a constraint the data never carried. Canonical, case-insensitive deduplication is the
+mitigation for near-duplicates instead. The 60-character bound is generous against the data: the
+longest existing label, `Photography Club`, is sixteen characters.
 
 ### Idempotency
 
@@ -483,8 +519,13 @@ of them being extracted, stored, logged or served.
 
 ## Configuration
 
-`ACTIVITY_STORE` is the feature's **only** environment variable, and the only `process.env` read
-anywhere in this project.
+`ACTIVITY_STORE` is the feature's **only configuration** variable — the one value that changes what
+the service does. Exactly one other environment value is read anywhere in this project, and it is not
+configuration: on Windows, `%SystemRoot%` locates the platform's own `icacls` so the store's
+permissions can be narrowed (see the staging bullets below). It names where the operating system
+keeps its files, it cannot alter the service's behaviour, and pointing it somewhere that does not
+hold that tool makes a write **refuse** rather than fall back to something weaker. The host and port
+remain literals and are configurable by nothing at all.
 
 - It **overrides the store path**.
 - It **defaults to `activities.json` beside the source**, next to `activity-store.js`.
@@ -539,15 +580,43 @@ anywhere in this project.
   staging path is never opened and never truncated: the name is unlinked, which removes *that name*
   and never the file a link points at, and the staging file is re-created, for at most three attempts
   before the write is refused as `500 store_write_failed` with the previous document left intact. The
-  opened descriptor is then proved to be a regular file carrying exactly one name — and, on POSIX,
-  owned by the account running the service and `chmod`ed to `0600` through the descriptor so the
-  umask cannot loosen it — the bytes are written through that same descriptor, and only then is it
-  renamed over the store. Because a stale staging file is removed and re-created rather than
-  truncated, it can no longer donate its permissions to the document that becomes the store.
-- On Windows that `0600` is **advisory**: the platform honours only the write bit, and the file
-  inherits the ACLs of the directory it is created in. There the directory *is* the access control,
-  which is why the setup below restricts it explicitly — that part is the operator's, not the
-  service's.
+  opened descriptor is then proved to be a regular file carrying exactly one name — and, where the
+  platform has the concept, owned by the account running the service — the bytes are written through
+  that same descriptor, and only then is it renamed over the store. Because a stale staging file is
+  removed and re-created rather than truncated, it can no longer donate its permissions to the
+  document that becomes the store.
+- **The staged file is restricted to its owner before a single byte of the document is written**, by
+  whichever mechanism the platform actually honours, and the rename carries that restriction onto the
+  store. So at the moment the file is at its widest it is also empty, and the store is never
+  published wider than the staging file was.
+  - Where the **mode** is the access control, the file is `chmod`ed to `0600` through the descriptor,
+    so the umask cannot loosen it.
+  - **On Windows the mode is not the access control and cannot be made into it.** The platform
+    derives only the read-only attribute from a mode, and a created file otherwise inherits the ACL
+    of the directory it was created in — so the service **replaces that inherited list** on the
+    staged file with a single entry granting full control to the file's owner, using the platform's
+    own `icacls` (located by absolute path under `%SystemRoot%\System32`, never by searching `PATH`).
+    Without this the store landed with `Authenticated Users: Modify` and `Users: Modify` in the
+    default configuration, which let every local account not just read submitted student data but
+    **rewrite** it — and a rewritten document is served straight back out of
+    `GET /activities/{id}`, or forces `500 store_unreadable` on every read. Note that `fs.stat`
+    still reports mode `0666` there for any regular file whatever its real permissions are: on that
+    platform the **ACL is the answer** and the mode is not, so `icacls <store>` — not a mode — is
+    what shows a store's permissions.
+  - **A restriction that cannot be applied refuses the write.** A missing or unrunnable tool, one
+    that times out, or one that exits non-zero — which is how a filesystem that cannot hold an ACL
+    at all would present — returns `500 store_write_failed` with the previous document intact and
+    nothing left staged, and the submission may safely be retried. The service does not publish a
+    document whose permissions it could not narrow.
+  - A store **left behind with wider permissions** — by an earlier build, or by an operator who
+    created the file by hand — is narrowed by the **next write that replaces it**, and its records
+    are carried across unchanged. Reads never change a file's permissions, so until that write the
+    file keeps whatever it was given; `icacls <store>` is how to check, and one submission is how to
+    fix it.
+- The **store directory is still the operator's to get right**, and the setup below restricts it
+  explicitly. The service now narrows the files it creates, but nothing it can do from inside makes
+  a shared parent directory private: who may *create*, *replace* or *delete* names beside the store —
+  including its staging sibling — is decided by that directory, not by the store's own permissions.
 - The store is **bounded, and no bound ever rewrites the file**. A store that is not a regular file,
   that exceeds **2 MiB**, or that holds more than **5,000** activity records is refused with
   `500 store_unreadable`, and in every one of those cases the file is left exactly as found — never
@@ -620,6 +689,14 @@ npm start
 The braces in `${env:USERNAME}` are load-bearing: written as `"$env:USERNAME:(OI)(CI)F"` the trailing
 colon is parsed as part of the variable path, the user name interpolates away, and `icacls` is handed
 a grant that never restricts anything.
+
+To see what a store actually carries, ask for its list rather than its mode — `icacls <store>`. After
+a submission it holds exactly one entry, granting full control to the file's owner and inheriting
+nothing, whatever the directory around it allows:
+
+```powershell
+icacls (Join-Path $Run 'activities.json')     # one entry: OWNER RIGHTS:(F)
+```
 
 **A shared, fixed temporary path is not an acceptable store directory** — not
 `/tmp/student-simple-activities`, not `/var/tmp/student-simple-activities`, not

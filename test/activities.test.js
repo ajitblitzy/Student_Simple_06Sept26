@@ -782,9 +782,17 @@ function escapeHtml(value) {
  *
  * The isolate is why an expectation cannot simply state the sentence as one
  * run of text any more. It exists because an accepted label may carry U+202E
- * RIGHT-TO-LEFT OVERRIDE — Unicode category Cf, so the normalization rules
- * permit it — and an unterminated override reverses the REST of the sentence,
- * the Student ID included, unless the label is isolated from it.
+ * RIGHT-TO-LEFT OVERRIDE, and an unterminated override reverses the REST of
+ * the sentence, the Student ID included, unless the label is isolated from it.
+ *
+ * The override IS accepted, and deliberately so. Normalization removes the
+ * invisible formatting characters — the zero-width space, the marks, the word
+ * joiner, the byte-order mark — but it keeps the direction controls, because
+ * those reorder VISIBLE text rather than padding it, so a label carrying one
+ * is a label whose author meant something by it. "It is Unicode category Cf"
+ * is therefore not the reason: some Cf characters are removed. The reason is
+ * that it is a direction control, which makes the isolate the fix rather than
+ * a wider refusal.
  *
  * Stating the expectation through this helper keeps the assertion about the
  * WHOLE sentence rather than about the fragments it survives as: a page that
@@ -2178,6 +2186,191 @@ describe('POST /activities — accepting a submission', () => {
 });
 
 /* ========================================================================= *
+ * Canonical labels over the wire
+ *
+ * Case folding is not the whole of recognising a near-duplicate. Two labels
+ * can differ in their code units and still be the same text to every reader:
+ * `Caf\u00e9 Club` and `Cafe\u0301 Club` are one precomposed character
+ * against a base plus a combining acute, and `Tennis Club\u200b` is the same
+ * three words followed by a character that occupies no space at all. Both
+ * arrive over HTTP from ordinary clients — a paste out of a web page or a
+ * spreadsheet cell carries zero-width characters, and a macOS filename or an
+ * IME can produce the decomposed form.
+ *
+ * So the label is canonicalized before it is stored and before the composite
+ * key is derived: the invisible formatting characters are removed and the
+ * result is put into Unicode NFC. The group below asserts that through the
+ * REQUEST PATH rather than against the store's own API, because the status
+ * code is where the property is observable from outside — 201 then 200, one
+ * record on read-back — and because a label with no visible content has to be
+ * refused in both response modes, not merely rejected somewhere inside.
+ *
+ * The direction controls are deliberately NOT removed; the bidi group further
+ * down asserts what happens to those instead.
+ * ========================================================================= */
+
+describe('POST /activities — canonical equivalence of submitted labels', () => {
+  it('recognizes the decomposed spelling of an accepted label as the same activity', async () => {
+    const context = 'POST /activities NFC then NFD';
+    const composed = 'Caf\u00e9 Club';
+    const decomposed = 'Cafe\u0301 Club';
+    assert.notStrictEqual(
+      composed,
+      decomposed,
+      `${context}: the two payloads must genuinely differ, or this case proves nothing`
+    );
+
+    const created = await postJson({ studentId: KNOWN_STUDENT_ID, activity: composed });
+    const createdPayload = assertSuccessEnvelope(created, 201, true, `${context} (first)`);
+    assertSubmissionRecord(createdPayload.record, KNOWN_STUDENT_ID, composed, context);
+
+    const repeat = await postJson({ studentId: KNOWN_STUDENT_ID, activity: decomposed });
+
+    const payload = assertSuccessEnvelope(
+      repeat,
+      200,
+      false,
+      `${context}: the decomposed spelling is the same activity, so nothing is added`
+    );
+    assert.strictEqual(
+      payload.record.activity,
+      composed,
+      `${context}: the STORED canonical form is returned, not the spelling just submitted`
+    );
+    assert.strictEqual(
+      payload.record.submittedAt,
+      createdPayload.record.submittedAt,
+      `${context}: the record keeps its original submittedAt, so nothing was rewritten`
+    );
+    assert.strictEqual(
+      repeat.headers.location,
+      undefined,
+      `${context}: Location is sent only with the 201`
+    );
+
+    // Read back through the API: exactly one record carries the label, and it
+    // carries the composed spelling. Two records here would be the defect
+    // itself — two rows nobody reading the page could tell apart.
+    const records = await readActivities(KNOWN_STUDENT_ID, context);
+    const matching = records.filter((record) => record.activity.normalize('NFC') === composed);
+    assert.strictEqual(
+      matching.length,
+      1,
+      `${context}: exactly one record may exist for the two spellings`
+    );
+    assert.strictEqual(
+      matching[0].activity,
+      composed,
+      `${context}: and it is stored composed, so a later NFD submission matches it too`
+    );
+  });
+
+  it('recognizes an invisibly padded repeat of an accepted label as the same activity', async () => {
+    const context = 'POST /activities plain then zero-width padded';
+    const label = 'Tennis Club';
+
+    const created = await postJson({ studentId: 'S002', activity: label });
+    assertSuccessEnvelope(created, 201, true, `${context} (first)`);
+
+    // Trailing ZERO WIDTH SPACE, then a leading BYTE ORDER MARK around a case
+    // variant: both are paste artefacts the submitter cannot see, so both are
+    // the same activity. The second also shows the two rules composing — the
+    // key is canonical AND case-insensitive.
+    for (const [description, activity] of [
+      ['a trailing ZERO WIDTH SPACE', `${label}\u200b`],
+      ['a leading BYTE ORDER MARK with a case variant', `\ufeffTENNIS club`],
+    ]) {
+      const repeat = await postJson({ studentId: 'S002', activity });
+      const payload = assertSuccessEnvelope(
+        repeat,
+        200,
+        false,
+        `${context}: ${description} must be recognized rather than appended`
+      );
+      assert.strictEqual(
+        payload.record.activity,
+        label,
+        `${context}: ${description} returns the label as it was first stored`
+      );
+    }
+
+    const records = await readActivities('S002', context);
+    assert.strictEqual(
+      records.filter((record) => record.activity.includes('Tennis')).length,
+      1,
+      `${context}: exactly one record after three visually identical submissions`
+    );
+  });
+
+  it('refuses a label of invisible characters only, in both response modes', async () => {
+    // A single ZERO WIDTH SPACE has no visible content, so it is empty once
+    // the invisible characters are removed — the same mistake as sending
+    // nothing at all, and the same `400 activity_invalid`. Accepting it
+    // persists a record that renders as a blank row, which no reader of the
+    // page can act on.
+    const jsonContext = 'POST /activities with a label of one ZERO WIDTH SPACE (JSON)';
+    const jsonResponse = await postJson({ studentId: 'S003', activity: '\u200b' });
+    assertErrorEnvelope(jsonResponse, 400, 'activity_invalid', jsonContext);
+
+    const formContext = 'POST /activities with a label of invisible characters (form)';
+    const formResponse = await postForm('S003', '\ufeff\u200b\u00ad');
+    assertHtmlFailure(formResponse, 400, 'activity_invalid', formContext);
+
+    // Nothing was stored by either refusal: the student still holds only the
+    // label the workbook seeded.
+    const records = await readActivities('S003', jsonContext);
+    assert.deepStrictEqual(
+      records.map((record) => record.activity),
+      [SEEDED_LABELS.S003],
+      'neither refusal may leave a record behind'
+    );
+  });
+
+  it('stores an internal zero-width character out of the label and reads the canonical form back', async () => {
+    // The character sits between two letters rather than at an edge, so a
+    // removal wired into the trim alone would leave it in place and the
+    // record would read back carrying it. The stored value is asserted at
+    // code-unit length as well as by equality, because the two labels look
+    // identical in a failure message.
+    const context = 'POST /activities with an internal zero-width character';
+    const submitted = 'Zero\u200bWidth Club';
+    const canonical = 'ZeroWidth Club';
+
+    const response = await postJson({ studentId: 'S004', activity: submitted });
+
+    const payload = assertSuccessEnvelope(response, 201, true, context);
+    assertSubmissionRecord(payload.record, 'S004', canonical, context);
+    assert.strictEqual(
+      payload.record.activity.length,
+      canonical.length,
+      `${context}: the returned label carries no invisible character`
+    );
+
+    const persisted = findRecord(await readActivities('S004', context), canonical);
+    assert.ok(persisted !== undefined, `${context}: the record is readable back`);
+    assert.strictEqual(
+      persisted.activity,
+      canonical,
+      `${context}: what was WRITTEN is the canonical label, not the submitted one`
+    );
+    assert.ok(
+      !persisted.activity.includes('\u200b'),
+      `${context}: no zero-width character reached the store`
+    );
+
+    // And the plain spelling is the same composite key, which is what the
+    // removal buys: the two forms are one activity.
+    const repeat = await postJson({ studentId: 'S004', activity: canonical });
+    assertSuccessEnvelope(
+      repeat,
+      200,
+      false,
+      `${context}: the plain spelling is the same activity`
+    );
+  });
+});
+
+/* ========================================================================= *
  * Media-type normalization
  *
  * The header is split at the first `;`, trimmed and lowercased before
@@ -2373,7 +2566,7 @@ describe('GET /activities/{studentId} — reading activities back', () => {
   });
 
   for (const method of ['POST', 'PUT', 'DELETE']) {
-    it(`answers 405 with the route-correct Allow: GET for ${method} /activities/S001`, async () => {
+    it(`answers 405 with the route-correct Allow: GET, HEAD for ${method} /activities/S001`, async () => {
       const context = `${method} /activities/${KNOWN_STUDENT_ID}`;
       const response = await request({
         method,
@@ -2383,11 +2576,12 @@ describe('GET /activities/{studentId} — reading activities back', () => {
       });
 
       assertErrorEnvelope(response, 405, 'method_not_allowed', context);
-      // The route addressed accepts only GET, so `Allow: GET, POST` would be a
-      // lie about this resource even though it is true of the namespace root.
+      // The route addressed accepts the two read methods and no submission, so
+      // `Allow: GET, HEAD, POST` would be a lie about this resource even though
+      // it is true of the namespace root.
       assert.strictEqual(
         response.headers.allow,
-        'GET',
+        'GET, HEAD',
         `${context}: Allow names this route's methods, not the namespace's`
       );
     });
@@ -3695,35 +3889,153 @@ describe('POST /activities — a request stream that fails part way', () => {
  * that verb, and nothing exists there under any verb.
  * ========================================================================= */
 
-describe('POST and GET are the only methods on /activities', () => {
-  for (const method of ['PUT', 'DELETE', 'PATCH']) {
-    it(`answers 405 with Allow: GET, POST for ${method} /activities`, async () => {
+describe('GET, HEAD and POST are the only methods on the /activities routes', () => {
+  // OPTIONS is deliberately in this list. It is not implemented — no RFC
+  // requires it of this service and no row of the matrix names it — so the
+  // right answer to it is the same 405 every other unsupported verb gets,
+  // carrying the `Allow` that tells the asker what the route does accept.
+  for (const method of ['PUT', 'DELETE', 'PATCH', 'OPTIONS']) {
+    it(`answers 405 with Allow: GET, HEAD, POST for ${method} /activities`, async () => {
       const context = `${method} /activities`;
       const response = await request({ method, target: NAMESPACE });
 
       assertErrorEnvelope(response, 405, 'method_not_allowed', context);
       assert.strictEqual(
         response.headers.allow,
-        'GET, POST',
-        `${context}: Allow names the namespace root's two methods`
+        'GET, HEAD, POST',
+        `${context}: Allow names the namespace root's three methods`
       );
     });
   }
 
-  it('answers 405 with Allow: GET, POST for HEAD /activities', async () => {
+  it('answers HEAD /activities with the headers of the form and no body', async () => {
     const context = 'HEAD /activities';
-    const response = await request({ method: 'HEAD', target: NAMESPACE });
+    const head = await request({ method: 'HEAD', target: NAMESPACE });
+    const sameByGet = await get(NAMESPACE);
 
-    // A HEAD response carries no body by definition, so the status, the
-    // content type and the Allow header are the whole observable contract here.
-    assert.strictEqual(response.status, 405, `${context}: status`);
-    assert.strictEqual(response.headers.allow, 'GET, POST', `${context}: Allow`);
+    assert.strictEqual(head.status, 200, `${context}: the status a GET gets, not a 405`);
     assert.strictEqual(
-      response.headers['content-type'],
-      CONTENT_TYPE_JSON,
-      `${context}: the envelope's content type is still announced`
+      head.headers['content-type'],
+      CONTENT_TYPE_HTML,
+      `${context}: the form's content type, charset included`
     );
-    assert.strictEqual(response.body, '', `${context}: a HEAD response has no body`);
+    assert.strictEqual(head.body, '', `${context}: a HEAD carries no body`);
+    // The size the GET body WOULD have had, which is the whole reason a client
+    // sends a HEAD at all. Measured against the same route's GET inside this
+    // case — the store is this case's own and a read writes nothing, so the two
+    // requests observe identical state.
+    assert.strictEqual(
+      head.headers['content-length'],
+      String(Buffer.byteLength(sameByGet.body)),
+      `${context}: Content-Length announces the GET body's byte length`
+    );
+    assert.strictEqual(
+      head.headers.allow,
+      undefined,
+      `${context}: no Allow header — nothing was refused`
+    );
+  });
+
+  it('answers HEAD /activities/S001 with the headers of the read and no body', async () => {
+    const context = `HEAD /activities/${KNOWN_STUDENT_ID}`;
+    const target = `${NAMESPACE}/${KNOWN_STUDENT_ID}`;
+    const head = await request({ method: 'HEAD', target });
+    const sameByGet = await get(target);
+
+    assert.strictEqual(head.status, 200, `${context}: the status a GET gets, not a 405`);
+    assert.strictEqual(
+      head.headers['content-type'],
+      CONTENT_TYPE_JSON,
+      `${context}: this route announces JSON under HEAD exactly as it does under GET`
+    );
+    assert.strictEqual(head.body, '', `${context}: a HEAD carries no body`);
+    assert.strictEqual(
+      head.headers['content-length'],
+      String(Buffer.byteLength(sameByGet.body)),
+      `${context}: Content-Length announces the GET body's byte length`
+    );
+    assert.strictEqual(
+      head.headers.allow,
+      undefined,
+      `${context}: no Allow header — nothing was refused`
+    );
+  });
+
+  it('answers HEAD and GET with the same status and the same headers on both read routes', async () => {
+    // Asserted as a computed DIFF rather than a whole-object comparison, so a
+    // future divergence reports the header that drifted and both its values
+    // instead of dumping two header sets for a reader to spot the difference
+    // in. The four exclusions are per-connection or per-instant metadata that
+    // says nothing about the representation: `date` moves with the clock, and
+    // the other three describe the connection carrying the response.
+    const volatile = new Set(['date', 'connection', 'keep-alive', 'transfer-encoding']);
+
+    for (const target of [NAMESPACE, `${NAMESPACE}/${KNOWN_STUDENT_ID}`]) {
+      const context = `HEAD vs GET ${target}`;
+      const head = await request({ method: 'HEAD', target });
+      const sameByGet = await get(target);
+
+      assert.strictEqual(head.status, sameByGet.status, `${context}: the same status`);
+
+      const names = [...new Set([...Object.keys(head.headers), ...Object.keys(sameByGet.headers)])]
+        .filter((name) => !volatile.has(name))
+        .sort();
+      const drifted = names
+        .filter((name) => head.headers[name] !== sameByGet.headers[name])
+        .map((name) => `${name}: HEAD ${JSON.stringify(head.headers[name])} vs GET ${JSON.stringify(sameByGet.headers[name])}`);
+
+      assert.deepStrictEqual(drifted, [], `${context}: every stable header must match`);
+    }
+  });
+
+  for (const [segment, expectedStatus, why] of [
+    ['s001', 400, 'the malformed-segment outcome'],
+    [ABSENT_STUDENT_ID, 404, 'the absent-student outcome'],
+  ]) {
+    it(`answers HEAD /activities/${segment} with ${expectedStatus} — ${why} a GET gets`, async () => {
+      const context = `HEAD /activities/${segment}`;
+      const target = `${NAMESPACE}/${segment}`;
+      const head = await request({ method: 'HEAD', target });
+      const sameByGet = await get(target);
+
+      // A HEAD carries no envelope to parse, so the error is asserted through
+      // what a HEAD does carry: the status, the content type announcing a JSON
+      // envelope, and its length. The envelope's two keys and its fixed
+      // sentence are asserted on the GET of the same path elsewhere in this
+      // file; the point here is that the method gate does not pre-empt the
+      // validation, so a HEAD reaches the same outcome rather than a 405.
+      assert.strictEqual(head.status, expectedStatus, `${context}: status`);
+      assert.strictEqual(sameByGet.status, expectedStatus, `${context}: the GET agrees`);
+      assert.strictEqual(
+        head.headers['content-type'],
+        CONTENT_TYPE_JSON,
+        `${context}: the envelope's content type is still announced`
+      );
+      assert.strictEqual(head.body, '', `${context}: a HEAD carries no body`);
+      assert.strictEqual(
+        head.headers['content-length'],
+        String(Buffer.byteLength(sameByGet.body)),
+        `${context}: Content-Length announces the GET envelope's byte length`
+      );
+    });
+  }
+
+  it('answers 404 not_found — not 405 — for HEAD /activities/S001/extra', async () => {
+    const context = `HEAD /activities/${KNOWN_STUDENT_ID}/extra`;
+    const response = await request({
+      method: 'HEAD',
+      target: `${NAMESPACE}/${KNOWN_STUDENT_ID}/extra`,
+    });
+
+    // Route resolution still runs ahead of the method check under HEAD: the
+    // path resolves to nothing, so it is a 404 with no `Allow`, exactly as it
+    // is for GET and DELETE.
+    assert.strictEqual(response.status, 404, `${context}: an unresolved path, not a method refusal`);
+    assert.strictEqual(
+      response.headers.allow,
+      undefined,
+      `${context}: no Allow header, because no resource exists to allow anything on`
+    );
   });
 });
 
@@ -4556,9 +4868,13 @@ describe('HTML escaping of submitted values', () => {
  * Bidi isolation of the values in an outcome sentence
  *
  * Escaping is not the whole of safely interpolating a value. A submitted label
- * may carry U+202E RIGHT-TO-LEFT OVERRIDE, which is Unicode category Cf — not
- * a control character, not a line separator — so the normalization rules
- * legitimately ACCEPT it and the store legitimately keeps it. Unterminated, it
+ * may carry U+202E RIGHT-TO-LEFT OVERRIDE — not a control character, not a
+ * line separator, and not one of the invisible formatting characters
+ * normalization removes — so the rules legitimately ACCEPT it and the store
+ * legitimately keeps it. It is kept because it is a DIRECTION control: it
+ * reorders visible text rather than padding it, so removing it would change
+ * what the author of the label wrote, where removing a zero-width space
+ * changes nothing anyone can see. Unterminated, it
  * escapes the label and reverses the remainder of the service's own sentence,
  * the Student ID included: `Recorded Chess <U+202E> buLC for S003.` renders as
  * `Recorded Chess .300S rof CLub`, so the one channel that says what happened

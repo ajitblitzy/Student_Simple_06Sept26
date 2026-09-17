@@ -5,11 +5,12 @@
  *
  * WHAT THIS MODULE OWNS
  * ---------------------
- * The request surface, and only that. The routes of the namespace are:
+ * The request surface, and only that. The routes of the namespace are, with
+ * the methods each one accepts:
  *
- *   GET  /activities               the submission form (HTML)
- *   POST /activities               a submission, form-encoded or JSON
- *   GET  /activities/{studentId}   one student's activities (JSON only)
+ *   GET | HEAD /activities               the submission form (HTML)
+ *   POST       /activities               a submission, form-encoded or JSON
+ *   GET | HEAD /activities/{studentId}   one student's activities (JSON only)
  *
  * The single export is `handle`, and its BOOLEAN RESULT is the whole
  * integration surface: `true` means this module claimed the request and has
@@ -169,13 +170,29 @@ const METHOD_GET = 'GET';
 const METHOD_POST = 'POST';
 
 /**
+ * `HEAD` is first-class on every route that answers `GET`, and it is a method
+ * constant here rather than a special case at one gate because both read
+ * routes test for it.
+ *
+ * It is GET minus the content: the same status, the same headers, no body. A
+ * general-purpose server is required to support it alongside GET, and a client
+ * that only wants to know whether a resource resolves — or how large its
+ * representation is — has no other method to ask with. Refusing it inside this
+ * namespace was also internally inconsistent: the caller's preserved
+ * fall-through never reads `req.method`, so `HEAD /` and `HEAD /anything-else`
+ * have always been answered `200`, and the namespace was the one place that
+ * turned the same request into a `405`. That is the inconsistency closed here.
+ */
+const METHOD_HEAD = 'HEAD';
+
+/**
  * The `Allow` header value for each route that RESOLVES. A 405 always carries
  * one, and it always names the methods of the route actually addressed rather
- * than of the namespace as a whole — `Allow: GET, POST` would be a lie on
- * `/activities/{id}`, which accepts only `GET`.
+ * than of the namespace as a whole — `Allow: GET, HEAD, POST` would be a lie
+ * on `/activities/{id}`, which accepts no submission.
  */
-const ALLOW_COLLECTION = 'GET, POST';
-const ALLOW_ITEM = 'GET';
+const ALLOW_COLLECTION = 'GET, HEAD, POST';
+const ALLOW_ITEM = 'GET, HEAD';
 
 /**
  * The request media types `POST /activities` accepts. The form encoding is
@@ -1008,6 +1025,17 @@ function send(res, statusCode, contentType, body, extraHeaders) {
 
   res.statusCode = statusCode;
   res.setHeader('Content-Type', contentType);
+  // `Content-Length` is set explicitly, and only because of HEAD. Measured on
+  // the pinned runtime (Node v24.21.0), `res.end(body)` computes and emits the
+  // header by itself for a GET or a POST, but on a HEAD response — where the
+  // runtime knows it must write no body — it omits the header ENTIRELY, so a
+  // HEAD would announce nothing about the size of the representation a GET
+  // would have returned, which is the one thing a HEAD is most often asked
+  // for. Set here it survives on a HEAD while the runtime still writes zero
+  // body bytes. The value is `Buffer.byteLength` of the same string `res.end`
+  // receives, which is byte for byte what the runtime already computed for
+  // GET and POST, so no existing response changes on the wire.
+  res.setHeader('Content-Length', Buffer.byteLength(body));
 
   if (extraHeaders !== undefined) {
     for (const [name, value] of Object.entries(extraHeaders)) {
@@ -2184,7 +2212,14 @@ async function handleSubmission(req, res) {
  * @throws {Error} A store refusal, which `handle` maps to a 500.
  */
 async function handleCollection(req, res) {
-  if (req.method === METHOD_GET) {
+  if (req.method === METHOD_GET || req.method === METHOD_HEAD) {
+    // A HEAD is served by rendering exactly what a GET renders and handing it
+    // to `send`. No body-suppression code is needed and none should be added:
+    // `node:http` marks a HEAD response `_hasBody = false` and discards the
+    // body itself, so the runtime writes only the headers. Rendering the same
+    // document is what makes those headers — the content type and the
+    // `Content-Length` `send` sets — describe the representation a GET would
+    // have returned, rather than an empty one.
     sendHtml(res, 200, renderEmptyForm());
     return;
   }
@@ -2199,7 +2234,7 @@ async function handleCollection(req, res) {
 }
 
 /**
- * `GET /activities/{studentId}` — one student's activities.
+ * `GET | HEAD /activities/{studentId}` — one student's activities.
  *
  * JSON only: this route never renders HTML, in either request mode, because
  * there is no form for a read to re-display.
@@ -2217,11 +2252,18 @@ async function handleCollection(req, res) {
  * @throws {Error} A store refusal, which `handle` maps to a 500.
  */
 async function handleItem(req, res, studentId) {
-  if (req.method !== METHOD_GET) {
+  if (req.method !== METHOD_GET && req.method !== METHOD_HEAD) {
     sendFailure(res, FAILURES.METHOD_NOT_ALLOWED, { Allow: ALLOW_ITEM });
     drain(req);
     return;
   }
+
+  // Nothing below this gate tests the method, and that is deliberate: a HEAD
+  // takes the identical path a GET takes — the same shape test, the same
+  // key-set lookup, the same store read — so it produces the same 400, 404 or
+  // 200 a GET would, with the body dropped by the runtime. Short-circuiting a
+  // HEAD ahead of the lookup would make it answer a different question from
+  // the GET it is supposed to preview.
 
   if (!STUDENT_ID_PATTERN.test(studentId)) {
     sendFailure(res, FAILURES.STUDENT_ID_MALFORMED);

@@ -82,6 +82,14 @@ const fs = require('node:fs/promises');
  * added. */
 const fsSync = require('node:fs');
 const path = require('node:path');
+/* For the ONE operation the runtime offers no API for: setting a file's ACL on
+ * a platform whose access control is an ACL rather than a mode. `node:fs` can
+ * `chmod` and nothing more, so the platform's own tool is invoked — see
+ * `restrictStagedFileToItsOwner`. A built-in module, so the project's
+ * zero-third-party-dependency posture is untouched, and the module OBJECT is
+ * held rather than `execFile` destructured off it, so the call site remains a
+ * property lookup a test can substitute. */
+const childProcess = require('node:child_process');
 const xlsxRead = require('./xlsx-read');
 
 /* ------------------------------------------------------------------------- *
@@ -577,10 +585,11 @@ const MAX_LABEL_LENGTH = 60;
  * U+0009 TAB is deliberately ABSENT from this class. It is horizontal
  * whitespace — and it is the character a spreadsheet copy-paste produces, in
  * a project whose data comes from spreadsheets — so the class below collapses
- * it BEFORE this check runs, which is the step order the specification states:
- * trim, collapse internal whitespace, then reject whatever is left. A tab
- * therefore never reaches this pattern, and no tab can survive into a stored
- * value.
+ * it BEFORE this check runs, which is the step order normalization follows —
+ * the specification's trim, collapse internal whitespace, then reject
+ * whatever is left, preceded by the canonicalization step described at
+ * `canonicalizeLabel`. A tab therefore never reaches this pattern, and no tab
+ * can survive into a stored value.
  *
  * The line terminators are in this class rather than in the trim/collapse
  * class on purpose, and that is the line a tab does not cross. U+2028 and
@@ -620,15 +629,75 @@ const TRAILING_SPACE_PATTERN = /[\t\p{Zs}]+$/u;
 const INTERNAL_SPACE_RUN_PATTERN = /[\t\p{Zs}]+/gu;
 
 /**
+ * The invisible formatting characters that are REMOVED from a label:
+ *
+ *   - U+00AD SOFT HYPHEN, a discretionary line-break hint;
+ *   - U+180E MONGOLIAN VOWEL SEPARATOR;
+ *   - U+200B-U+200F: the zero-width space, the zero-width non-joiner and
+ *     joiner, and the left-to-right and right-to-left MARKS;
+ *   - U+2060-U+2064: the word joiner and the four invisible math operators;
+ *   - U+FEFF, the byte-order mark in its zero-width-no-break-space role.
+ *
+ * These are the invisible analogue of the padding the class above already
+ * trims, so they are REMOVED rather than refused. Every one of them is
+ * zero-width: a paste from a web page or a spreadsheet cell carries them
+ * without the submitter ever seeing one, and a refusal message about a
+ * character nobody can see is not actionable — it names a fault the person
+ * cannot find in their own input. Removal is also what the deduplication rule
+ * needs, because none of them is `\p{Zs}` and none is a control character, so
+ * without this class `Tennis Club` and `Tennis Club\u200b` both survive
+ * normalization unchanged and persist as two visually identical records.
+ *
+ * What is deliberately NOT in this class, and why:
+ *
+ *   - THE BIDI CONTROLS — U+202A-U+202E, the embeddings and the overrides,
+ *     U+2066-U+2069, the isolates, and U+061C ARABIC LETTER MARK. Those are
+ *     DIRECTION controls: they reorder visible text rather than being
+ *     padding, so a label carrying one is a label whose author meant
+ *     something by it. They are accepted deliberately, and the served HTML
+ *     wraps every interpolated value in a `<bdi>` element precisely so an
+ *     unterminated override cannot reverse the sentence around it — see the
+ *     bidi cases in `test/activities.test.js`. Removing them here would
+ *     silently change an accepted, tested behaviour.
+ *   - VARIATION SELECTORS, U+FE00-U+FE0F and U+E0100-U+E01EF, because they
+ *     change how the preceding character RENDERS: dropping one would change
+ *     the glyph the submitter chose.
+ *
+ * The one honest cost: an emoji ZWJ sequence is flattened to its component
+ * glyphs, and a Persian or Hindi ZWNJ that shapes a word is dropped. That is
+ * accepted because every member of this class is zero-width — the label read
+ * back differs from the one typed only in characters that occupy no space —
+ * and the alternative is two labels that render identically persisting as two
+ * records, which is the near-duplicate risk normalization exists to mitigate.
+ *
+ * The `g` flag is what makes `String.prototype.replace` remove every
+ * occurrence rather than only the first. This pattern is used with `replace`
+ * and nothing else, so the `lastIndex` that a stateful `test` would leave
+ * behind between calls never arises.
+ */
+const INVISIBLE_FORMAT_PATTERN = /[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/gu;
+
+/**
  * The ONLY rule by which a workbook label counts as blank, and therefore as a
  * row that records nothing.
  *
  * Deliberately the same horizontal-whitespace class the three patterns above
- * use, which makes the blank rule and the normalization rule agree by
- * construction: a cell this pattern calls blank is one `inspectLabel` would
- * also reduce to the empty string, and every cell it does not call blank goes
- * through `inspectLabel` and is answered there — accepted if it normalizes,
- * refused if it carries a control character or a line separator.
+ * use, and applied by `loadSeedRecords` to the CANONICALIZED cell rather than
+ * to the raw one, which together make the blank rule and the normalization
+ * rule agree by construction: a cell this pattern calls blank is one
+ * `inspectLabel` would also reduce to the empty string, and every cell it
+ * does not call blank goes through `inspectLabel` and is answered there —
+ * accepted if it normalizes, refused if it carries a control character or a
+ * line separator.
+ *
+ * Testing the canonicalized cell is what keeps that equivalence true for the
+ * invisible characters `INVISIBLE_FORMAT_PATTERN` removes. A cell holding
+ * nothing but a byte-order mark is blank to a reader's eye and blank to
+ * `inspectLabel`, which removes the mark and then has an empty string left;
+ * tested raw it would instead be a one-character label, fail normalization as
+ * empty, and take the WHOLE seed down with E_REFERENCE_DATA — every request
+ * answered `500 reference_data_unavailable` because one workbook cell carried
+ * an invisible character. Blank means blank on both sides of the rule.
  *
  * The class is wrong in both directions if it drifts from that one. A
  * `rawLabel.trim() === ''` test would be WIDER, because
@@ -759,11 +828,17 @@ function refuse(code, message, diagnosis) {
  *   reason  A stable lower-snake-case token naming which refusal this is. Part
  *           of this module's contract, so a rename is a contract change and
  *           shows up in this file's diff.
- *   detail  The `code` of the underlying fault — a `node:fs` errno such as
- *           `ENOENT`, or the reader's own `E_XLSX_*` code — or `null` when
- *           there was no underlying fault. This is the difference between "the
- *           store could not be written" and knowing the directory was missing,
- *           read-only or full.
+ *   detail  The `code` of the underlying fault, or `null` when there was no
+ *           underlying fault. This is the difference between "the store could
+ *           not be written" and knowing the directory was missing, read-only
+ *           or full. Two sources, and which one it came from is legible from
+ *           the code itself: a `node:fs` errno such as `ENOENT` for THIS
+ *           module's own filesystem work — the staging write, the rename, the
+ *           startup probe — and an `E_XLSX_*` code for anything the reader
+ *           raised. A reader failure never arrives here as an errno, because
+ *           `xlsx-read.js` translates its own filesystem faults into
+ *           `E_XLSX_UNSUPPORTED_SOURCE`; so a missing workbook is that code
+ *           with `reason: 'source_missing'`, not a bare `ENOENT`.
  *   at      The position the refusal names: a record's index within the
  *           document, or a workbook row number. `null` when it names none.
  *   number  A bounded numeric the reader rejected, propagated from it. `null`
@@ -863,7 +938,39 @@ function describeValue(value) {
  * implementation is what keeps those answers from drifting apart — a second
  * implementation of the same rule would eventually accept in one context what
  * it refuses in another.
+ *
+ * The step order is: CANONICALIZE — remove the invisible formatting
+ * characters, then put the result into Unicode NFC — then trim, then collapse
+ * internal horizontal whitespace, then refuse any remaining control character
+ * or line separator, then enforce the 1-to-60 bound. `canonicalizeLabel`
+ * below is the first step on its own, because `compositeKey` needs it without
+ * the rest.
  * ------------------------------------------------------------------------- */
+
+/**
+ * Removes the invisible formatting characters and returns the result in
+ * Unicode NFC. The canonical form of a label, and the form the store holds.
+ *
+ * THE ORDER IS MEASURED, NOT PREFERRED. For `'e\u200b\u0301'` — an `e`, a
+ * zero-width space, a combining acute — normalizing first and stripping
+ * second yields U+0065 U+0301, still decomposed, because U+200B is a starter
+ * with combining class 0 sitting between the base and the accent and it
+ * BLOCKS the composition; stripping first and normalizing second yields
+ * U+00E9. Strip-first is therefore what guarantees the returned value is
+ * itself in NFC, and with it that canonicalization is idempotent —
+ * `canonicalizeLabel(canonicalizeLabel(x)) === canonicalizeLabel(x)`.
+ *
+ * The loader depends on exactly that: it refuses any stored label that is not
+ * already in normalized form, so a normalizer whose output could need
+ * normalizing again would write documents its own loader then rejects.
+ *
+ * @param {string} value A label, or any string being compared as one.
+ * @returns {string} The same text with the invisible formatting characters
+ *   removed, in NFC.
+ */
+function canonicalizeLabel(value) {
+  return value.replace(INVISIBLE_FORMAT_PATTERN, '').normalize('NFC');
+}
 
 /**
  * Applies the normalization rules and reports the outcome without throwing,
@@ -871,15 +978,31 @@ function describeValue(value) {
  *
  * The order is exact and each step depends on the one before it:
  *
- *   1. Trim leading and trailing horizontal whitespace.
- *   2. Collapse every internal run of horizontal whitespace to a single
+ *   1. Canonicalize, through `canonicalizeLabel`: remove the invisible
+ *      formatting characters, then put the result into Unicode NFC. So
+ *      `Caf\u00e9 Club` and `Cafe\u0301 Club` become one label, and a
+ *      zero-width space cannot pad one label into two.
+ *   2. Trim leading and trailing horizontal whitespace.
+ *   3. Collapse every internal run of horizontal whitespace to a single
  *      space. A tab is horizontal whitespace, so `Chess\tClub` becomes
- *      `Chess Club` here and carries nothing forward for step 3 to refuse.
- *   3. Reject any remaining control character or line separator. A newline, a
+ *      `Chess Club` here and carries nothing forward for step 4 to refuse.
+ *   4. Reject any remaining control character or line separator. A newline, a
  *      carriage return or a U+2028 LINE SEPARATOR reaches this step intact
- *      because step 2 collapses horizontal whitespace only.
- *   4. Enforce the length bound, measured AFTER the two steps above, so
- *      padding cannot push a legitimate label over the limit.
+ *      because step 3 collapses horizontal whitespace only.
+ *   5. Enforce the length bound, measured AFTER the three steps above, so
+ *      padding — visible or invisible — cannot push a legitimate label over
+ *      the limit, and a decomposed accent cannot count twice.
+ *
+ * Step 1 runs BEFORE the trim and the collapse rather than after them, which
+ * is the opposite of the obvious placement and the difference is observable:
+ * `'Tennis \u200b Club'` has the zero-width space removed between two spaces,
+ * so stripping after the collapse would leave the DOUBLED space `'Tennis
+ * Club'` — two spaces — in the stored value, with nothing left to tidy it.
+ * Canonicalizing first hands the collapse a single run to fold. Running it
+ * before the emptiness check is what makes a label of nothing but invisible
+ * characters refused rather than stored as a record with no visible content,
+ * and running it before the bound is what measures the string the store will
+ * actually keep.
  *
  * Submitted casing is preserved in the returned value — `Chess Club` is
  * stored as typed. Case is folded only for the composite-key comparison in
@@ -903,7 +1026,7 @@ function inspectLabel(raw) {
     return { ok: false, reason: `must be a string; received ${describeValue(raw)}` };
   }
 
-  const normalized = raw
+  const normalized = canonicalizeLabel(raw)
     .replace(LEADING_SPACE_PATTERN, '')
     .replace(TRAILING_SPACE_PATTERN, '')
     .replace(INTERNAL_SPACE_RUN_PATTERN, ' ');
@@ -914,7 +1037,11 @@ function inspectLabel(raw) {
 
   const length = normalized.length;
   if (length < MIN_LABEL_LENGTH) {
-    return { ok: false, reason: 'must not be empty once surrounding whitespace is removed' };
+    return {
+      ok: false,
+      reason:
+        'must not be empty once surrounding whitespace and invisible formatting characters are removed',
+    };
   }
   if (length > MAX_LABEL_LENGTH) {
     return {
@@ -981,12 +1108,21 @@ function isIsoUtcInstant(value) {
  * ID matches `/^S\d{3}$/` and a label has already had control characters
  * refused. So no pair of distinct components can collide on one key.
  *
+ * The label is put through `canonicalizeLabel` before its case is folded.
+ * Every caller inside this module passes a value `inspectLabel` has already
+ * canonicalized, so for them the call is a no-op — it is defence in depth for
+ * a caller that reached this comparison with a value that never went through
+ * `normalizeLabel`, which is exactly the path by which a decomposed accent or
+ * a zero-width space would otherwise produce a second key for one visible
+ * label. The cost is 2 ms per 5000 keys measured on the supported runtime, so
+ * the duplicate scan the loader runs over a full store is unaffected.
+ *
  * @param {string} studentId A well-formed Student ID.
  * @param {string} normalizedLabel A label in normalized form.
- * @returns {string} The comparison key.
+ * @returns {string} The comparison key: canonical, and folded to lower case.
  */
 function compositeKey(studentId, normalizedLabel) {
-  return `${studentId}\u0000${normalizedLabel.toLowerCase()}`;
+  return `${studentId}\u0000${canonicalizeLabel(normalizedLabel).toLowerCase()}`;
 }
 
 /**
@@ -1054,6 +1190,15 @@ let cachedSeedRecords = null;
  * `E_XLSX_TRUNCATED` would be reaching past this module's contract, and all
  * of them mean the same thing here — the reference data cannot be trusted.
  * The original travels as `cause`.
+ *
+ * The translation is TOTAL, and it is total because the reader leaves nothing
+ * uncoded: a workbook that is absent or unreadable is
+ * `E_XLSX_UNSUPPORTED_SOURCE` rather than a raw errno, a part that is not a
+ * worksheet is `E_XLSX_MALFORMED_XML` rather than an empty column, and even a
+ * caller fault inside this module would arrive as
+ * `E_XLSX_INVALID_ARGUMENT`. So the `catch` below is a single exhaustive
+ * boundary rather than a best effort, and the `detail` recorded on the
+ * diagnostic is always one of the reader's codes.
  *
  * @param {string} workbookFileName A workbook beside this module.
  * @param {string} columnLetter The column to read.
@@ -1162,11 +1307,18 @@ function loadKeySet() {
  *
  * A student whose activity cell is blank simply contributes no record, which
  * is the honest reading of an empty cell: nothing was recorded for them.
- * "Blank" means `HORIZONTAL_WHITESPACE_ONLY_PATTERN` — empty, or horizontal
- * whitespace only — and nothing wider. A cell holding a lone newline is NOT
- * blank: it is a label carrying a control character, and it is refused by
- * `inspectLabel` like any other, rather than skipped as though the row said
- * nothing.
+ * "Blank" means `HORIZONTAL_WHITESPACE_ONLY_PATTERN` applied to the
+ * CANONICALIZED cell — empty, horizontal whitespace only, or invisible
+ * formatting characters only — and nothing wider. Canonicalizing first is
+ * what keeps the blank rule and the normalizer in agreement: a cell holding
+ * nothing but a byte-order mark contributes no record, exactly as an empty
+ * cell does, instead of reaching `inspectLabel` as a one-character label,
+ * failing as empty, and failing the whole seed with E_REFERENCE_DATA — which
+ * would answer every request `500 reference_data_unavailable` over one
+ * invisible character in one spreadsheet cell. A cell holding a lone newline
+ * is still NOT blank: it is a label carrying a control character, and it is
+ * refused by `inspectLabel` like any other, rather than skipped as though the
+ * row said nothing.
  *
  * The Student ID is likewise validated AS READ, with no trim, and its shape is
  * checked before its membership so a control-padded value is reported as a
@@ -1227,10 +1379,18 @@ function loadSeedRecords() {
     /* Both values AS READ. Neither is trimmed before it is validated: a
      * `String.prototype.trim` made `'S001\t'` a valid Student ID and made a
      * newline-only label test as blank, so the row was skipped before
-     * `inspectLabel` could refuse it. */
+     * `inspectLabel` could refuse it.
+     *
+     * The blank test is the one exception, and it is not a trim: the cell is
+     * CANONICALIZED for that test alone, so the invisible characters
+     * `inspectLabel` removes cannot make a cell that is blank to the eye read
+     * as a one-character label. The test class stays exactly the horizontal
+     * whitespace the normalizer trims, so nothing that survives
+     * canonicalization is laundered — a newline-only cell is still not blank
+     * and is still refused. */
     const studentId = studentIds[index];
     const rawLabel = labels[index];
-    const labelIsBlank = HORIZONTAL_WHITESPACE_ONLY_PATTERN.test(rawLabel);
+    const labelIsBlank = HORIZONTAL_WHITESPACE_ONLY_PATTERN.test(canonicalizeLabel(rawLabel));
 
     /* An entirely empty row inside the declared dimension: no ID, no label,
      * nothing recorded. Only a genuinely empty ID cell qualifies, so a padded
@@ -2134,12 +2294,38 @@ const STAGING_OPEN_FLAGS =
  * service being reachable only over loopback protects it from the network and
  * not at all from another local principal.
  *
- * On Windows the mode is not an ACL: only the write bit is honoured, and the
- * file inherits the ACLs of its directory. That is why the operator
- * documentation requires a PRIVATE directory for `ACTIVITY_STORE` rather than
- * a shared temporary one — on that platform the directory is the control.
+ * On Windows this mode is NOT the access control and cannot be made into it:
+ * the platform derives only the read-only attribute from a mode, `fs.stat`
+ * reports `0666` there whatever the file's real permissions are, and a created
+ * file otherwise takes the INHERITABLE ACEs of the directory it was created
+ * in. The narrowing on that platform is therefore a separate step —
+ * `restrictStagedFileToItsOwner` below — and the mode is still passed because
+ * it costs nothing and is the whole control wherever it means anything.
  */
 const STAGING_FILE_MODE = 0o600;
+
+/**
+ * Whether this platform's file MODE is its access control.
+ *
+ * `process.getuid` exists exactly where POSIX ownership and mode semantics do,
+ * so asking for it asks the question that actually matters rather than naming
+ * platforms — a list that would have to be kept in step with every platform
+ * that grows or loses those semantics. Where this holds, the staging file is
+ * `chmod`ed through its descriptor and that is the end of it; where it does not,
+ * the mode restricts nothing and something else has to.
+ */
+const PLATFORM_HONOURS_FILE_MODE = typeof process.getuid === 'function';
+
+/**
+ * Whether this platform expresses access control as an ACL that a created file
+ * INHERITS from its directory — which is precisely what makes the mode above
+ * insufficient and a narrowing step necessary.
+ *
+ * A platform test rather than a capability test, deliberately, because there is
+ * no capability to probe: nothing in the runtime reports "my permissions are
+ * ACLs", and the tool that sets one is named per platform anyway.
+ */
+const PLATFORM_RESTRICTS_BY_ACL = process.platform === 'win32';
 
 /**
  * How many times the exclusive create may be retried after removing what it
@@ -2200,9 +2386,269 @@ async function openStagingFileExclusively() {
   }
 }
 
+/* ------------------------------------------------------------------------- *
+ * Narrowing the staged file where the mode cannot
+ *
+ * WHY THIS EXISTS AT ALL. `STAGING_FILE_MODE` is the whole control on POSIX
+ * and no control whatsoever on Windows. MEASURED on this project's Windows
+ * runtime, in a directory carrying the ordinary inherited defaults: a staging
+ * file created with exactly the flags and mode above lands with
+ * `NT AUTHORITY\Authenticated Users:(I)(M)` and `BUILTIN\Users:(I)(M)`, and
+ * the rename then publishes that ACL onto the store. Every local principal
+ * could therefore READ submitted student data and — the worse half — REWRITE
+ * it, which is an integrity path into the service's own responses: the loader
+ * accepts any document that passes its shape checks, so forged records are
+ * served back, and a deliberately invalid one forces `E_STORE_UNREADABLE` on
+ * every read. Naming a private directory as the operator's responsibility did
+ * not prevent any of that in the DEFAULT configuration, so the narrowing is
+ * done here rather than assumed of whoever set `ACTIVITY_STORE`.
+ *
+ * WHY A TOOL. The runtime has no ACL API: `fs.chmod` toggles the read-only
+ * attribute on that platform and nothing else, and no flag to `fs.open` can
+ * supply a security descriptor. The platform's own `icacls` is the only
+ * mechanism available without a native addon, which the zero-dependency
+ * posture rules out.
+ *
+ * WHAT IT CANNOT DO, STATED RATHER THAN GLOSSED. The tool addresses a file by
+ * PATH, and no by-descriptor equivalent exists, so there is a window between
+ * this module creating the file and the tool opening it. The staging file is
+ * created EXCLUSIVELY, and its identity is compared against the descriptor's
+ * immediately before and immediately after the tool runs, so a name swapped
+ * underneath it refuses the write instead of publishing a document whose
+ * permissions were applied to something else. The residual window is the
+ * tool's own open, it requires a store directory in which another principal
+ * may delete files — exactly the arrangement the operator documentation
+ * forbids — and it is why that documentation still asks for a private
+ * directory even though the service no longer depends on getting one.
+ * ------------------------------------------------------------------------- */
+
 /**
- * Proves the opened staging descriptor is the private regular file this
- * module just created, and pins its mode.
+ * The platform's access-control tool, by ABSOLUTE path, or `null` where the
+ * platform needs none or does not have it.
+ *
+ * ABSOLUTE, and that is the security-relevant part. A bare `icacls` would be
+ * resolved by searching the current directory and then `PATH`, so a file of
+ * that name dropped beside the service would be executed in its place — a
+ * privileged-path defect introduced while fixing a permissions one. The
+ * location comes from the platform's own published system root, with the
+ * conventional path as a fallback, and is confirmed to exist at load so a
+ * missing tool is known before a submission depends on it.
+ *
+ * This is the one environment value the feature reads besides `ACTIVITY_STORE`,
+ * and it is deliberately NOT configuration: it names where the operating system
+ * keeps its own files, it cannot change what the service does, and pointing it
+ * anywhere that does not hold the tool makes writes REFUSE rather than fall
+ * back to something weaker.
+ */
+const ACL_TOOL_PATH = (() => {
+  if (!PLATFORM_RESTRICTS_BY_ACL) {
+    return null;
+  }
+  const systemRoot =
+    typeof process.env.SystemRoot === 'string' && process.env.SystemRoot !== ''
+      ? process.env.SystemRoot
+      : 'C:\\Windows';
+  const candidate = path.join(systemRoot, 'System32', 'icacls.exe');
+  return fsSync.existsSync(candidate) ? candidate : null;
+})();
+
+/**
+ * The single access right the staged file is left carrying: full control for
+ * whoever OWNS it, and nothing for anybody else.
+ *
+ * `S-1-3-4` is the well-known OWNER RIGHTS identifier, and a literal SID is
+ * used rather than an account name for two reasons. It needs no lookup, so the
+ * write path cannot fail because a name did not resolve in a container, under a
+ * virtual account or on a host that has lost its domain; and it is not
+ * localized, so the grant reads the same on every installation. The owner of a
+ * file this module creates always comes from this process's own token, so this
+ * grant can never lock the service out of the store it just wrote.
+ *
+ * Paired with `/inheritance:r`, which REMOVES the ACEs the file inherited from
+ * its directory — the grant alone would leave those in place, and they are the
+ * whole finding.
+ */
+const ACL_OWNER_GRANT = '*S-1-3-4:(F)';
+
+/**
+ * How long the tool is given before the write is refused.
+ *
+ * Bounded because this runs inside the write mutex: a tool that never returns
+ * would hold up every later submission indefinitely, so it is the write that
+ * fails rather than the service that stops responding. Far above the measured
+ * cost of the call — about 18 ms on this host — so a slow but working host is
+ * never refused.
+ */
+const ACL_TOOL_TIMEOUT_MS = 10_000;
+
+/** A bound on what the tool may write back, so its output cannot grow memory. */
+const ACL_TOOL_OUTPUT_LIMIT_BYTES = 64 * 1024;
+
+/**
+ * Runs the access-control tool and resolves once it has succeeded.
+ *
+ * `execFile` rather than `exec`: there is no shell, so the path and the grant
+ * are arguments rather than text a shell re-parses, and nothing in either can
+ * be read as a command. The call goes through the module object so a test can
+ * substitute it — the only way to exercise the refusal below without a host
+ * that genuinely cannot set an ACL.
+ *
+ * @param {Array<string>} args The tool's arguments.
+ * @returns {Promise<void>} Resolves when the tool exited zero.
+ */
+function runAclTool(args) {
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(
+      ACL_TOOL_PATH,
+      args,
+      {
+        windowsHide: true,
+        timeout: ACL_TOOL_TIMEOUT_MS,
+        maxBuffer: ACL_TOOL_OUTPUT_LIMIT_BYTES,
+      },
+      (fault) => {
+        if (fault === null || fault === undefined) {
+          resolve();
+          return;
+        }
+        reject(fault);
+      }
+    );
+  });
+}
+
+/**
+ * Describes a tool failure in a form a message may carry.
+ *
+ * Deliberately narrow. The tool reports a refusal on stderr QUOTING THE FILE
+ * IT WAS GIVEN, and the fault object carries the whole command line in `cmd`,
+ * so neither may reach a message this module composes — every message here is
+ * contracted to be free of filesystem paths. An exit status, an errno or the
+ * fact that it was killed is the whole of what is useful and the whole of what
+ * is safe. The fault itself still travels as the refusal's `cause`, where a
+ * developer can inspect it.
+ *
+ * @param {unknown} fault The rejection from `runAclTool`.
+ * @returns {string} For example `'ENOENT'`, `'ETIMEDOUT'` or `'exit status 5'`.
+ */
+function describeToolFault(fault) {
+  if (fault === null || typeof fault !== 'object') {
+    return 'an unidentified fault';
+  }
+  if (typeof fault.code === 'string') {
+    return fault.code;
+  }
+  if (fault.killed === true) {
+    return 'ETIMEDOUT';
+  }
+  if (typeof fault.code === 'number') {
+    return `exit status ${fault.code}`;
+  }
+  return 'an unidentified fault';
+}
+
+/**
+ * Refuses the write unless the staging PATH still names the file this module
+ * holds open.
+ *
+ * The identity is the filesystem's own — the device and the file's serial
+ * within it — read as BIGINTS because on this platform the serial EXCEEDS what
+ * a double represents exactly: one measured here was 10133099161951476, well
+ * past 2^53, so a plain `stat` would compare two rounded numbers and could
+ * call two different files the same one.
+ *
+ * @param {{dev: bigint, ino: bigint}} held The descriptor's own identity.
+ * @returns {Promise<void>}
+ * @throws {Error} E_STORE_WRITE_FAILED when the path names something else, or
+ *   when it cannot be inspected at all.
+ */
+async function refuseIfStagingPathMoved(held) {
+  let atPath;
+  try {
+    atPath = await fs.stat(RESOLVED_TEMPORARY_PATH, { bigint: true });
+  } catch (cause) {
+    throw refuse(
+      CODE_STORE_WRITE_FAILED,
+      `the activity store could not be written (${describeCause(cause)}); its staging path could not be confirmed to still name the file being written, the previous document is intact and the submission was not persisted`,
+      { reason: 'staging_path_unconfirmable', cause }
+    );
+  }
+
+  if (atPath.dev !== held.dev || atPath.ino !== held.ino) {
+    throw refuse(
+      CODE_STORE_WRITE_FAILED,
+      'the activity store could not be written (its staging path stopped naming the file being written, so another process replaced it mid-write); the previous document is intact and the submission was not persisted',
+      { reason: 'staging_path_swapped' }
+    );
+  }
+}
+
+/**
+ * Leaves the staged file readable and writable by its owner alone, on the
+ * platform where the mode cannot say so.
+ *
+ * Called BEFORE a single byte of the document is written, so the file is never
+ * a world-writable file that happens to contain student data — at the moment it
+ * is widest it is also empty. The rename carries the resulting ACL onto the
+ * store, which is what makes one call per write sufficient rather than a second
+ * pass over the published document.
+ *
+ * FAILS CLOSED, on every branch. A tool that is absent, that cannot be run,
+ * that times out or that exits non-zero — a filesystem with no ACL to set would
+ * present as the last of these — refuses the write with the same
+ * `E_STORE_WRITE_FAILED` a full disk gets, so the previous document stays intact
+ * and the caller sees `500 store_write_failed` and may safely retry. What must
+ * never happen is the other outcome: publishing a document this module could not
+ * protect while reporting success.
+ *
+ * @param {import('node:fs/promises').FileHandle} handle The staging descriptor.
+ * @returns {Promise<void>}
+ * @throws {Error} E_STORE_WRITE_FAILED when the restriction could not be applied
+ *   and proved to have been applied to this file. The caller closes and removes
+ *   the staging file.
+ */
+async function restrictStagedFileToItsOwner(handle) {
+  if (ACL_TOOL_PATH === null) {
+    throw refuse(
+      CODE_STORE_WRITE_FAILED,
+      "the activity store could not be written (this platform's access-control tool could not be located, so the staging file's inherited permissions could not be narrowed to its owner); the previous document is intact and the submission was not persisted",
+      { reason: 'staging_acl_tool_unavailable' }
+    );
+  }
+
+  let held;
+  try {
+    held = await handle.stat({ bigint: true });
+  } catch (cause) {
+    throw refuse(
+      CODE_STORE_WRITE_FAILED,
+      `the activity store could not be written (${describeCause(cause)}); its staging file could not be identified before its permissions were narrowed, the previous document is intact and the submission was not persisted`,
+      { reason: 'staging_uninspectable', cause }
+    );
+  }
+
+  await refuseIfStagingPathMoved(held);
+
+  try {
+    await runAclTool([RESOLVED_TEMPORARY_PATH, '/inheritance:r', '/grant:r', ACL_OWNER_GRANT]);
+  } catch (cause) {
+    throw refuse(
+      CODE_STORE_WRITE_FAILED,
+      `the activity store could not be written (${describeToolFault(cause)}); its staging file could not be restricted to its owner, the previous document is intact and the submission was not persisted`,
+      { reason: 'staging_acl_not_restricted', cause }
+    );
+  }
+
+  /* The same check again, and not for symmetry: the tool acted on a NAME, so
+   * this is what establishes that the permissions it set belong to the file
+   * about to become the store rather than to something that took the name in
+   * between. */
+  await refuseIfStagingPathMoved(held);
+}
+
+/**
+ * Proves the opened staging descriptor is the regular file this module just
+ * created, and restricts it to its owner.
  *
  * Exclusive creation already establishes most of this, so each check states
  * what it adds rather than repeating it:
@@ -2215,22 +2661,35 @@ async function openStagingFileExclusively() {
  *     describe on their own: it is not a link object, it is a second name for
  *     an existing file, and it reports `nlink >= 2`. Measured working on NTFS
  *     as well as POSIX.
- *   - `uid` — POSIX only, gated on `typeof process.getuid === 'function'`
- *     because Windows has no such concept and the property is meaningless
- *     there. It refuses a file owned by someone else, which a freshly created
- *     file cannot be unless the directory itself is not the operator's.
+ *   - `uid` — only where the platform has the concept, which is where
+ *     `PLATFORM_HONOURS_FILE_MODE` holds. It refuses a file owned by someone
+ *     else, which a freshly created file cannot be unless the directory itself
+ *     is not the operator's.
  *
- * `chmod` to `STAGING_FILE_MODE` is POSIX only and runs through the
- * DESCRIPTOR, not the path, so it cannot be redirected to another file
- * between the two calls. It makes the mode exactly `0600` whatever the
- * umask, and it also corrects the one case creation cannot: a mode is applied
- * only to a file being created, so without this a file that somehow survived
- * to become the store would keep a mode from elsewhere.
+ * THEN THE NARROWING, one mechanism per platform, because the two platforms
+ * express access control differently and neither expression works on the
+ * other:
+ *
+ *   - Where the MODE is the control, `chmod` to `STAGING_FILE_MODE` runs
+ *     through the DESCRIPTOR, not the path, so it cannot be redirected to
+ *     another file between the two calls. It makes the mode exactly `0600`
+ *     whatever the umask, and it also corrects the one case creation cannot: a
+ *     mode is applied only to a file being created, so without this a file that
+ *     somehow survived to become the store would keep a mode from elsewhere.
+ *   - Where access control is an inherited ACL, `restrictStagedFileToItsOwner`
+ *     replaces what the directory donated with a single grant to the file's
+ *     owner. Without it the mode above restricts nothing at all on that
+ *     platform and the store is published world-writable — see that function's
+ *     own note for the measurement.
+ *
+ * Both run BEFORE any byte of the document is written, so the file is never
+ * widely accessible while it holds data.
  *
  * @param {import('node:fs/promises').FileHandle} handle The staging descriptor.
  * @returns {Promise<void>}
- * @throws {Error} E_STORE_WRITE_FAILED when the descriptor fails any check or
- *   its mode cannot be set. The caller closes and removes the file.
+ * @throws {Error} E_STORE_WRITE_FAILED when the descriptor fails any check, or
+ *   its mode cannot be set, or its inherited permissions cannot be narrowed.
+ *   The caller closes and removes the file.
  */
 async function verifyStagingDescriptor(handle) {
   let stats;
@@ -2257,7 +2716,7 @@ async function verifyStagingDescriptor(handle) {
       { reason: 'staging_multiply_linked' }
     );
   }
-  if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) {
+  if (PLATFORM_HONOURS_FILE_MODE && stats.uid !== process.getuid()) {
     throw refuse(
       CODE_STORE_WRITE_FAILED,
       'the activity store could not be written (its staging file is owned by another user, so it must not be written or renamed onto the store); the previous document is intact and the submission was not persisted',
@@ -2265,11 +2724,9 @@ async function verifyStagingDescriptor(handle) {
     );
   }
 
-  /* POSIX only. Windows honours just the write bit through `chmod`, and
-   * calling it there would claim a restriction the platform does not apply —
-   * the directory's inherited ACLs are the control on that platform, which is
-   * why the operator documentation requires a private directory. */
-  if (typeof process.getuid === 'function') {
+  if (PLATFORM_HONOURS_FILE_MODE) {
+    /* The mode IS the access control here, and it is set through the
+     * descriptor so no second path resolution can redirect it. */
     try {
       await handle.chmod(STAGING_FILE_MODE);
     } catch (cause) {
@@ -2278,6 +2735,10 @@ async function verifyStagingDescriptor(handle) {
         `the activity store could not be written (${describeCause(cause)}); its staging file could not be restricted to its owner, the previous document is intact and the submission was not persisted`,
         { reason: 'staging_mode_not_restricted', cause });
     }
+  } else if (PLATFORM_RESTRICTS_BY_ACL) {
+    /* The mode restricts NOTHING here — the file carries whatever its
+     * directory donated — so the ACL is what has to be narrowed. */
+    await restrictStagedFileToItsOwner(handle);
   }
 }
 
@@ -2398,11 +2859,15 @@ async function publishStagedDocument() {
  * truncated in place — which is also what stops it donating its MODE to the
  * document that becomes the store.
  *
- * MODE. The staging file is created `0600` and, on POSIX, `chmod`ed to `0600`
- * through the descriptor so the umask cannot loosen it; the rename carries
- * that mode onto the store. Windows honours only the write bit and otherwise
- * inherits the directory's ACLs, so on that platform the private directory
- * required of `ACTIVITY_STORE` is the control rather than the mode.
+ * PERMISSIONS. The staging file is restricted to its owner BEFORE any byte of
+ * the document is written, by whichever mechanism the platform actually
+ * honours: where the mode is the control it is created `0600` and `chmod`ed to
+ * `0600` through the descriptor so the umask cannot loosen it, and where access
+ * control is an inherited ACL the ACEs the directory donated are replaced with
+ * a single grant to the owner. The rename then carries that onto the store,
+ * which is why the store is never published wider than the staging file was.
+ * A restriction that cannot be applied REFUSES the write rather than publishing
+ * an unprotected document.
  *
  * On failure with the process alive, the previous document is left intact and
  * the submission is simply not persisted; retrying is safe, because a
@@ -2729,16 +3194,19 @@ function isKnownStudent(studentId) {
  * No closed vocabulary is imposed. The existing workbook column is
  * unconstrained free text, and an enumeration invented here would refuse a
  * legitimate new club while claiming a constraint the data never carried.
- * Case-insensitive deduplication is the mitigation for near-duplicates
- * instead.
+ * Canonical, case-insensitive deduplication is the mitigation for
+ * near-duplicates instead: the label is put into Unicode NFC with the
+ * invisible formatting characters removed, so a precomposed `é` and an `e`
+ * followed by a combining acute are one activity rather than two records that
+ * render identically.
  *
  * @param {unknown} raw The submitted label, for example `'  Chess   Club  '`.
- * @returns {string} The normalized label, for example `'Chess Club'`, with
- *   the submitted casing preserved.
+ * @returns {string} The normalized label, for example `'Chess Club'`, in
+ *   canonical form and with the submitted casing preserved.
  * @throws {Error} E_LABEL_INVALID when the label is not a string, is empty
- *   once trimmed, carries a control character or a line separator, or falls
- *   outside the 1-to-60-character bound — counted in UTF-16 code units, as
- *   the intake form's `maxlength` is — once normalized.
+ *   once canonicalized and trimmed, carries a control character or a line
+ *   separator, or falls outside the 1-to-60-character bound — counted in
+ *   UTF-16 code units, as the intake form's `maxlength` is — once normalized.
  */
 function normalizeLabel(raw) {
   const inspected = inspectLabel(raw);
