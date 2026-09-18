@@ -48,8 +48,7 @@ Every value has the same precedence: an explicit `options` property passed to `c
 | Environment variable   | `options` property    | Default                           | Validation |
 | ---------------------- | --------------------- | --------------------------------- | ---------- |
 | `PORT`                 | `port`                | `3000`                            | Must match one to five decimal digits in full and fall in `0`–`65535`. `0` means "bind an ephemeral port". `1.5`, `3000abc`, `70000` and an empty value are startup errors, not silently coerced values. |
-| `HOST`                 | `host`                | `127.0.0.1`                       | Must be non-empty after trimming. An empty value is a startup error rather than an implicit bind to every interface. A value beyond loopback additionally requires `ALLOWED_HOSTS` — see [Security](#security). |
-| `ALLOWED_HOSTS`        | `allowedHosts`        | none — the loopback default needs none | The authorities this server answers for, beyond the loopback set a loopback bind already answers for: a comma-separated list, or an array programmatically. Each entry is a host with an optional port (`app.example`, `app.example:8080`, `[::1]:8080`) and nothing else — a scheme, path, userinfo or whitespace is a startup error naming the entry. An entry carrying a port matches only that exact `host:port`; an entry carrying none matches that host on any port. **Required when `HOST` reaches beyond loopback**, where startup fails without it. |
+| `HOST`                 | `host`                | `127.0.0.1`                       | Must be non-empty after trimming. An empty or whitespace-only value is a startup error rather than an implicit bind to every interface. Any other value is accepted, including one beyond loopback — see the warning under [Security](#security) before using one. |
 | `ACTIVITIES_DATA_PATH` | `activitiesDataPath`  | `activities.json` beside `server.js` | A relative value is resolved against the entrypoint's directory. The file itself may be absent, but its directory must exist and be writable, or startup fails. |
 | `WORKBOOK_DIR`         | `workbookDir`         | the directory of `server.js`      | Any path holding `student_details.xlsx` and `student_other_info.xlsx`. A relative value is resolved against the entrypoint's directory. |
 
@@ -57,56 +56,10 @@ Every value has the same precedence: an explicit `options` property passed to `c
 working directory**, so `node /path/to/server.js` reads the committed workbooks and registry no
 matter where it was launched from.
 
-`HOST` selects the interface to bind; `ALLOWED_HOSTS` is a different question — which `Host`
-authorities the service will answer for once a request arrives. The two are related by one rule:
-the default loopback bind answers for the loopback authorities without being told, and any wider
-bind must name its authorities or startup fails. Both halves are set out under
-[Security](#security).
-
-### Write-path limits
-
-`POST` is the one route that consumes resources a request does not release: pending write work while
-it is queued, and a registry record for good afterwards. Four ceilings bound both, and all four are
-configurable at the same precedence as the values above.
-
-| Environment variable         | `options` property        | Default  | Bounds |
-| ---------------------------- | ------------------------- | -------- | ------ |
-| `MAX_PENDING_WRITES`         | `maxPendingWrites`        | `16`     | Writes in flight at once, where a write is in flight from the moment its `POST` is admitted — before the body is read — until it settles. A `POST` that cannot acquire capacity is refused with `503` without its body being read at all. |
-| `MAX_ACTIVITIES_PER_STUDENT` | `maxActivitiesPerStudent` | `32`     | Activities one student may hold, counting the workbook record — which is also the size of that student's `GET` response. |
-| `MAX_REGISTRY_RECORDS`       | `maxRegistryRecords`      | `1000`   | Records `activities.json` may hold in total. |
-| `MAX_REGISTRY_BYTES`         | `maxRegistryBytes`        | `262144` | Serialized size of `activities.json`. Measured on the bytes a write would actually produce, so it also bounds the cost of the full-file rewrite each write performs. |
-
-Each must be an integer of at least 1, validated as a whole string exactly as `PORT` is: `0`, `1.5`,
-`16abc` and an empty value are startup errors rather than silently different ceilings. The record
-ceiling normally binds before the byte ceiling — 1000 records of a 64-character activity serialize to
-roughly 100 KB — so the byte ceiling is the backstop that catches a registry already larger than its
-record count suggests.
-
-`MAX_PENDING_WRITES` is **acquired, not merely checked**. A `POST` takes one unit of that capacity
-before its body is read and holds it until the write settles or the request ends, so a slow or
-abandoned upload occupies a slot for as long as it occupies the process, and at most
-`MAX_PENDING_WRITES` requests can be reading a body at once. Checking instead of acquiring would
-admit every request in a simultaneous burst, since none of them has enqueued a write yet.
-
-These are **finite capacity, not rate limiting**: they are per process, they count every caller
-together, and they say nothing about how often any one client may ask. No per-client rate limiter,
-request timeout or connection cap is part of this service. A ceiling that has been reached is
-reported to the client and **not** logged, because a line per refused request would make a flood of
-them a second unbounded resource.
-
-**What is observable, and what is not.** The ceilings in force are on `server.config`
-(`maxPendingWrites`, `maxActivitiesPerStudent`, `maxRegistryRecords`, `maxRegistryBytes`). Of the
-counts behind them, only the per-student one is visible over HTTP — as the `count` of
-`GET /api/students/{studentId}/activities`. The number of writes currently in flight and the
-registry's byte size are **not** exposed by any route, and the roster's counts include the
-workbook-sourced records, so they cannot be read as the registry's own record count; that count is
-`activities.json`'s array length, read from the file. Programmatically, the repository's
-`checkWriteAdmission(studentId)` reports which ceiling would refuse a write without acquiring
-anything.
-
-A registry that is *already* past a ceiling — a hand edit, or a ceiling lowered afterwards — still
-loads and is still served in full. Only further writes are refused; nothing is truncated, and no
-record is ever deleted or reclaimed by the service.
+Those four are the whole configuration surface of the service. `createServer` and `start` accept two
+further properties, `directory` and `repository`, but they are an injection seam for tests rather
+than configuration: they are read straight off the options object and are deliberately not part of
+what `resolveConfig` returns.
 
 `MIN_TESTS` is the one further environment variable this project reads, and it configures the
 **test guard rather than the service**; it is documented with the rest of the verification surface
@@ -266,8 +219,6 @@ Each code has one fixed sentence, so two requests that fail the same way produce
 | Status | Code                        | When                                                                                          | `message` |
 | ------ | --------------------------- | --------------------------------------------------------------------------------------------- | --------- |
 | `400`  | `INVALID_STUDENT_ID`        | The identifier fails `/^S\d{3}$/` after normalization, or its path segment carries a malformed percent-escape | `Student ID must match S followed by three digits: <value>` |
-| `400`  | `INVALID_HOST`              | The `Host` header is present but unusable: empty, sent twice, or not an authority — judged before the target is parsed; see [Request authority validation](#request-authority-validation) | `Host header must be a single valid authority` |
-| `421`  | `MISDIRECTED_REQUEST`       | The authority parses and is not one this server answers for — the DNS-rebinding case; see [Request authority validation](#request-authority-validation) | `Request authority is not served by this server` |
 | `400`  | `MALFORMED_JSON`            | The request body is not parseable JSON                                                         | `Request body is not valid JSON` |
 | `400`  | `INVALID_ACTIVITY`          | `activity` is missing, not a string, empty or whitespace-only, or longer than 64 characters    | `activity must be a string of 1 to 64 characters` |
 | `400`  | `UNEXPECTED_FIELD`          | The body carries any key other than `activity`                                                 | `Unexpected field: <key>` |
@@ -278,15 +229,9 @@ Each code has one fixed sentence, so two requests that fail the same way produce
 | `413`  | `PAYLOAD_TOO_LARGE`         | The request body exceeds 8192 bytes                                                            | `Request body exceeds 8192 bytes` |
 | `415`  | `UNSUPPORTED_MEDIA_TYPE`    | A `POST` without `Content-Type: application/json`                                              | `Content-Type must be application/json` |
 | `500`  | `INTERNAL_ERROR`            | An internal fault — a failed registry write, the only condition that produces a `500`. The detail goes to stderr; no exception text or stack is ever returned | `Could not persist the activity record` |
-| `503`  | `ACTIVITY_WRITE_QUEUE_FULL` | A `POST` arrived while `maxPendingWrites` writes were already in flight — counting from the moment each was admitted, so a request still uploading its body counts. The response carries `Retry-After: 1`, and the capacity is released as those requests finish | `Too many activity writes are in flight; retry shortly` |
-| `507`  | `STUDENT_ACTIVITY_LIMIT_REACHED` | The student already holds `maxActivitiesPerStudent` activities. `<id>` is the normalized identifier; the configured ceiling is deliberately not disclosed | `Student <id> has reached the maximum number of recorded activities` |
-| `507`  | `ACTIVITY_REGISTRY_FULL`    | The registry has reached `maxRegistryRecords` records, or the write would take it past `maxRegistryBytes`                                       | `The activity registry has reached its configured capacity` |
 
-The two authority codes are decided before anything else and are documented in full under [Security](#security). The last three report a **bound rather than a fault**, which is why none of them is a `500` and none
-is a `409`: nothing failed and nothing conflicted, the write was declined. `503` is the temporal one
-— the queue drains, so it names when to retry — while `507 Insufficient Storage` (RFC 4918 §11.5) is
-the standing one, and it keeps failing until records are removed by hand or a ceiling is raised.
-Every one of them writes nothing: no record, no rewrite, and no `activities.json.tmp`.
+Those eleven are the whole error contract: no other status and no other code is produced by any
+route, and the table is the complete list rather than a selection from one.
 
 How the placeholders render: `<value>` for an identifier is the raw, still-encoded path segment as
 received, truncated to 64 characters — never the decoded form and never the normalized one. Both
@@ -298,10 +243,7 @@ request target with the query string removed and is **not** truncated, so a `404
 `/api/unknown?x=1` reads `No route for GET /api/unknown` and a long unrecognised target is named in
 full — the 64-character cap applies only to identifier and activity values; `<key>` is the first
 offending key in the body's own key order; `<method>` is the request method verbatim; and `<id>`,
-the normalized identifier, appears in exactly two sentences — `ACTIVITY_ALREADY_RECORDED` and
-`STUDENT_ACTIVITY_LIMIT_REACHED`. No message interpolates a configured ceiling: a client can do
-nothing with the number, so each of the three bound codes keeps one fixed sentence whatever the
-deployment.
+the normalized identifier, appears in exactly one sentence — `ACTIVITY_ALREADY_RECORDED`.
 
 `Allow` values are exact and ordered:
 
@@ -313,32 +255,24 @@ deployment.
 
 `Content-Type` is matched on the media type only, so `application/json; charset=utf-8` is accepted.
 An error answered before the request body has been read declares `Connection: close` and abandons
-the request stream: the authority gate (`INVALID_HOST`, `MISDIRECTED_REQUEST`), every stage through identifier existence — the `405`s with their `Allow`,
+the request stream: every stage through identifier existence — the `405`s with their `Allow`,
 `INVALID_STUDENT_ID`, `STUDENT_NOT_FOUND`, the `415`, and the root `405` and unrecognised-path `404`
-the entrypoint writes — plus **write admission**, whose `503 ACTIVITY_WRITE_QUEUE_FULL` and `507`
-quota refusals are decided one stage earlier still, and the mid-stream `413`. A connection whose body
-was never interpreted is not one to reuse, and declaring that is what stops a keep-alive client
-pipelining behind a discarded body. Errors decided after the body was fully read — `MALFORMED_JSON`,
-`UNEXPECTED_FIELD`, `INVALID_ACTIVITY`, `ACTIVITY_ALREADY_RECORDED`, `INTERNAL_ERROR`, and the two
-bound codes when they are reached *after* admission (a `507` from the byte ceiling, which can only be
-measured once the write is serialized, or either code from a ceiling reached while the body was being
-read) — and every successful response keep default connection handling.
+the entrypoint writes — plus the mid-stream `413`. A connection whose body was never interpreted is
+not one to reuse, and declaring that is what stops a keep-alive client pipelining behind a discarded
+body. Errors decided after the body was fully read — `MALFORMED_JSON`, `UNEXPECTED_FIELD`,
+`INVALID_ACTIVITY`, `ACTIVITY_ALREADY_RECORDED`, `INTERNAL_ERROR` — and every successful response
+keep default connection handling.
 
-**Validation order is fixed**, so a request with several faults gets one predictable response: `Host` authority, then path,
-then method, then identifier shape, then identifier existence, then — for `POST` only — **write
-admission**, media type, body size, JSON parse, unexpected keys, `activity` validity, the duplicate
-check and finally persistence. A `POST` to an unknown student carrying an oversize, unparseable body
-therefore answers `404`, not `413` or `400`.
+**Validation order is fixed**, so a request with several faults gets one predictable response: path
+recognition, then method, then identifier shape, then identifier existence, then — for `POST` only —
+media type, body size, JSON parse, unexpected keys, `activity` validity, the duplicate check and
+finally persistence. A `POST` to an unknown student carrying an oversize, unparseable body therefore
+answers `404`, not `413` or `400`.
 
-Write admission sits where it does on purpose: every stage after it interprets the request, and
-interpreting a request means buffering up to 8 KiB of it, so refusing first is what makes the bound
-worth having — a service at capacity reads no body at all. Two consequences follow, both
-deterministic. A request that is also malformed is told it was refused for capacity rather than told
-what was wrong with it; and a student at their ceiling gets `507` even for an oversize or unparseable
-body, where an unbounded service would have answered `413` or `400`. Identifier shape and existence
-still outrank admission, so an unknown student is a `404` whatever the load. The registry's byte
-ceiling is the one bound that cannot be judged before the write is serialized, so it is enforced at
-the persistence step instead — after the body has been read, and still before anything is written.
+Nothing precedes path recognition: the first question asked of any request is which route it names,
+and the `Host` header is not consulted at any stage. Identifier shape and existence are decided
+before a single body byte is read, which is what makes that `404` outrank both the size cap and the
+parse failure.
 
 ## Activity data
 
@@ -433,18 +367,12 @@ the group's first member, and groups are ordered by `activityKey` ascending.
   can survive, and an undeletable `activities.json.tmp` is a signal to look at the stderr log and
   the file's permissions. Writes are serialized on a single queue, so two concurrent `POST`s of the
   same activity produce one `201` and one `409`.
-- That queue is **bounded**, and so is what it writes. `MAX_PENDING_WRITES` caps the writes in
-  flight; `MAX_ACTIVITIES_PER_STUDENT`, `MAX_REGISTRY_RECORDS` and `MAX_REGISTRY_BYTES` cap what
-  accumulates. Without them the registry, each per-student response and the cost of the full-file
-  rewrite every write performs would all grow with however many activities were posted, and nothing
-  reclaims a record — so the ceilings, and raising them deliberately, are the whole of the retention
-  policy. The defaults and their validation are under
-  [Write-path limits](#write-path-limits); the statuses a caller sees are `503` and `507` in
-  [Errors](#errors).
-- **Growing the registry on purpose** is a configuration change, not a code change: raise the
-  relevant ceiling, restart, and the previously refused writes are accepted. Shrinking it is a hand
-  edit of `activities.json` while the service is stopped — the service never deletes a record, and a
-  registry left above a lowered ceiling still loads and is served in full.
+- That queue is **unbounded**, and so is what it writes. There is no ceiling on the writes in flight,
+  on the activities one student may hold, or on the registry's record count or byte size, so the
+  registry, each per-student response and the cost of the full-file rewrite every write performs all
+  grow with however many activities are posted. Nothing reclaims a record: shrinking the registry is
+  a hand edit of `activities.json` while the service is stopped. That growth is an accepted risk of
+  the loopback-only deployment model — see [Accepted risks](#accepted-risks).
 - Writes are **single-process**. Two processes sharing one registry file would interleave; this
   service does not coordinate between instances.
 
@@ -530,57 +458,18 @@ The service binds `127.0.0.1` by default, and **that loopback default is the onl
 there is**: no authentication, no authorization, no TLS, no CORS and no rate limiting exists
 anywhere in this project. Every process on the host reaches the activity API anonymously.
 
-### Request authority validation
-
-A loopback bind keeps remote *packets* out. On its own it does not keep a remote *origin* out,
-because of DNS rebinding: an attacker serves a page from their own host under a DNS name with a
-very short TTL, then re-answers that name with `127.0.0.1`. The browser's next request goes to this
-service over a genuinely local connection while the browser still treats it as same-origin, so the
-attacker's script reads the response. No bind address can refuse such a request — it arrives from
-`127.0.0.1` — and the one thing that distinguishes it is the authority it must carry, which names
-the attacker's host rather than anything this service answers for. Browsers always send `Host` and
-script cannot change it, so that field is reliable here.
-
-Every request is therefore judged on its `Host` authority **before its target is parsed and before
-any route sees it**, which is why a refused request reaches no route, no student lookup, no body
-reader and no write queue:
-
-| Bind | Authorities answered for |
-| ---- | ------------------------ |
-| Loopback (the default `127.0.0.1`, any `127.x.y.z`, `localhost`, `::1`) | `localhost`, `127.0.0.1`, `::1` and the configured bind value itself — each **only on the port actually bound**, so a request for `localhost:3001` on a service listening on `3000` is refused, as is a portless authority (which means port 80) — plus anything `ALLOWED_HOSTS` adds |
-| Anything wider (`0.0.0.0`, `::`, a specific interface address, a hostname) | Exactly what `ALLOWED_HOSTS` names, and nothing implicit. **Startup fails when it names nothing**, rather than publishing a socket that answers for every authority |
-
-Comparison is case-insensitive and accepts `[::1]` as `::1`. A bracketed host must actually be an
-IPv6 literal, so `[::1.]` and `[not:ipv6]` are refused rather than repaired. One trailing dot is
-ignored on a **name** (`localhost.` is `localhost`, the fully qualified spelling a browser may
-send) and never on an IP literal, which has no fully qualified form. The same parser reads the
-`Host` header and every `ALLOWED_HOSTS` entry, so a listed authority and a request authority cannot
-disagree about spelling, and an entry that could never match is a startup error rather than a false
-sense of permission.
-
-Two refusals, both carrying the standard envelope and `Connection: close`, and both with a fixed
-sentence that echoes nothing the caller sent:
-
-| Status | Code | When | `message` |
-| ------ | ---- | ---- | --------- |
-| `400`  | `INVALID_HOST`        | The `Host` header is present but unusable: empty, sent twice, or not an authority (a scheme, path, userinfo, whitespace or an unparseable port) | `Host header must be a single valid authority` |
-| `421`  | `MISDIRECTED_REQUEST` | The authority parses and is simply not one this server answers for — the DNS-rebinding case | `Request authority is not served by this server` |
-
-An HTTP/1.0 request that sends no `Host` at all asserts no origin, so there is nothing to compare
-and it is served under the server's own authority; an HTTP/1.1 request without one is refused by
-the runtime before the service sees it. What this does **not** do is authenticate anybody: it
-confines the service to the authorities it was configured for, which is what makes the loopback
-default a real boundary rather than a nominal one. Everything below still applies.
-
-To publish the service deliberately, name the authority as well as the interface:
+To publish the service deliberately, name the interface:
 
 ```bash
-HOST=0.0.0.0 ALLOWED_HOSTS=activities.internal:3000 npm start
+HOST=0.0.0.0 npm start
 ```
 
+That start **succeeds**: `HOST` is validated for being a non-empty string and nothing else, so
+widening the bind is a decision the service will carry out rather than refuse.
+
 **Setting `HOST=0.0.0.0` publishes the service to the network while it authenticates nobody.** Put
-exactly, any client that can reach the bound address and addresses it by an authority
-`ALLOWED_HOSTS` names then has all of the following without presenting a credential:
+exactly, any client that can reach the bound address then has all of the following without
+presenting a credential:
 
 - **Read the `Student ID` of every student holding an activity** — all ten, `S001` through `S010`,
   in the committed data, since each holds one. A single `GET /api/activities` returns those
@@ -598,7 +487,21 @@ exactly, any client that can reach the bound address and addresses it by an auth
 What such a client cannot obtain is the rest of a directory row. The only directory field retained
 and serialized is `Name`, so no Gender, Date of Birth, Age, Department, Year, Email, Phone or City
 value can leave the process, and `student_academics.xlsx` is never opened by the service at all.
-That bound limits the exposure; it is not a substitute for access control. Nor is authority
-validation: it decides which authorities are answered for, never who is asking. Widening the bind
-is the change that would require authentication, authorization, TLS and rate limiting together, and
-none of them is implemented here.
+That bound limits the exposure; it is not a substitute for access control. Widening the bind is the
+change that would require authentication, authorization, TLS and rate limiting together, and none of
+them is implemented here.
+
+### Accepted risks
+
+These are known exposures that this service does **not** mitigate. Each is recorded rather than
+fixed, because the mitigation is access control or a quota subsystem and neither is part of this
+service; the loopback default is what keeps them out of reach.
+
+| Exposure | What it is | Why it is accepted |
+| -------- | ---------- | ------------------ |
+| **DNS rebinding** (CWE-346) | A loopback bind keeps remote *packets* out, not a remote *origin*. An attacker serves a page under a DNS name with a very short TTL, then re-answers that name with `127.0.0.1`; the browser's next request reaches this service over a genuinely local connection while the browser still treats it as same-origin, so the attacker's script reads the response. No bind address can refuse such a request. | Refusing it means validating the request's `Host` authority, which is an access-control mechanism. Authentication, authorization, CORS and rate limiting are all out of scope for this service, and the loopback bind plus the warning above is the whole of the access-control model. The exposure is bounded by what any local process already has: `Name` and activity records, and no other directory field. |
+| **Unbounded write workload** (CWE-770) | Every valid `POST` allocates response state and a task on the single-writer queue, and nothing caps how many may be in flight, so queue depth, memory and latency grow with however many requests a caller sends at once. | A quota or rate limit is out of scope. On a loopback-only service every caller is already a local process, which has cheaper ways to consume the same resources. |
+| **Unbounded registry growth** (CWE-770) | Nothing caps the activities one student may hold, or the registry's record count or byte size, so `activities.json`, each per-student response and the cost of the full-file rewrite every write performs all grow without limit. No route deletes a record. | Same reason. Shrinking the registry is a hand edit of `activities.json` with the service stopped, and a registry of any size still loads and is served in full. |
+
+None of the three is reachable from off the host while the default `HOST=127.0.0.1` stands. Widening
+the bind makes all three remotely reachable at once, which is what the warning above is about.

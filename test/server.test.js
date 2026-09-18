@@ -17,20 +17,21 @@
  * The greeting's "Sharebot" wording disagrees with the project name and is
  * preserved DELIBERATELY - assert it verbatim, never "fix" it.
  *
- * The loopback bind is a real boundary, not a nominal one. A DNS rebinding
- * attack reaches a loopback service through a browser, so the request arrives
- * locally and only the `Host` authority it must carry distinguishes it; the
- * cases below exercise that gate under the real entrypoint - a rebound
- * authority refused on the greeting, on both read routes and on the append
- * route, a supported loopback authority still served, and the configuration
- * that governs a wider bind.
+ * The `Host` header is not part of the contract and no test below sends one as
+ * a condition of being served: dispatch begins at path recognition, so the
+ * greeting and both read routes answer identically whatever authority a client
+ * names. The loopback default is the whole of the access control, and the
+ * residual DNS-rebinding exposure it leaves is recorded as an accepted risk in
+ * `README.md` rather than gated in code.
  *
  * WHAT CONSTRAINS EVERYTHING BELOW
  * ---------------------------------------------------------------------------
- *   - **It writes nothing inside the checkout.** No `POST` is issued anywhere
- *     in this file, so the committed `activities.json` and the workbooks are
- *     read-only throughout and `git status --porcelain` is identical before and
- *     after a run. The one directory it creates is an `fs.mkdtempSync`
+ *   - **It writes nothing inside the checkout.** The one `POST` it issues
+ *     carries a non-JSON `Content-Type`, so it is refused at the media-type
+ *     stage and can never reach persistence; the committed `activities.json` is
+ *     asserted byte-unchanged around it, and the workbooks are read-only
+ *     throughout, which is what keeps `git status --porcelain` identical before
+ *     and after a run. The one directory it creates is an `fs.mkdtempSync`
  *     directory under the system temp root, holding the two registry files that
  *     make relative-path resolution observable, and it is removed in the same
  *     test's `finally`.
@@ -112,40 +113,22 @@ const S001_PAYLOAD = {
   activities: [{ activity: 'Robotics Club', source: 'workbook' }]
 };
 
-/** The roster route, the second read surface an unchecked authority exposed. */
+/** The roster route, the feature's second read surface. */
 const ACTIVITIES_PATH = '/api/activities';
 
-/** The committed registry, asserted byte-unchanged after every rebound `POST`. */
-const REGISTRY_PATH = path.join(REPO_ROOT, 'activities.json');
-
-/* ---------------------------------------------------------------------------
- * The authority contract, written as literals for the same reason the greeting
- * is: an assertion derived from the implementation agrees with whatever the
- * implementation does.
- * ------------------------------------------------------------------------- */
+/**
+ * The number of groups the roster answers for the committed data: ten records
+ * over eight distinct activities, because `Robotics Club` and `Debate Society`
+ * each hold two students and `activities.json` ships empty.
+ */
+const ROSTER_GROUP_COUNT = 8;
 
 /**
- * The authority a rebound browser origin presents: the attacker's own name,
- * which is the one field the attack cannot change. Reaching this service with
- * it is the whole of the DNS-rebinding exposure, so every route is probed with
- * it.
+ * The committed registry. This file issues no successful `POST`, so it is
+ * asserted byte-unchanged - that is what keeps `git status --porcelain`
+ * identical across a run.
  */
-const REBOUND_AUTHORITY = `attacker.example:${DEFAULT_PORT}`;
-
-/** A loopback authority the service answers for, spelled the other legitimate way. */
-const LOCALHOST_AUTHORITY = `localhost:${DEFAULT_PORT}`;
-
-/** `421 Misdirected Request` - a parseable authority this server does not serve. */
-const STATUS_MISDIRECTED_REQUEST = 421;
-
-/** `400` - a `Host` header that is present but unusable. */
-const STATUS_BAD_REQUEST = 400;
-
-/** The two authority refusals, body included, since both sentences are fixed. */
-const MISDIRECTED_BODY = '{"error":{"code":"MISDIRECTED_REQUEST",'
-  + '"message":"Request authority is not served by this server"}}';
-const INVALID_HOST_BODY = '{"error":{"code":"INVALID_HOST",'
-  + '"message":"Host header must be a single valid authority"}}';
+const REGISTRY_PATH = path.join(REPO_ROOT, 'activities.json');
 
 /* ---------------------------------------------------------------------------
  * Deadlines. Every wait in this file is bounded, so a failure is a readable
@@ -158,16 +141,14 @@ const REQUEST_TIMEOUT_MS = 5000;
 const PROBE_TIMEOUT_MS = 2000;
 
 /**
- * The environment variables the feature reads. They are stripped from every
- * child's environment and then re-applied per test, so no value can leak in
- * from the shell that launched the suite or out of one test into the next.
- *
- * `ALLOWED_HOSTS` belongs here for a sharper reason than tidiness: an ambient
- * value would widen the authority policy of every child, so a rebound-authority
- * assertion could pass or fail on the shell's environment rather than on the
- * code.
+ * The four environment variables the feature reads - the whole of its
+ * configuration surface. They are stripped from every child's environment and
+ * then re-applied per test, so no value can leak in from the shell that
+ * launched the suite or out of one test into the next: an ambient `HOST` or
+ * `WORKBOOK_DIR` would otherwise let a test pass or fail on the environment
+ * rather than on the code.
  */
-const FEATURE_ENV_KEYS = ['PORT', 'HOST', 'ACTIVITIES_DATA_PATH', 'WORKBOOK_DIR', 'ALLOWED_HOSTS'];
+const FEATURE_ENV_KEYS = ['PORT', 'HOST', 'ACTIVITIES_DATA_PATH', 'WORKBOOK_DIR'];
 
 /**
  * Pinned options for every in-process `createServer`/`start` call.
@@ -552,14 +533,10 @@ const stop = async (handle, { signals = ['SIGTERM', 'SIGKILL'] } = {}) => {
  * The body is kept as a `Buffer` because the greeting is compared as bytes, not
  * as a decoded string: a byte-for-byte guarantee cannot survive a transcoding.
  *
- * `headers` exists for the authority assertions and is the mechanism that makes
- * them possible at all: an explicit `Host` REPLACES the one the client would
- * derive from the connection, which is precisely what a rebound browser origin
- * does - it connects to `127.0.0.1` while naming the attacker's authority.
- * Verified on the pinned runtime: supplying `Host` suppresses the automatic
- * header rather than adding a second one, so `req.rawHeaders` still carries
- * exactly one. An empty or duplicated value cannot be sent this way - the
- * client substitutes its own - which is what `rawRequest` below is for.
+ * `headers` carries the request headers a case needs - `Content-Type` for the
+ * media-type refusal, which is the only header any assertion in this file
+ * depends on. No test sets `Host`: dispatch begins at path recognition, so the
+ * authority a client names is not part of the contract.
  *
  * @param {{
  *   method?: string,
@@ -605,61 +582,6 @@ const httpRequest = ({ method = 'GET', path: requestPath, port = DEFAULT_PORT, h
     request.on('error', reject);
     request.end();
   });
-
-/**
- * Writes one request onto a raw socket and returns the response bytes.
- *
- * Needed because an HTTP client refuses to send the malformed authorities the
- * gate must refuse: `http.request` substitutes its own `Host` for an empty
- * value and will not emit a second `Host` line, and it never speaks HTTP/1.0.
- * Those three cases are only reachable by writing the request line and headers
- * directly.
- *
- * The socket is read to close - every authority refusal declares
- * `Connection: close`, so the server ends the connection itself - and the wait
- * is bounded so a missing response is a readable failure rather than a hang.
- *
- * @param {string} raw The complete request, CRLF-delimited.
- * @param {number} [port] The port to connect to.
- * @returns {Promise<{statusLine: string, status: number, text: string, raw: string}>}
- *   The response's status line, parsed status, body and full bytes.
- */
-const rawRequest = (raw, port = DEFAULT_PORT) => new Promise((resolve, reject) => {
-  const socket = net.connect({ host: HOST, port });
-  let received = '';
-  let settled = false;
-
-  const settle = (outcome, value) => {
-    if (settled) return;
-    settled = true;
-    socket.removeAllListeners();
-    socket.destroy();
-    outcome(value);
-  };
-
-  socket.setTimeout(REQUEST_TIMEOUT_MS, () => settle(
-    reject,
-    new Error(
-      `no response to the raw request within ${REQUEST_TIMEOUT_MS} ms; `
-        + `read ${JSON.stringify(received)}`
-    )
-  ));
-  socket.on('connect', () => socket.write(raw));
-  socket.on('data', (chunk) => {
-    received += chunk.toString('utf8');
-  });
-  socket.on('error', (error) => settle(reject, error));
-  socket.on('close', () => {
-    const statusLine = received.split('\r\n')[0];
-    const separatorAt = received.indexOf('\r\n\r\n');
-    settle(resolve, {
-      statusLine,
-      status: Number(statusLine.split(' ')[1]),
-      text: separatorAt === -1 ? '' : received.slice(separatorAt + 4),
-      raw: received
-    });
-  });
-});
 
 /**
  * Occupies a port so a bind conflict can be provoked deliberately.
@@ -799,10 +721,11 @@ test('the entrypoint prints the baseline startup banner as its first stdout line
   }
 });
 
-// The authority cases live on `/` on purpose: it is the one path that predates
-// the feature, so "the gate refuses a rebound origin" and "the gate refuses
-// nothing an ordinary client sends" have to be true at the same time.
-test('GET / still answers the byte-identical 34-byte baseline greeting to a served authority', async () => {
+// `/` is the one path that predates the feature, and the greeting is the only
+// behavioural guarantee the repository made before it. Asserted here against
+// the shipped entrypoint with nothing injected, because that is the artifact an
+// operator runs.
+test('GET / still answers the byte-identical 34-byte baseline greeting', async () => {
   const entry = spawnEntry();
   try {
     await waitForBanner(entry);
@@ -829,169 +752,6 @@ test('GET / still answers the byte-identical 34-byte baseline greeting to a serv
       GREETING_BYTE_LENGTH,
       `the greeting must be ${GREETING_BYTE_LENGTH} bytes, read ${response.body.length}`
     );
-
-    // The rebinding case itself. The connection is to `127.0.0.1` - exactly as
-    // a rebound browser's would be, which is why no bind address can refuse it
-    // - while the authority names the attacker. It must be refused before the
-    // route runs, and the refusal must carry none of the greeting.
-    const rebound = await httpRequest({ path: '/', headers: { Host: REBOUND_AUTHORITY } });
-    assert.equal(
-      rebound.status,
-      STATUS_MISDIRECTED_REQUEST,
-      `Host: ${REBOUND_AUTHORITY} must be refused with ${STATUS_MISDIRECTED_REQUEST}, `
-        + `read ${rebound.status} with body ${JSON.stringify(rebound.text)}`
-    );
-    assert.equal(
-      rebound.headers['content-type'],
-      JSON_MEDIA_TYPE,
-      `a refused authority must answer ${JSON_MEDIA_TYPE}, `
-        + `read ${JSON.stringify(rebound.headers['content-type'])}`
-    );
-    assert.equal(
-      rebound.text,
-      MISDIRECTED_BODY,
-      `the refusal must be the fixed envelope, read ${JSON.stringify(rebound.text)}`
-    );
-    assert.equal(
-      rebound.headers.connection,
-      'close',
-      `a refused authority must declare Connection: close, `
-        + `read ${JSON.stringify(rebound.headers.connection)}`
-    );
-    assert.ok(
-      !rebound.text.includes('Sharebot'),
-      `a refused authority must not receive the greeting, read ${JSON.stringify(rebound.text)}`
-    );
-
-    // The other half: every authority a legitimate client can present on this
-    // bind is still served, so the gate is a boundary rather than an outage.
-    const named = await httpRequest({ path: '/', headers: { Host: LOCALHOST_AUTHORITY } });
-    assert.equal(
-      named.status,
-      200,
-      `Host: ${LOCALHOST_AUTHORITY} is a supported loopback authority and must answer 200, `
-        + `read ${named.status} with body ${JSON.stringify(named.text)}`
-    );
-    assert.ok(
-      named.body.equals(GREETING_BYTES),
-      `Host: ${LOCALHOST_AUTHORITY} must receive the greeting byte for byte, `
-        + `read ${JSON.stringify(named.text)}`
-    );
-
-    // The port is part of the authority, not decoration: a loopback host on a
-    // port this process is not listening on was addressed at something else.
-    // `%d` is a real port number, so the value is well-formed - what fails is
-    // the comparison against the port actually bound.
-    const wrongPort = await httpRequest({ path: '/', headers: { Host: `${HOST}:${DEFAULT_PORT + 1}` } });
-    assert.equal(
-      wrongPort.status,
-      STATUS_MISDIRECTED_REQUEST,
-      `Host: ${HOST}:${DEFAULT_PORT + 1} must be refused on a server bound to ${DEFAULT_PORT}, `
-        + `read ${wrongPort.status}`
-    );
-
-    // A portless authority means the scheme default, port 80, which this
-    // service is not on.
-    const portless = await httpRequest({ path: '/', headers: { Host: HOST } });
-    assert.equal(
-      portless.status,
-      STATUS_MISDIRECTED_REQUEST,
-      `Host: ${HOST} implies port 80 and must be refused on ${DEFAULT_PORT}, `
-        + `read ${portless.status}`
-    );
-
-    // Userinfo is not part of an authority, and a value carrying it is unusable
-    // rather than merely unrecognised - hence 400, not 421.
-    const userinfo = await httpRequest({
-      path: '/',
-      headers: { Host: `admin@${HOST}:${DEFAULT_PORT}` }
-    });
-    assert.equal(
-      userinfo.status,
-      STATUS_BAD_REQUEST,
-      `Host: admin@${HOST}:${DEFAULT_PORT} must be a ${STATUS_BAD_REQUEST}, read ${userinfo.status}`
-    );
-    assert.equal(
-      userinfo.text,
-      INVALID_HOST_BODY,
-      `an unusable authority must be the fixed INVALID_HOST envelope, `
-        + `read ${JSON.stringify(userinfo.text)}`
-    );
-
-    // Brackets delimit an IPv6 literal, so their contents must be one. `[::1]`
-    // is a supported loopback authority and is served; the two malformed forms
-    // are refused rather than repaired, because a parser that normalized them -
-    // stripping that trailing dot, say - would make a value that is not an
-    // address match the loopback set.
-    const bracketedCases = [
-      {
-        host: `[::1]:${DEFAULT_PORT}`,
-        status: 200,
-        why: '::1 is a supported loopback authority on the bound port'
-      },
-      {
-        host: `[::1.]:${DEFAULT_PORT}`,
-        status: STATUS_BAD_REQUEST,
-        why: '::1. is not an IPv6 literal, and a trailing dot must not be normalized off one'
-      },
-      {
-        host: `[not:ipv6]:${DEFAULT_PORT}`,
-        status: STATUS_BAD_REQUEST,
-        why: 'a colon inside brackets is not evidence of an address'
-      }
-    ];
-    for (const { host, status, why } of bracketedCases) {
-      const result = await httpRequest({ path: '/', headers: { Host: host } });
-      assert.equal(
-        result.status,
-        status,
-        `Host: ${host} must answer ${status} because ${why}; read ${result.status} with body `
-          + `${JSON.stringify(result.text)}`
-      );
-    }
-
-    // Three cases an HTTP client will not send, so they go on the wire directly.
-    // Each names what the gate decided and why that is the right decision.
-    const rawCases = [
-      {
-        label: 'an HTTP/1.0 request asserting no authority',
-        raw: 'GET / HTTP/1.0\r\n\r\n',
-        status: 200,
-        // It names no origin, so there is none to be misdirected from, and a
-        // browser cannot produce it: `Host` is a forbidden header name, so the
-        // rebinding vehicle always lands in one of the cases above.
-        why: 'a request that asserts no authority is served under the server\'s own'
-      },
-      {
-        label: 'an HTTP/1.0 request asserting a rebound authority',
-        raw: `GET / HTTP/1.0\r\nHost: ${REBOUND_AUTHORITY}\r\n\r\n`,
-        status: STATUS_MISDIRECTED_REQUEST,
-        why: 'asserting an authority subjects it to the policy, whatever the protocol version'
-      },
-      {
-        label: 'an empty Host value',
-        raw: 'GET / HTTP/1.1\r\nHost: \r\n\r\n',
-        status: STATUS_BAD_REQUEST,
-        why: 'an asserted-but-empty authority is unusable; the runtime passes it through'
-      },
-      {
-        label: 'two Host header lines',
-        raw: `GET / HTTP/1.1\r\nHost: ${HOST}:${DEFAULT_PORT}\r\nHost: ${REBOUND_AUTHORITY}\r\n\r\n`,
-        status: STATUS_BAD_REQUEST,
-        // `req.headers.host` reports only the first, so a gate that trusted it
-        // would judge one authority while the bytes carry two.
-        why: 'two Host lines make the authority ambiguous (RFC 9112 3.2), and the runtime allows them'
-      }
-    ];
-    for (const { label, raw, status, why } of rawCases) {
-      const result = await rawRequest(raw);
-      assert.equal(
-        result.status,
-        status,
-        `${label}: must answer ${status} because ${why}; read ${JSON.stringify(result.statusLine)} `
-          + `with body ${JSON.stringify(result.text)}`
-      );
-    }
   } finally {
     await stop(entry);
   }
@@ -1020,76 +780,38 @@ test('the activity route answers from the committed workbooks under the real ent
       `GET ${S001_PATH} must answer the committed S001 payload, read ${JSON.stringify(response.text)}`
     );
 
-    // The same three capabilities through a rebound authority. This is what the
-    // gate is for: without it, the payload just asserted - a student's name,
-    // their activities, and every Student ID on the roster - is readable by any
-    // page that rebound a DNS name at this loopback service.
+    // The roster route through the same artifact, so both read surfaces are
+    // known to be reachable with nothing injected or stubbed.
+    const roster = await httpRequest({ path: ACTIVITIES_PATH });
+    assert.equal(
+      roster.status,
+      200,
+      `GET ${ACTIVITIES_PATH} must answer 200, read ${roster.status} with body `
+        + `${JSON.stringify(roster.text)}`
+    );
+    assert.equal(
+      JSON.parse(roster.text).count,
+      ROSTER_GROUP_COUNT,
+      `GET ${ACTIVITIES_PATH} must answer the ${ROSTER_GROUP_COUNT} committed groups, `
+        + `read ${JSON.stringify(roster.text)}`
+    );
+
+    // The append route reached with the WRONG media type. It is refused at the
+    // route on its `Content-Type`, which is the first POST stage the fixed
+    // validation order reaches once the identifier has resolved - so nothing
+    // can be persisted, and the committed registry is asserted byte-unchanged
+    // because this file must write nothing inside the checkout.
     const registryBefore = fs.readFileSync(REGISTRY_PATH);
-    for (const target of [S001_PATH, ACTIVITIES_PATH]) {
-      const refused = await httpRequest({ path: target, headers: { Host: REBOUND_AUTHORITY } });
-      assert.equal(
-        refused.status,
-        STATUS_MISDIRECTED_REQUEST,
-        `GET ${target} with Host: ${REBOUND_AUTHORITY} must be refused with `
-          + `${STATUS_MISDIRECTED_REQUEST}, read ${refused.status} with body `
-          + `${JSON.stringify(refused.text)}`
-      );
-      assert.equal(
-        refused.text,
-        MISDIRECTED_BODY,
-        `GET ${target}: the refusal must be the fixed envelope, read ${JSON.stringify(refused.text)}`
-      );
-      // The refusal is asserted to carry no data, not merely a different status:
-      // a body leaking the name or an identifier would be the same exposure at a
-      // different status code.
-      for (const secret of ['Aarav Sharma', 'S001', 'Robotics Club']) {
-        assert.ok(
-          !refused.text.includes(secret),
-          `GET ${target} with a rebound authority must leak nothing, but the body named `
-            + `${JSON.stringify(secret)}: ${JSON.stringify(refused.text)}`
-        );
-      }
-    }
-
-    // The append route, the one capability that writes. The probe deliberately
-    // carries the WRONG media type, so the request is unwritable by
-    // construction: with the gate it is refused as a misdirected authority, and
-    // without the gate it would reach the route and be refused as an
-    // unsupported media type. Either way nothing can be persisted, and the
-    // status distinguishes the two outcomes exactly - which is what proves the
-    // gate runs BEFORE dispatch rather than somewhere inside it.
-    const reboundPost = await httpRequest({
+    const unsupported = await httpRequest({
       method: 'POST',
       path: S001_PATH,
-      headers: { Host: REBOUND_AUTHORITY, 'Content-Type': 'text/plain' }
+      headers: { 'Content-Type': 'text/plain' }
     });
     assert.equal(
-      reboundPost.status,
-      STATUS_MISDIRECTED_REQUEST,
-      `POST ${S001_PATH} with Host: ${REBOUND_AUTHORITY} must be refused with `
-        + `${STATUS_MISDIRECTED_REQUEST} before the route sees it - a 415 would mean the `
-        + `authority was checked after dispatch. Read ${reboundPost.status} with body `
-        + `${JSON.stringify(reboundPost.text)}`
-    );
-    assert.ok(
-      fs.readFileSync(REGISTRY_PATH).equals(registryBefore),
-      `the committed registry ${REGISTRY_PATH} must be byte-unchanged by a refused POST`
-    );
-
-    // The control for that comparison: the identical request from a served
-    // authority DOES reach the route, and is refused there on its media type.
-    // Without this, a gate that refused every POST would pass the assertion
-    // above for the wrong reason.
-    const servedPost = await httpRequest({
-      method: 'POST',
-      path: S001_PATH,
-      headers: { Host: `${HOST}:${DEFAULT_PORT}`, 'Content-Type': 'text/plain' }
-    });
-    assert.equal(
-      servedPost.status,
+      unsupported.status,
       415,
-      `POST ${S001_PATH} from a served authority must reach the route and be refused on its `
-        + `media type (415), read ${servedPost.status} with body ${JSON.stringify(servedPost.text)}`
+      `POST ${S001_PATH} with a non-JSON media type must be refused with 415, `
+        + `read ${unsupported.status} with body ${JSON.stringify(unsupported.text)}`
     );
     assert.ok(
       fs.readFileSync(REGISTRY_PATH).equals(registryBefore),
@@ -1480,37 +1202,14 @@ const INVALID_HOST_CASES = [
 ];
 
 /**
- * Authority allowlist entries that must be refused at startup, and why each
- * one matters rather than being pedantry.
- *
- * An entry the policy cannot parse is worse than useless: it would sit in the
- * configuration looking like permission while matching nothing, so an operator
- * would widen the bind, believe an authority was named, and get a service that
- * refuses every request - or, with a looser parser, one that admitted more than
- * the entry says. Both are startup failures instead.
+ * A host beyond the loopback default, used to prove the rule above is bounded:
+ * the empty and whitespace-only values are the ONLY fatal ones. `0.0.0.0` is
+ * the value the README documents and warns about, and a warning about what a
+ * start exposes presupposes that the start works.
  */
-const INVALID_ALLOWED_HOSTS = [
-  { value: '', why: 'an empty entry names no authority' },
-  { value: '   ', why: 'a whitespace-only entry names no authority' },
-  { value: 'app example', why: 'an authority cannot contain whitespace' },
-  { value: 'app.example:70000', why: 'a port must be inside 0-65535' },
-  { value: 'app.example:https', why: 'a port must be decimal digits' },
-  { value: 'admin@app.example', why: 'userinfo is not part of an authority' },
-  { value: 'http://app.example', why: 'a scheme is not part of an authority' },
-  { value: 'app.example/activities', why: 'a path is not part of an authority' },
-  { value: '[::1', why: 'an unclosed bracket is not an authority' },
-  { value: 'app.example:1:2', why: 'two ports are ambiguous' },
-  // Brackets promise an IPv6 literal. An entry that does not hold one could
-  // never match a request authority, so it would sit in the configuration
-  // looking like permission while permitting nothing.
-  { value: '[not:ipv6]', why: 'a bracketed value must be an IPv6 literal' },
-  { value: '[::1.]', why: 'a malformed literal must not be repaired into a valid one' }
-];
+const WIDER_HOST = '0.0.0.0';
 
-/** A named authority that is nothing like a loopback spelling. */
-const NAMED_AUTHORITY = 'activities.internal';
-
-test('an empty or unlisted wider host is fatal and relative paths resolve against the entrypoint directory', async () => {
+test('an empty host is fatal, a wider one is not, and relative paths resolve against the entrypoint directory', async () => {
   for (const { value, cliQuoted } of INVALID_HOST_CASES) {
     const label = JSON.stringify(value);
     assert.throws(
@@ -1577,155 +1276,24 @@ test('an empty or unlisted wider host is fatal and relative paths resolve agains
     }
   }
 
-  // A bind beyond loopback with no authority named. `0.0.0.0` is the value the
-  // README warns about: it publishes the service to a network that
-  // authenticates nobody, and a published socket that answers for every
-  // authority is reachable by a rebound browser origin. It must fail while the
-  // server is being BUILT - nothing may listen first.
-  assert.throws(
-    () => createServer({ ...LIBRARY_OPTIONS, host: '0.0.0.0' }),
-    (error) => {
-      assert.equal(
-        error.code,
-        'SERVER_CONFIG_INVALID',
-        `host 0.0.0.0 with no allowlist must be a configuration error, `
-          + `read ${JSON.stringify(error.code)}`
-      );
-      assert.match(
-        error.message,
-        /ALLOWED_HOSTS/,
-        `the message must name the setting that would permit it, `
-          + `read ${JSON.stringify(error.message)}`
-      );
-      return true;
-    },
-    'a wildcard bind with no authority allowlist must be refused'
-  );
-
-  // The same bind, with the authority it will answer for named, is accepted -
-  // the rule is "name them", not "never widen". `createServer` does not listen,
-  // so asserting this publishes nothing.
-  const widened = createServer({
-    ...LIBRARY_OPTIONS,
-    host: '0.0.0.0',
-    allowedHosts: `${NAMED_AUTHORITY}:${DEFAULT_PORT}`
-  });
-  assert.deepEqual(
-    widened.config.allowedHosts,
-    [`${NAMED_AUTHORITY}:${DEFAULT_PORT}`],
-    `a named allowlist must reach the resolved configuration, `
-      + `read ${JSON.stringify(widened.config.allowedHosts)}`
+  // The other half of the host rule, and the half that bounds it: ONLY an empty
+  // or whitespace-only value is fatal. A non-loopback host is a supported
+  // configuration - `HOST=0.0.0.0 npm start` is a documented invocation, and the
+  // README's warning about it presupposes that the start succeeds - so the value
+  // must resolve and the server must build. `createServer` does not listen, so
+  // asserting this publishes no socket.
+  const wider = createServer({ ...LIBRARY_OPTIONS, host: WIDER_HOST });
+  assert.equal(
+    wider.config.host,
+    WIDER_HOST,
+    `host ${WIDER_HOST} must resolve unchanged rather than be refused, `
+      + `read ${JSON.stringify(wider.config.host)}`
   );
   assert.equal(
-    widened.listening,
+    wider.listening,
     false,
     'createServer must not listen, so this assertion may not publish a socket'
   );
-
-  // And through the artifact an operator runs, because `HOST` is read from the
-  // environment by every `node server.js`. Nothing binds: configuration is
-  // resolved before any `listen`, so this cannot contend for the default port.
-  const widenedCli = spawnEntry({ env: { HOST: '0.0.0.0' } });
-  try {
-    assert.ok(
-      await waitForClose(widenedCli, CHILD_EXIT_TIMEOUT_MS),
-      `HOST=0.0.0.0: the entrypoint must exit within ${CHILD_EXIT_TIMEOUT_MS} ms`
-        + `${describeChild(widenedCli)}`
-    );
-    assert.ok(
-      widenedCli.code !== null && widenedCli.code !== 0,
-      `HOST=0.0.0.0: the entrypoint must exit non-zero rather than publish the service, `
-        + `read ${widenedCli.code}${describeChild(widenedCli)}`
-    );
-    assert.equal(
-      widenedCli.stdout,
-      '',
-      `HOST=0.0.0.0: no banner may be printed, read ${JSON.stringify(widenedCli.stdout)}`
-    );
-    assert.match(
-      widenedCli.stderr,
-      /ALLOWED_HOSTS/,
-      `HOST=0.0.0.0: stderr must name the setting that would permit the bind, `
-        + `read ${JSON.stringify(widenedCli.stderr)}`
-    );
-  } finally {
-    await stop(widenedCli);
-  }
-
-  // Every allowlist entry is validated at startup, so a rule that could never
-  // match is a failure rather than a false sense of permission.
-  for (const { value, why } of INVALID_ALLOWED_HOSTS) {
-    const label = JSON.stringify(value);
-    assert.throws(
-      () => resolveConfig({ ...LIBRARY_OPTIONS, allowedHosts: [value] }),
-      (error) => {
-        assert.equal(
-          error.code,
-          'SERVER_CONFIG_INVALID',
-          `allowedHosts ${label}: must be a configuration error, read ${JSON.stringify(error.code)}`
-        );
-        return true;
-      },
-      `allowedHosts ${label} must be refused: ${why}`
-    );
-  }
-
-  // Entries are canonicalized once, by the same parser the `Host` header goes
-  // through, so a listed authority and a request authority cannot disagree on
-  // case, spacing or IPv6 bracketing.
-  assert.deepEqual(
-    resolveConfig({
-      ...LIBRARY_OPTIONS,
-      allowedHosts: ` ${NAMED_AUTHORITY.toUpperCase()} , app.example:8080 , [::1]:8080 `
-    }).allowedHosts,
-    [NAMED_AUTHORITY, 'app.example:8080', '[::1]:8080'],
-    'a comma-separated allowlist must be trimmed, lower-cased and kept in order'
-  );
-
-  // The allowlist admits what it names, on a real server. An entry carrying no
-  // port matches the name on whatever port the service is on, which is the
-  // reverse-proxy case; an authority nobody named is still refused.
-  const named = await start({
-    ...LIBRARY_OPTIONS,
-    port: 0,
-    allowedHosts: [NAMED_AUTHORITY]
-  });
-  try {
-    const namedPort = named.address().port;
-    const admitted = await httpRequest({
-      path: '/',
-      port: namedPort,
-      headers: { Host: NAMED_AUTHORITY }
-    });
-    assert.equal(
-      admitted.status,
-      200,
-      `Host: ${NAMED_AUTHORITY} is on the allowlist and must be served, read ${admitted.status}`
-    );
-    const unlisted = await httpRequest({
-      path: '/',
-      port: namedPort,
-      headers: { Host: REBOUND_AUTHORITY }
-    });
-    assert.equal(
-      unlisted.status,
-      STATUS_MISDIRECTED_REQUEST,
-      `Host: ${REBOUND_AUTHORITY} is not on the allowlist and must be refused, `
-        + `read ${unlisted.status}`
-    );
-    // The implicit loopback set survives alongside an explicit allowlist: an
-    // allowlist adds authorities, it does not replace the ones a loopback bind
-    // already answers for.
-    const loopback = await httpRequest({ path: '/', port: namedPort });
-    assert.equal(
-      loopback.status,
-      200,
-      `${HOST}:${namedPort} must still be served when an allowlist is configured, `
-        + `read ${loopback.status}`
-    );
-  } finally {
-    await closeServer(named);
-  }
 
   const config = resolveConfig({
     host: HOST,

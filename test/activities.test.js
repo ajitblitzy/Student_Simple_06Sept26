@@ -120,10 +120,6 @@ const STATUS_PAYLOAD_TOO_LARGE = 413;
 const STATUS_UNSUPPORTED_MEDIA_TYPE = 415;
 const STATUS_INTERNAL_ERROR = 500;
 
-/** `503` for a queue that will drain, `507` for a quota that will not. */
-const STATUS_SERVICE_UNAVAILABLE = 503;
-const STATUS_INSUFFICIENT_STORAGE = 507;
-
 const ROOT_PATH = '/';
 const ACTIVITIES_PATH = '/api/activities';
 const S001_PATH = '/api/students/S001/activities';
@@ -152,35 +148,11 @@ const CODE_PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE';
 const CODE_UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE';
 const CODE_INTERNAL_ERROR = 'INTERNAL_ERROR';
 
-/**
- * The three codes that report a **bound** on the write path rather than a fault
- * in the request: the write queue is full, or a quota has been reached.
- */
-const CODE_WRITE_QUEUE_FULL = 'ACTIVITY_WRITE_QUEUE_FULL';
-const CODE_STUDENT_ACTIVITY_LIMIT_REACHED = 'STUDENT_ACTIVITY_LIMIT_REACHED';
-const CODE_REGISTRY_FULL = 'ACTIVITY_REGISTRY_FULL';
-
 const MESSAGE_MALFORMED_JSON = 'Request body is not valid JSON';
 const MESSAGE_INVALID_ACTIVITY = 'activity must be a string of 1 to 64 characters';
 const MESSAGE_PAYLOAD_TOO_LARGE = `Request body exceeds ${MAX_BODY_BYTES} bytes`;
 const MESSAGE_UNSUPPORTED_MEDIA_TYPE = `Content-Type must be ${JSON_MEDIA_TYPE}`;
 const MESSAGE_INTERNAL_ERROR = 'Could not persist the activity record';
-const MESSAGE_WRITE_QUEUE_FULL = 'Too many activity writes are in flight; retry shortly';
-const MESSAGE_REGISTRY_FULL = 'The activity registry has reached its configured capacity';
-
-/**
- * The one bound sentence that interpolates a value - the normalized identifier,
- * and deliberately not the configured ceiling, which is operator configuration
- * a client can do nothing with.
- *
- * @param {string} studentId The normalized identifier.
- * @returns {string} The `507 STUDENT_ACTIVITY_LIMIT_REACHED` sentence.
- */
-const messageStudentActivityLimit = (studentId) =>
-  `Student ${studentId} has reached the maximum number of recorded activities`;
-
-/** `Retry-After` on the `503`, in seconds, as a header value. */
-const RETRY_AFTER_SECONDS = '1';
 
 /** `Allow` values: exact and ordered, because the order is part of the contract. */
 const ALLOW_ROOT = 'GET, HEAD';
@@ -209,6 +181,15 @@ const S003_NAME = 'Rohan Iyer';
 /** `Other Info!C2:C11` values this file depends on. */
 const S001_ACTIVITY = 'Robotics Club';
 const S003_ACTIVITY = 'Football Team';
+
+/**
+ * The same activity spelled in lower case. Grouping is keyed on the case-folded
+ * name, so a record carrying this spelling joins `S001_ACTIVITY`'s group, and
+ * the label the group comes back with is then evidence of which member was
+ * emitted first. Derived rather than written out, so it cannot drift from the
+ * workbook value above.
+ */
+const S001_ACTIVITY_FOLDED = S001_ACTIVITY.toLowerCase();
 
 /**
  * An activity `S003` does not hold, used wherever a write must succeed. `S004`
@@ -318,13 +299,6 @@ const DECOY_CONTENTS = 'decoy: this file must never be written by a registry wri
  * neither can fire on a merely busy machine.
  */
 const REQUEST_DEADLINE_MS = 10000;
-
-/**
- * How long the saturation case waits for the write queue to report itself full.
- * It is reached as soon as the blocked writer is entered, so this is a
- * diagnosis deadline rather than a delay anything normally waits out.
- */
-const SATURATION_DEADLINE_MS = 5000;
 const START_DEADLINE_MS = 15000;
 
 const servers = [];
@@ -846,6 +820,53 @@ test('the full roster is the eight committed groups over ten records', async () 
   const listed = body.activities.reduce((total, group) => total + group.studentIds.length, 0);
   assert.equal(members, EXPECTED_RECORD_COUNT, 'the group counts must sum to ten records');
   assert.equal(listed, EXPECTED_RECORD_COUNT, 'the listed Student IDs must sum to ten records');
+
+  // Within a group, a workbook-sourced member's position is its row in the
+  // ACTIVITY workbook - the sheet the record came from. The committed data
+  // cannot tell that apart from the directory workbook's row order, because
+  // both key columns run S001 to S010 in the same order and no test pins the
+  // two sheets to one order, so the invariant is pinned here through the
+  // injected-row seams with the two orders deliberately crossed: the directory
+  // lists S001 before S009 while the activity rows list S009 first. Emitted
+  // order therefore has to be S009 then S001, and the group's label - the first
+  // emitted member's spelling - has to be S009's. The synthetic name below is
+  // only what the directory row needs to build; no response carries it.
+  const crossedDirectory = studentDirectory.fromRows([
+    DIRECTORY_HEADER_ROW,
+    { A: 'S001', B: S001_NAME },
+    { A: 'S009', B: 'Ishaan Nair' }
+  ]);
+  const crossedRepository = activityRepository.fromData({
+    directory: crossedDirectory,
+    activityRows: [
+      ACTIVITY_HEADER_ROW,
+      { A: 'S009', B: 'Hostel', C: S001_ACTIVITY_FOLDED },
+      { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }
+    ],
+    registryRecords: [],
+    activitiesDataPath: path.join(mkTemp(), REGISTRY_FILENAME)
+  });
+  const crossedServer = await startServer({
+    directory: crossedDirectory,
+    repository: crossedRepository
+  });
+  const crossed = await request(crossedServer, { path: ACTIVITIES_PATH });
+  assert.equal(
+    crossed.status,
+    STATUS_OK,
+    `the crossed-order roster must succeed; body was ${crossed.text}`
+  );
+  assert.deepEqual(
+    json(crossed),
+    {
+      count: 1,
+      activities: [
+        { activity: S001_ACTIVITY_FOLDED, count: 2, studentIds: ['S009', 'S001'] }
+      ]
+    },
+    'workbook-sourced members must follow the activity workbook row order, ' +
+      'not the order the directory workbook happens to list them in'
+  );
 });
 
 test('the activity filter matches trimmed and case-insensitively', async () => {
@@ -860,9 +881,29 @@ test('the activity filter matches trimmed and case-insensitively', async () => {
 });
 
 test('a filter that matches nothing is an empty 200, not an error', async () => {
-  const res = await request(sharedServer, { path: `${ACTIVITIES_PATH}?activity=Chess%20Club` });
-  assert.equal(res.status, STATUS_OK, `an unmatched filter must be a 200; body was ${res.text}`);
-  assert.deepEqual(json(res), { count: 0, activities: [] });
+  // A present `activity` parameter is a filter whatever it holds, and a filter
+  // matching nothing is a 200 carrying no groups rather than an error. An
+  // unmatched name and a blank value are both in that class: no group's
+  // activity key can be empty, because an activity is 1 to 64 characters after
+  // trimming. Only an ABSENT parameter asks for the whole roster, which test 7
+  // covers - the three blank forms below answering with all eight groups is the
+  // defect these cases exist to pin.
+  const unmatched = encodeURIComponent(UNUSED_ACTIVITY);
+  const cases = [
+    ['an unmatched activity name', `${ACTIVITIES_PATH}?activity=${unmatched}`],
+    ['a present but empty value', `${ACTIVITIES_PATH}?activity=`],
+    ['a whitespace-only value', `${ACTIVITIES_PATH}?activity=%20`],
+    ['a valueless parameter', `${ACTIVITIES_PATH}?activity`]
+  ];
+  for (const [label, target] of cases) {
+    const res = await request(sharedServer, { path: target });
+    assert.equal(res.status, STATUS_OK, `${label}: ${target} must be a 200; body was ${res.text}`);
+    assert.deepEqual(
+      json(res),
+      { count: 0, activities: [] },
+      `${label}: ${target} must match nothing rather than answer with the whole roster`
+    );
+  }
 });
 
 test('grouping folds case and labels the group with the workbook spelling', async () => {
@@ -1901,142 +1942,6 @@ test('a failed write is a 500 that leaks nothing and leaves no artifact', async 
     );
     fs.unlinkSync(cleanupLink);
   }
-
-  // ---- The other way a write is refused: a bound, not a fault --------------
-  // A quota refusal has to behave like the failed write above in the one
-  // respect that matters here - it must leave the file and the directory
-  // exactly as it found them - while reporting itself as capacity rather than
-  // as a server error. Without these bounds the registry, the per-student
-  // response and the full-file rewrite all grew with however many POSTs a
-  // caller chose to send.
-  /**
-   * Starts a server whose repository carries the given ceilings, over a
-   * one-student workbook row set and its own seeded registry file.
-   *
-   * @param {object} limits The `max…` ceilings to apply.
-   * @returns {Promise<{server: object, file: string, directory: string}>} The
-   *   server, its registry file and the directory holding it.
-   */
-  const startBoundedServer = async (limits) => {
-    const boundedDir = mkTemp();
-    const boundedFile = path.join(boundedDir, REGISTRY_FILENAME);
-    fs.writeFileSync(boundedFile, EMPTY_REGISTRY, 'utf8');
-    const boundedDirectory = studentDirectory.fromRows([
-      DIRECTORY_HEADER_ROW,
-      { A: 'S001', B: S001_NAME },
-      { A: 'S003', B: S003_NAME }
-    ]);
-    const boundedRepository = activityRepository.fromData({
-      directory: boundedDirectory,
-      activityRows: [
-        ACTIVITY_HEADER_ROW,
-        { A: 'S001', B: 'Hostel', C: S001_ACTIVITY },
-        { A: 'S003', B: 'Hostel', C: S003_ACTIVITY }
-      ],
-      registryRecords: [],
-      activitiesDataPath: boundedFile,
-      ...limits
-    });
-    return {
-      server: await startServer({ directory: boundedDirectory, repository: boundedRepository }),
-      file: boundedFile,
-      directory: boundedDir
-    };
-  };
-
-  // Each student already holds one workbook activity, so a ceiling of 2 leaves
-  // room for exactly one more - and the second POST must be refused.
-  const perStudent = await startBoundedServer({ maxActivitiesPerStudent: 2 });
-  const firstAdmitted = await postJson(perStudent.server, S001_PATH, { activity: UNUSED_ACTIVITY });
-  assert.equal(firstAdmitted.status, STATUS_CREATED, `the first POST must be accepted; ${firstAdmitted.text}`);
-  const storedAtCap = fs.readFileSync(perStudent.file);
-  const atCap = await postJson(perStudent.server, S001_PATH, { activity: NEW_ACTIVITY });
-  assert.equal(
-    atCap.status,
-    STATUS_INSUFFICIENT_STORAGE,
-    `a student at their ceiling must be refused with 507; body was ${atCap.text}`
-  );
-  assertMediaType(atCap, JSON_MEDIA_TYPE, `POST ${S001_PATH} (507)`);
-  assert.deepEqual(
-    json(atCap),
-    errorBody(CODE_STUDENT_ACTIVITY_LIMIT_REACHED, messageStudentActivityLimit('S001'))
-  );
-  assert.ok(
-    fs.readFileSync(perStudent.file).equals(storedAtCap),
-    'a quota refusal must leave the registry file byte-unchanged'
-  );
-  // A ceiling is per student: one full collection must not close the service.
-  const sibling = await postJson(perStudent.server, S003_PATH, { activity: NEW_ACTIVITY });
-  assert.equal(
-    sibling.status,
-    STATUS_CREATED,
-    `another student must still be served; body was ${sibling.text}`
-  );
-  // Admission runs before the body is read, so an oversize body from a student
-  // at their ceiling answers 507 rather than the 413 it would otherwise earn.
-  // This is the observable proof that no body was consumed.
-  const oversizeAtCap = await postRaw(
-    perStudent.server,
-    S001_PATH,
-    `{"activity":"${'x'.repeat(OVERSIZE_BODY_BYTES)}"}`
-  );
-  assert.equal(
-    oversizeAtCap.status,
-    STATUS_INSUFFICIENT_STORAGE,
-    `admission must precede the body cap; body was ${oversizeAtCap.text}`
-  );
-  assert.equal(json(oversizeAtCap).error.code, CODE_STUDENT_ACTIVITY_LIMIT_REACHED);
-
-  // The registry's own cardinality ceiling, which no single student can be
-  // blamed for: one record fills it, and the next write is refused whoever
-  // sends it.
-  const byRecords = await startBoundedServer({ maxRegistryRecords: 1 });
-  const firstRecord = await postJson(byRecords.server, S001_PATH, { activity: UNUSED_ACTIVITY });
-  assert.equal(firstRecord.status, STATUS_CREATED, firstRecord.text);
-  const registryFull = await postJson(byRecords.server, S003_PATH, { activity: UNUSED_ACTIVITY });
-  assert.equal(
-    registryFull.status,
-    STATUS_INSUFFICIENT_STORAGE,
-    `a full registry must be refused with 507; body was ${registryFull.text}`
-  );
-  assert.deepEqual(json(registryFull), errorBody(CODE_REGISTRY_FULL, MESSAGE_REGISTRY_FULL));
-  assert.deepEqual(
-    JSON.parse(fs.readFileSync(byRecords.file, 'utf8')),
-    [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
-    'only the admitted record may reach the registry file'
-  );
-
-  // The byte ceiling is the one bound that cannot be judged before the write is
-  // serialized, so it is enforced inside the critical section - after the body
-  // has been read, and still before anything is written.
-  const byBytes = await startBoundedServer({ maxRegistryBytes: 16 });
-  const tooManyBytes = await postJson(byBytes.server, S001_PATH, { activity: UNUSED_ACTIVITY });
-  assert.equal(
-    tooManyBytes.status,
-    STATUS_INSUFFICIENT_STORAGE,
-    `a write past the byte ceiling must be refused with 507; body was ${tooManyBytes.text}`
-  );
-  assert.deepEqual(json(tooManyBytes), errorBody(CODE_REGISTRY_FULL, MESSAGE_REGISTRY_FULL));
-  assert.equal(
-    fs.readFileSync(byBytes.file, 'utf8'),
-    EMPTY_REGISTRY,
-    'a write refused on size must not rewrite the registry'
-  );
-  const boundedLeftovers = fs
-    .readdirSync(byBytes.directory)
-    .filter((name) => name.endsWith(REGISTRY_TEMPORARY_SUFFIX));
-  assert.deepEqual(
-    boundedLeftovers,
-    [],
-    `a refused write must leave no temporary file; found ${boundedLeftovers.join(', ')}`
-  );
-  // And the index is untouched, exactly as on the failed-write path above.
-  const boundedRead = await request(byBytes.server, { path: S001_PATH });
-  assert.deepEqual(
-    json(boundedRead).activities,
-    [{ activity: S001_ACTIVITY, source: 'workbook' }],
-    'a refused write must leave the in-memory index untouched'
-  );
 });
 
 test('one failed write does not poison the writes that follow it', async () => {
@@ -2085,58 +1990,6 @@ test('one failed write does not poison the writes that follow it', async () => {
     [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
     'exactly the recovered record must be on disk'
   );
-
-  // ---- The same property for a write refused by a bound -------------------
-  // A quota refusal never reaches the writer at all, so it must not occupy the
-  // queue either: the write that follows it has to be served normally. A bound
-  // that left the queue wedged would trade an unbounded registry for an
-  // unusable one.
-  const boundedPath = path.join(mkTemp(), REGISTRY_FILENAME);
-  fs.writeFileSync(boundedPath, EMPTY_REGISTRY, 'utf8');
-  const boundedDirectory = studentDirectory.fromRows([
-    DIRECTORY_HEADER_ROW,
-    { A: 'S001', B: S001_NAME },
-    { A: 'S003', B: S003_NAME }
-  ]);
-  const boundedRepository = activityRepository.fromData({
-    directory: boundedDirectory,
-    activityRows: [
-      ACTIVITY_HEADER_ROW,
-      { A: 'S001', B: 'Hostel', C: S001_ACTIVITY },
-      { A: 'S003', B: 'Hostel', C: S003_ACTIVITY }
-    ],
-    registryRecords: [],
-    activitiesDataPath: boundedPath,
-    // Each student holds one workbook activity already, so this leaves room
-    // for exactly one more each.
-    maxActivitiesPerStudent: 2
-  });
-  const boundedServer = await startServer({
-    directory: boundedDirectory,
-    repository: boundedRepository
-  });
-  const filled = await postJson(boundedServer, S001_PATH, { activity: UNUSED_ACTIVITY });
-  assert.equal(filled.status, STATUS_CREATED, `the first write must land; body was ${filled.text}`);
-  const refused = await postJson(boundedServer, S001_PATH, { activity: NEW_ACTIVITY });
-  assert.equal(
-    refused.status,
-    STATUS_INSUFFICIENT_STORAGE,
-    `the write past the ceiling must be refused; body was ${refused.text}`
-  );
-  const afterRefusal = await postJson(boundedServer, S003_PATH, { activity: NEW_ACTIVITY });
-  assert.equal(
-    afterRefusal.status,
-    STATUS_CREATED,
-    `a refusal must not poison the queue behind it; body was ${afterRefusal.text}`
-  );
-  assert.deepEqual(
-    JSON.parse(fs.readFileSync(boundedPath, 'utf8')),
-    [
-      { studentId: 'S001', activity: UNUSED_ACTIVITY },
-      { studentId: 'S003', activity: NEW_ACTIVITY }
-    ],
-    'exactly the two admitted records must be on disk, in the order they were accepted'
-  );
 });
 
 test('two concurrent posts of one activity produce one record', async () => {
@@ -2157,246 +2010,6 @@ test('two concurrent posts of one activity produce one record', async () => {
     JSON.parse(fs.readFileSync(registryPath, 'utf8')),
     [{ studentId: 'S003', activity: NEW_ACTIVITY }],
     'only one record may reach the registry file'
-  );
-
-  // ---- Saturation: pending write work is finite --------------------------
-  // Concurrency is what the two POSTs above exercise; this is what happens when
-  // there is more of it than the service will carry. Before the bound existed,
-  // every valid POST allocated pending promise and response state and a task on
-  // this serialized queue, so queue depth, memory, sockets and latency were a
-  // function of how many requests a caller chose to send at once.
-  //
-  // The writer below blocks until the test releases it, which holds the single
-  // permitted write open and makes the saturated state deterministic rather
-  // than a matter of timing.
-  const gatedPath = path.join(mkTemp(), REGISTRY_FILENAME);
-  fs.writeFileSync(gatedPath, EMPTY_REGISTRY, 'utf8');
-  let releaseWrite = null;
-  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
-  const gatedDirectory = studentDirectory.fromRows([
-    DIRECTORY_HEADER_ROW,
-    { A: 'S001', B: S001_NAME }
-  ]);
-  const gatedRepository = activityRepository.fromData({
-    directory: gatedDirectory,
-    activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
-    registryRecords: [],
-    activitiesDataPath: gatedPath,
-    maxPendingWrites: 1,
-    writeFile: async (target, contents) => {
-      await writeGate;
-      fs.writeFileSync(target, contents, 'utf8');
-    }
-  });
-  const gatedServer = await startServer({
-    directory: gatedDirectory,
-    repository: gatedRepository
-  });
-
-  const inFlight = postJson(gatedServer, S001_PATH, { activity: UNUSED_ACTIVITY });
-  // Wait for the admitted write to actually occupy the queue, so the requests
-  // below meet a saturated service rather than racing to fill it.
-  const saturatedBy = Date.now() + SATURATION_DEADLINE_MS;
-  while (gatedRepository.checkWriteAdmission('S001') === null) {
-    assert.ok(
-      Date.now() < saturatedBy,
-      `the queue did not report itself full within ${SATURATION_DEADLINE_MS} ms`
-    );
-    await new Promise((resolve) => { setTimeout(resolve, 10); });
-  }
-  assert.equal(
-    gatedRepository.checkWriteAdmission('S001').code,
-    CODE_WRITE_QUEUE_FULL,
-    'a saturated queue must refuse admission by that code'
-  );
-
-  const shed = await Promise.all([
-    postJson(gatedServer, S001_PATH, { activity: NEW_ACTIVITY }),
-    postJson(gatedServer, S001_PATH, { activity: 'Dance Club' }),
-    // Admission precedes every interpretation of the request, so a body this
-    // service would otherwise refuse as 415 or 400 is shed as capacity - the
-    // observable proof that a saturated service reads no body at all.
-    postRaw(gatedServer, S001_PATH, '{', TEXT_MEDIA_TYPE)
-  ]);
-  shed.forEach((res, index) => {
-    assert.equal(
-      res.status,
-      STATUS_SERVICE_UNAVAILABLE,
-      `shed request ${index} must be a 503; body was ${res.text}`
-    );
-    assertMediaType(res, JSON_MEDIA_TYPE, `shed request ${index}`);
-    assert.deepEqual(
-      json(res),
-      errorBody(CODE_WRITE_QUEUE_FULL, MESSAGE_WRITE_QUEUE_FULL),
-      `shed request ${index} must carry the fixed queue-full envelope`
-    );
-    assert.equal(
-      res.headers['retry-after'],
-      RETRY_AFTER_SECONDS,
-      `shed request ${index} must say when to retry, read ${res.headers['retry-after']}`
-    );
-  });
-
-  releaseWrite();
-  const admitted = await inFlight;
-  assert.equal(
-    admitted.status,
-    STATUS_CREATED,
-    `the admitted write must still complete; body was ${admitted.text}`
-  );
-  assert.deepEqual(
-    JSON.parse(fs.readFileSync(gatedPath, 'utf8')),
-    [{ studentId: 'S001', activity: UNUSED_ACTIVITY }],
-    'only the admitted write may reach the registry file'
-  );
-  // The bound is capacity, not a ban: once the queue drains it admits again.
-  assert.equal(
-    gatedRepository.checkWriteAdmission('S001'),
-    null,
-    'admission must reopen once the queue has drained'
-  );
-  const afterDrain = await postJson(gatedServer, S001_PATH, { activity: NEW_ACTIVITY });
-  assert.equal(
-    afterDrain.status,
-    STATUS_CREATED,
-    `a write after the queue drained must be served; body was ${afterDrain.text}`
-  );
-
-  // ---- The bound covers the request, not just the queued task -------------
-  // The case above saturates the queue with a write that is already running.
-  // This one starts from an **empty** queue with an ordinary writer, and the
-  // requests that hold the capacity have not finished arriving: each sends its
-  // headers and one byte of body and then stops. That is the shape that
-  // matters, because it is the cheap one to send and the expensive one to hold -
-  // a socket, its listeners and a partial body per request - and a boundary
-  // that merely *checked* for room would admit every one of them, since no
-  // write has been enqueued yet. Capacity is therefore acquired, not consulted:
-  // exactly `maxPendingWrites` requests may be reading a body at once.
-  const heldPath = path.join(mkTemp(), REGISTRY_FILENAME);
-  fs.writeFileSync(heldPath, EMPTY_REGISTRY, 'utf8');
-  const heldDirectory = studentDirectory.fromRows([
-    DIRECTORY_HEADER_ROW,
-    { A: 'S001', B: S001_NAME }
-  ]);
-  const heldRepository = activityRepository.fromData({
-    directory: heldDirectory,
-    activityRows: [ACTIVITY_HEADER_ROW, { A: 'S001', B: 'Hostel', C: S001_ACTIVITY }],
-    registryRecords: [],
-    activitiesDataPath: heldPath,
-    maxPendingWrites: 2
-  });
-  const heldServer = await startServer({
-    directory: heldDirectory,
-    repository: heldRepository
-  });
-
-  /**
-   * Sends a `POST` whose declared body is complete but whose bytes are not, so
-   * the request sits in the read phase until `finish()` is called.
-   *
-   * @param {string} activity The activity the finished body will carry.
-   * @returns {{settled: boolean, status: number|null, headers: object, text: string, finish: () => void}}
-   *   A live record of the exchange, updated as it settles.
-   */
-  const openPartialPost = (activity) => {
-    const body = JSON.stringify({ activity });
-    const record = { settled: false, status: null, headers: {}, text: '', finish: () => {} };
-    const req = http.request(
-      {
-        host: LOOPBACK_HOST,
-        port: heldServer.address().port,
-        path: S001_PATH,
-        method: METHOD_POST,
-        headers: { 'Content-Type': JSON_MEDIA_TYPE, 'Content-Length': Buffer.byteLength(body) },
-        agent: false
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          record.status = res.statusCode;
-          record.headers = res.headers;
-          record.text = Buffer.concat(chunks).toString('utf8');
-          record.settled = true;
-        });
-      }
-    );
-    // A refused request has its stream destroyed once it has been answered, so
-    // a write-side error here is expected and must not fail the test.
-    req.on('error', () => {});
-    req.write(body.slice(0, 1));
-    record.finish = () => { req.end(body.slice(1)); };
-    return record;
-  };
-
-  const partials = [1, 2, 3, 4, 5, 6].map((n) => openPartialPost(`Held Club ${n}`));
-  const refusedBy = Date.now() + SATURATION_DEADLINE_MS;
-  while (partials.filter((entry) => entry.settled).length < partials.length - 2) {
-    assert.ok(
-      Date.now() < refusedBy,
-      'the requests past the capacity of the read phase must be refused immediately; '
-        + `only ${partials.filter((entry) => entry.settled).length} of `
-        + `${partials.length - 2} had answered within ${SATURATION_DEADLINE_MS} ms`
-    );
-    await new Promise((resolve) => { setTimeout(resolve, 10); });
-  }
-  const answered = partials.filter((entry) => entry.settled);
-  const holding = partials.filter((entry) => !entry.settled);
-  assert.equal(
-    answered.length,
-    4,
-    `exactly 4 of 6 requests must be refused while 2 hold the capacity; ${answered.length} answered`
-  );
-  assert.equal(
-    holding.length,
-    2,
-    `exactly maxPendingWrites requests may occupy the read phase; ${holding.length} did`
-  );
-  answered.forEach((entry, index) => {
-    assert.equal(
-      entry.status,
-      STATUS_SERVICE_UNAVAILABLE,
-      `refused partial ${index} must be a 503; body was ${entry.text}`
-    );
-    assert.deepEqual(
-      JSON.parse(entry.text),
-      errorBody(CODE_WRITE_QUEUE_FULL, MESSAGE_WRITE_QUEUE_FULL),
-      `refused partial ${index} must carry the fixed queue-full envelope`
-    );
-    assert.equal(entry.headers['retry-after'], RETRY_AFTER_SECONDS);
-  });
-  assert.equal(
-    fs.readFileSync(heldPath, 'utf8'),
-    EMPTY_REGISTRY,
-    'not one of these requests has completed a body, so nothing may be written yet'
-  );
-
-  // Completing the two held bodies releases their slots the ordinary way.
-  holding.forEach((entry) => entry.finish());
-  const completedBy = Date.now() + SATURATION_DEADLINE_MS;
-  while (holding.filter((entry) => entry.settled).length < holding.length) {
-    assert.ok(
-      Date.now() < completedBy,
-      'the two held requests must complete once their bodies arrive'
-    );
-    await new Promise((resolve) => { setTimeout(resolve, 10); });
-  }
-  holding.forEach((entry) => {
-    assert.equal(
-      entry.status,
-      STATUS_CREATED,
-      `a request that held capacity must be served once its body arrives; body was ${entry.text}`
-    );
-  });
-  assert.equal(
-    JSON.parse(fs.readFileSync(heldPath, 'utf8')).length,
-    2,
-    'exactly the two admitted writes may reach the registry file'
-  );
-  assert.equal(
-    heldRepository.checkWriteAdmission('S001'),
-    null,
-    'both slots must be released once their requests are done'
   );
 });
 

@@ -5,16 +5,6 @@
  * the extracurricular-activity feature. It exports `resolveConfig`,
  * `createServer` and `start`; requiring it binds no port and writes nothing.
  *
- * The authority gate. Every request is judged on its `Host` authority before
- * its target is parsed and before any route sees it. A loopback bind keeps
- * remote packets out but not a remote origin: a DNS name rebound to `127.0.0.1`
- * lets a browser issue same-origin requests that arrive locally and differ only
- * in the authority they name. A loopback bind therefore answers only for
- * `localhost`, `127.0.0.1`, `::1` and its own bind value, on the port actually
- * bound; a wider bind answers only for the authorities `ALLOWED_HOSTS` names and
- * refuses to start without them. A refusal is `400 INVALID_HOST` or
- * `421 MISDIRECTED_REQUEST` with `Connection: close`.
- *
  * The routing boundary. The request target is parsed here exactly once and one
  * object is handed down - `{ method, segments, rawPath, query }` - in which
  * `segments` is the path split on `/` with the leading empty element dropped and
@@ -41,7 +31,6 @@
  */
 
 const http = require('http');
-const net = require('node:net');
 const path = require('node:path');
 
 const studentDirectory = require('./lib/studentDirectory');
@@ -57,35 +46,6 @@ const DEFAULT_HOST = '127.0.0.1';
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_ACTIVITIES_FILENAME = 'activities.json';
-
-/*
- * The write-path ceilings, and the environment variable that overrides each.
- * The values themselves come from `activityRepository.WRITE_LIMIT_DEFAULTS`, the
- * module that enforces them, so the default resolved here and the default
- * applied cannot drift apart; `resolveConfig` makes each one concrete so
- * `server.config` reports the ceilings actually in force. Each bounds a
- * different quantity - pending writes, activities per student, registry records
- * and registry bytes - per process and across every caller together; none is a
- * per-client rate limit.
- */
-const LIMIT_ENVIRONMENT_KEYS = Object.freeze({
-  maxPendingWrites: 'MAX_PENDING_WRITES',
-  maxActivitiesPerStudent: 'MAX_ACTIVITIES_PER_STUDENT',
-  maxRegistryRecords: 'MAX_REGISTRY_RECORDS',
-  maxRegistryBytes: 'MAX_REGISTRY_BYTES'
-});
-
-const LIMIT_KEYS = Object.freeze(Object.keys(LIMIT_ENVIRONMENT_KEYS));
-
-/**
- * A limit is validated as a whole string before conversion, for the same reason
- * a port is: `Number.parseInt` would read `'16abc'` as `16` and `'1.5'` as `1`,
- * silently enforcing a ceiling the operator never wrote. Ten digits is past
- * every sane ceiling and still inside `Number.MAX_SAFE_INTEGER`.
- */
-const LIMIT_TEXT_PATTERN = /^\d{1,10}$/;
-
-const MIN_LIMIT = 1;
 
 const GREETING = 'Hello, World Welcome to Sharebot!\n';
 const GREETING_BYTE_LENGTH = Buffer.byteLength(GREETING);
@@ -113,31 +73,9 @@ const STATUS_BAD_REQUEST = 400;
 const STATUS_NOT_FOUND = 404;
 const STATUS_METHOD_NOT_ALLOWED = 405;
 
-/**
- * `421 Misdirected Request` - RFC 9110 15.5.20: the request was directed at a
- * server that is unwilling to produce an authoritative response for the target
- * URI's origin. That is exactly the authority-mismatch case below, and keeping
- * it distinct from `400` is what lets an operator tell a rebound origin apart
- * from a client that sent a malformed `Host` at all.
- */
-const STATUS_MISDIRECTED_REQUEST = 421;
-
 const CODE_INVALID_STUDENT_ID = 'INVALID_STUDENT_ID';
 const CODE_METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED';
 const CODE_NOT_FOUND = 'NOT_FOUND';
-const CODE_INVALID_HOST = 'INVALID_HOST';
-const CODE_MISDIRECTED_REQUEST = 'MISDIRECTED_REQUEST';
-
-/**
- * The two authority sentences. Both are **fixed and interpolate nothing**: the
- * `Host` header is entirely caller-controlled, so echoing it back - even
- * JSON-encoded and truncated - would reflect attacker-chosen text into a
- * response and into whatever reads it. Neither is written to stderr either;
- * per-request logging is declined system-wide, and a log line carrying this
- * value would be a terminal-control injection sink rather than a diagnostic.
- */
-const MESSAGE_INVALID_HOST = 'Host header must be a single valid authority';
-const MESSAGE_MISDIRECTED_REQUEST = 'Request authority is not served by this server';
 
 /*
  * The per-student route's shape, mirrored from `lib/activityRoutes.js`, needed
@@ -188,68 +126,6 @@ const EMPTY_OPTIONS = Object.freeze({});
 const DEFAULT_ACTIVITIES_DATA_PATH = path.join(__dirname, DEFAULT_ACTIVITIES_FILENAME);
 const DEFAULT_WORKBOOK_DIR = __dirname;
 
-/* ---------------------------------------------------------------------------
- * Request-authority constants.
- *
- * WHY THIS EXISTS AT ALL
- * ---------------------------------------------------------------------------
- * Binding `127.0.0.1` keeps remote *packets* out; it does not keep a remote
- * *origin* out. An attacker serves a page on their own host, points a DNS name
- * with a tiny TTL at that host, gets a browser to load it, then re-answers the
- * name with `127.0.0.1`. The browser's next request goes to this loopback
- * service while the browser still considers it same-origin, so the attacker's
- * script reads the response - that is DNS rebinding, and the connection is
- * genuinely local, so no bind address can stop it. What distinguishes such a
- * request is the one field the browser must send and the attacker cannot
- * change: the `Host` authority names the attacker's own name, never an
- * authority this server answers for. Validating it is therefore what makes the
- * loopback default a real boundary rather than a nominal one.
- * ------------------------------------------------------------------------- */
-
-/**
- * A bind address inside `127.0.0.0/8`. Matched as a whole string, so
- * `127.0.0.1.example` is not a loopback bind.
- */
-const LOOPBACK_BIND_PATTERN = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
-
-/**
- * Bind values that are loopback without being an IPv4 literal: the IPv6
- * loopback in both its bare and bracketed spellings, and the name every
- * platform resolves to one of the two.
- */
-const LOOPBACK_BIND_NAMES = Object.freeze(['localhost', '::1', '[::1]']);
-
-/**
- * The authority hosts a loopback bind answers for, in addition to the resolved
- * bind value itself. Deliberately the three spellings a client can legitimately
- * reach a loopback service by - not a pattern, because every member of this set
- * is a decision to serve that authority.
- */
-const LOOPBACK_AUTHORITY_HOSTS = Object.freeze(['localhost', '127.0.0.1', '::1']);
-
-/**
- * Rejected outright in an authority. `[^!-~]` excludes every character outside
- * printable ASCII - C0 and C1 controls, DEL, space, tab and any non-ASCII byte,
- * so an authority can carry neither a terminal control nor a Unicode
- * look-alike. The explicit list then removes userinfo (`@`) and the delimiters
- * that would make an authority carry a path, query or fragment.
- */
-const AUTHORITY_UNSAFE_PATTERN = /[^!-~]|[@/\\?#]/;
-
-/** The port an authority implies when it carries none, per RFC 9110 4.2.1. */
-const DEFAULT_HTTP_PORT = 80;
-
-/** How `ALLOWED_HOSTS` separates its entries. */
-const ALLOWED_HOSTS_SEPARATOR = ',';
-
-/** The allowlist of a deployment that named none. */
-const EMPTY_ALLOWED_HOSTS = Object.freeze([]);
-
-/** The three outcomes of the authority gate. */
-const AUTHORITY_ALLOWED = 'ALLOWED';
-const AUTHORITY_INVALID = 'INVALID';
-const AUTHORITY_MISDIRECTED = 'MISDIRECTED';
-
 const noop = () => {};
 
 const describeValue = (value) => {
@@ -299,138 +175,6 @@ const createConfigError = (summary) => {
   const error = new Error(summary);
   error.code = CONFIG_ERROR_CODE;
   return error;
-};
-
-/* ---------------------------------------------------------------------------
- * Authority parsing and comparison.
- *
- * One parser serves both sides of the policy: the `Host` header of every
- * request, and every entry of the configured allowlist. That is deliberate -
- * an allowlist entry and a request authority that were normalized by different
- * code could differ in case, in a trailing dot or in IPv6 bracketing, and an
- * authority that "should" match but does not is how such a policy quietly
- * starts refusing legitimate traffic, or quietly starts accepting illegitimate
- * traffic.
- * ------------------------------------------------------------------------- */
-
-/**
- * Normalizes an authority's host for comparison.
- *
- * Lower-cased, because a host is case-insensitive. A single trailing dot is
- * then removed **from a name only**, because `localhost.` is the fully
- * qualified spelling of `localhost` and a browser may send either - but an IP
- * literal has no fully qualified form, so stripping a dot from one would turn a
- * value that is not an address into a value that is. `[::1.]` is the case that
- * matters: dot-stripping it before the comparison would make a malformed
- * literal match the loopback set, which is why this function is told whether it
- * is normalizing a literal and `parseAuthority` validates a bracketed host
- * before it gets here.
- *
- * @param {string} host The host component, already unbracketed.
- * @param {boolean} isLiteral Whether `host` has been validated as an IP literal.
- * @returns {string} The comparison form.
- */
-const normalizeAuthorityHost = (host, isLiteral) => {
-  const lower = host.toLowerCase();
-  if (isLiteral) return lower;
-  return lower.length > 1 && lower.endsWith('.') ? lower.slice(0, -1) : lower;
-};
-
-/**
- * Parses an authority into its host and port, or reports it unusable.
- *
- * Strict on purpose: anything this returns `null` for is refused rather than
- * repaired, because a value that cannot be parsed one single way is a value two
- * components could read differently. Refused: an empty value, any character
- * outside printable ASCII, userinfo, a path/query/fragment delimiter, a stray
- * bracket, an unbracketed IPv6 literal (two colons would make the port
- * ambiguous), a **bracketed value that is not an IPv6 literal** - checked with
- * `net.isIP`, so `[::1.]` and `[not:ipv6]` are refused rather than normalized
- * into something that could match - and a port that is not one to five digits
- * inside `0`-`65535`.
- *
- * @param {unknown} value The raw authority - a `Host` header or a list entry.
- * @returns {{host: string, port: number|null}|null} The parsed authority, with
- *   `port === null` when it carried none, or `null` when it is unusable.
- */
-const parseAuthority = (value) => {
-  if (typeof value !== 'string') return null;
-
-  const text = value.trim();
-  if (text === '' || AUTHORITY_UNSAFE_PATTERN.test(text)) return null;
-
-  let hostText = text;
-  let portText = '';
-  let isLiteral = false;
-
-  if (text.startsWith('[')) {
-    // The bracketed IPv6 form: `[::1]` or `[::1]:3000`.
-    const close = text.indexOf(']');
-    if (close === -1) return null;
-    hostText = text.slice(1, close);
-    // Brackets exist for one purpose - to delimit an IPv6 literal - so the
-    // contents must actually BE one. A colon is not evidence of that:
-    // `[::1.]` and `[not:ipv6]` both carry one and neither is an address, and
-    // admitting them would hand a malformed value to comparison.
-    if (net.isIP(hostText) !== 6) return null;
-    isLiteral = true;
-    const rest = text.slice(close + 1);
-    if (rest !== '') {
-      if (!rest.startsWith(':')) return null;
-      portText = rest.slice(1);
-    }
-  } else {
-    if (hostText.includes(']')) return null;
-    const colon = text.indexOf(':');
-    if (colon !== -1) {
-      hostText = text.slice(0, colon);
-      portText = text.slice(colon + 1);
-      // A second colon means an unbracketed IPv6 literal or two ports; either
-      // way the port is ambiguous.
-      if (portText.includes(':')) return null;
-    }
-    if (hostText === '' || hostText.includes('[')) return null;
-    // An IPv4 literal is a literal too, so it is not dot-normalized either.
-    isLiteral = net.isIP(hostText) !== 0;
-  }
-
-  let port = null;
-  if (portText !== '') {
-    if (!PORT_TEXT_PATTERN.test(portText)) return null;
-    port = Number(portText);
-    if (port > MAX_PORT) return null;
-  }
-
-  return { host: normalizeAuthorityHost(hostText, isLiteral), port };
-};
-
-/**
- * Renders a parsed authority back to its canonical text, so the resolved
- * configuration reports the allowlist in one spelling - which is what a
- * diagnostic or an assertion can be written against.
- *
- * @param {{host: string, port: number|null}} authority The parsed authority.
- * @returns {string} `app.example`, `app.example:8080` or `[::1]:8080`.
- */
-const formatAuthority = ({ host, port }) => {
-  const rendered = host.includes(':') ? `[${host}]` : host;
-  return port === null ? rendered : `${rendered}:${port}`;
-};
-
-/**
- * Whether a resolved bind value keeps the service on the loopback interface.
- *
- * This is the switch between the two halves of the policy: a loopback bind
- * carries an implicit set of loopback authorities, while anything wider - a
- * wildcard such as `0.0.0.0` or `::`, a specific interface address, or a
- * hostname - carries none and must name its authorities explicitly.
- *
- * @param {string} host The resolved, trimmed bind value.
- * @returns {boolean} `true` for a loopback bind.
- */
-const isLoopbackBind = (host) => {
-  const lower = host.toLowerCase();
-  return LOOPBACK_BIND_NAMES.includes(lower) || LOOPBACK_BIND_PATTERN.test(lower);
 };
 
 /* ---------------------------------------------------------------------------
@@ -502,57 +246,6 @@ const resolvePort = (candidate) => {
 };
 
 /**
- * Validates one write-path ceiling and returns it as a number.
- *
- * Shaped after `resolvePort` on purpose, because the hazard is identical: these
- * values arrive from the environment as text, and a partial parse would install
- * a ceiling nobody chose. A string must match `LIMIT_TEXT_PATTERN` in full; a
- * number passed programmatically must be an integer; either way the result must
- * be at least `MIN_LIMIT`, since a ceiling of `0` would report every write as a
- * capacity condition instead of as the configuration mistake it is.
- *
- * @param {unknown} candidate The raw value, or `undefined` for the default.
- * @param {number} fallback The default from the repository's own table.
- * @param {string} label The option name, for the message.
- * @returns {number} An integer of at least 1.
- * @throws {Error} With `code === 'SERVER_CONFIG_INVALID'`, naming the value.
- */
-const resolveLimit = (candidate, fallback, label) => {
-  if (candidate === undefined) return fallback;
-
-  if (typeof candidate === 'number') {
-    if (!Number.isInteger(candidate) || candidate < MIN_LIMIT) {
-      throw createConfigError(
-        `${label} must be an integer of at least ${MIN_LIMIT}: ${truncate(String(candidate))}`
-      );
-    }
-    return candidate;
-  }
-
-  if (typeof candidate !== 'string') {
-    throw createConfigError(
-      `${label} must be a number or a decimal string (received ${describeValue(candidate)})`
-    );
-  }
-
-  const text = candidate.trim();
-  if (!LIMIT_TEXT_PATTERN.test(text)) {
-    throw createConfigError(
-      `${label} must be one to ten decimal digits with nothing else, not a fraction ` +
-        `and not an empty value: ${quoteValue(candidate)}`
-    );
-  }
-
-  const value = Number(text);
-  if (value < MIN_LIMIT) {
-    throw createConfigError(
-      `${label} must be an integer of at least ${MIN_LIMIT}: ${quoteValue(candidate)}`
-    );
-  }
-  return value;
-};
-
-/**
  * Validates a host and returns it trimmed.
  *
  * An empty or whitespace-only value is fatal rather than a silent bind to every
@@ -611,64 +304,6 @@ const resolveEntrypointPath = (candidate, fallback, label) => {
 };
 
 /**
- * Validates the explicit authority allowlist and returns it canonicalized.
- *
- * Accepted shapes, so the environment and a programmatic caller can each say it
- * naturally: a comma-separated string (`'app.example:8080, 10.0.0.5'`) or an
- * array of entries. Every entry passes through the same parser the `Host`
- * header does, so an unusable entry is a **startup** failure naming it rather
- * than a rule that silently never matches.
- *
- * An entry that carries a port matches only that exact `host:port`. An entry
- * that carries none matches that host on any port, which is the reverse-proxy
- * case: a proxy terminating on `:443` forwards `Host: app.example` while this
- * service listens on some other port entirely, and an operator naming
- * `app.example` means the name rather than the port.
- *
- * @param {unknown} candidate The raw value, or `undefined` for "none".
- * @returns {readonly string[]} The frozen, canonical entries.
- * @throws {Error} With `code === 'SERVER_CONFIG_INVALID'`, naming the entry.
- */
-const resolveAllowedHosts = (candidate) => {
-  if (candidate === undefined) return EMPTY_ALLOWED_HOSTS;
-
-  let rawEntries;
-  if (Array.isArray(candidate)) {
-    rawEntries = candidate;
-  } else if (typeof candidate === 'string') {
-    // An empty or whitespace-only value means "none named", which is exactly
-    // what an unset variable means; an exported-but-empty `ALLOWED_HOSTS` must
-    // not read as an allowlist of one empty authority.
-    const text = candidate.trim();
-    if (text === '') return EMPTY_ALLOWED_HOSTS;
-    rawEntries = text.split(ALLOWED_HOSTS_SEPARATOR);
-  } else {
-    throw createConfigError(
-      'allowedHosts must be a comma-separated string or an array of authorities '
-        + `(received ${describeValue(candidate)})`
-    );
-  }
-
-  const canonical = [];
-  rawEntries.forEach((entry) => {
-    const authority = parseAuthority(entry);
-    if (authority === null) {
-      throw createConfigError(
-        'allowedHosts entries must each be a host, optionally with a port, and nothing '
-          + `else - no scheme, path, userinfo or whitespace: ${quoteValue(entry)}`
-      );
-    }
-    const rendered = formatAuthority(authority);
-    // Duplicates are dropped rather than refused: naming one authority twice is
-    // harmless, and a deployment assembling the list from several sources
-    // should not fail for saying the same thing twice.
-    if (!canonical.includes(rendered)) canonical.push(rendered);
-  });
-
-  return Object.freeze(canonical);
-};
-
-/**
  * Resolves the whole configuration.
  *
  * Pure and idempotent: it reads `options` and `process.env`, mutates nothing,
@@ -679,36 +314,17 @@ const resolveAllowedHosts = (candidate) => {
  * `directory` and `repository` are deliberately **not** part of the result: they
  * are injection-only options, read straight off `options` by `createServer`.
  *
- * One cross-value rule lives here, because it is the only place both values are
- * known: **a bind wider than loopback must name its authorities.** A loopback
- * bind carries the implicit loopback authority set, so it needs no allowlist; a
- * wildcard or interface bind carries none, and serving every authority on a
- * published socket is precisely the exposure the authority gate exists to
- * prevent. Failing here rather than per request is deliberate - an operator who
- * widens the bind learns at startup, instead of from a server that binds
- * successfully and then refuses every request it receives.
- *
  * @param {{
  *   host?: string,
  *   port?: number|string,
  *   activitiesDataPath?: string,
- *   workbookDir?: string,
- *   allowedHosts?: string|readonly string[],
- *   maxPendingWrites?: number|string,
- *   maxActivitiesPerStudent?: number|string,
- *   maxRegistryRecords?: number|string,
- *   maxRegistryBytes?: number|string
+ *   workbookDir?: string
  * }} [options] Overrides, highest precedence.
  * @returns {{
  *   host: string,
  *   port: number,
  *   activitiesDataPath: string,
- *   workbookDir: string,
- *   allowedHosts: readonly string[],
- *   maxPendingWrites: number,
- *   maxActivitiesPerStudent: number,
- *   maxRegistryRecords: number,
- *   maxRegistryBytes: number
+ *   workbookDir: string
  * }} The frozen, fully concrete configuration.
  * @throws {Error} With `code === 'SERVER_CONFIG_INVALID'` on any invalid value,
  *   naming the value. It throws rather than exiting: only the CLI wrapper turns
@@ -734,31 +350,8 @@ const resolveConfig = (options) => {
     DEFAULT_WORKBOOK_DIR,
     'workbookDir'
   );
-  const allowedHosts = resolveAllowedHosts(readOption(source, 'allowedHosts', 'ALLOWED_HOSTS'));
 
-  if (allowedHosts.length === 0 && !isLoopbackBind(host)) {
-    throw createConfigError(
-      `host ${quoteValue(host)} binds beyond loopback, so allowedHosts must name at least `
-        + 'one authority this server answers for - set ALLOWED_HOSTS, for example '
-        + `ALLOWED_HOSTS="app.example:${port}". A published socket that serves every `
-        + 'authority is reachable by a rebound browser origin'
-    );
-  }
-
-  // The four write-path ceilings, resolved at the same precedence as everything
-  // above and defaulted from the module that enforces them. They travel to the
-  // repository through `createServer`'s existing `{ ...config, directory }`
-  // spread, so the composition root stays the only place they are read.
-  const resolved = { host, port, activitiesDataPath, workbookDir, allowedHosts };
-  LIMIT_KEYS.forEach((key) => {
-    resolved[key] = resolveLimit(
-      readOption(source, key, LIMIT_ENVIRONMENT_KEYS[key]),
-      activityRepository.WRITE_LIMIT_DEFAULTS[key],
-      key
-    );
-  });
-
-  return Object.freeze(resolved);
+  return Object.freeze({ host, port, activitiesDataPath, workbookDir });
 };
 
 /**
@@ -913,234 +506,6 @@ const sendInvalidStudentId = (req, res, rawValue) => {
   );
 };
 
-/**
- * Refuses a request whose authority this server does not answer for.
- *
- * Two outcomes, kept distinct because they are two different faults and an
- * operator reading a log needs to tell them apart. Both follow the split this
- * contract already draws between a value's **shape** and its **identity** -
- * `400 INVALID_STUDENT_ID` against `404 STUDENT_NOT_FOUND`:
- *
- *   - `400 INVALID_HOST` - the `Host` header is present but unusable: empty,
- *     duplicated, or not a parseable authority. RFC 9112 3.2 requires `400` for
- *     exactly these, and the runtime supplies it only for a header missing from
- *     an HTTP/1.1 request: an empty value reaches this handler as `''`, and a
- *     second `Host` header is neither rejected nor surfaced by
- *     `req.headers.host`, which reports only the first. Both were confirmed on
- *     the pinned runtime, so both are decided here.
- *   - `421 MISDIRECTED_REQUEST` - the authority parses and is simply not one
- *     this server answers for. This is the DNS-rebinding case.
- *
- * Both go through `sendError`, so both carry the same two-key envelope, declare
- * `Connection: close` - the connection is not one to reuse, and a keep-alive
- * client must not pipeline another request behind a refusal - and abandon the
- * request body unread, since the decision was taken before a byte of it was
- * interpreted.
- *
- * @param {import('http').IncomingMessage} req The request to refuse.
- * @param {import('http').ServerResponse} res The response to write.
- * @param {string} outcome `AUTHORITY_INVALID` or `AUTHORITY_MISDIRECTED`.
- * @returns {void}
- */
-const sendAuthorityRejection = (req, res, outcome) => {
-  if (outcome === AUTHORITY_INVALID) {
-    sendError(req, res, STATUS_BAD_REQUEST, CODE_INVALID_HOST, MESSAGE_INVALID_HOST);
-    return;
-  }
-  sendError(
-    req,
-    res,
-    STATUS_MISDIRECTED_REQUEST,
-    CODE_MISDIRECTED_REQUEST,
-    MESSAGE_MISDIRECTED_REQUEST
-  );
-};
-
-/* ---------------------------------------------------------------------------
- * The authority gate.
- *
- * It runs before the request target is parsed and before anything is
- * dispatched, so an authority this server does not answer for reaches no route,
- * no identifier lookup, no body reader and no write queue. Placing it first is
- * the whole point: a gate after dispatch would already have served the data.
- * ------------------------------------------------------------------------- */
-
-/**
- * Builds the authority policy once, from the resolved configuration.
- *
- * Two parts, and a request is allowed if **either** admits it:
- *
- *   1. `boundPortHosts` - the implicit set a loopback bind answers for
- *      (`localhost`, `127.0.0.1`, `::1`, plus the resolved bind value itself,
- *      so `HOST=127.0.0.2` answers for `127.0.0.2`). Empty for any wider bind.
- *      A member of this set matches **only on the port actually bound**, which
- *      for an ephemeral run is the port the kernel chose rather than the `0`
- *      that was configured.
- *   2. `entries` - the explicit allowlist, already parsed and validated by
- *      `resolveAllowedHosts`, which applies whatever the bind is.
- *
- * @param {{host: string, port: number, allowedHosts: readonly string[]}} config
- *   The resolved configuration.
- * @returns {{
- *   boundPortHosts: readonly string[],
- *   entries: readonly {host: string, port: number|null}[],
- *   configuredPort: number
- * }} The frozen policy.
- */
-const createAuthorityPolicy = ({ host, port, allowedHosts }) => {
-  const boundPortHosts = [];
-  if (isLoopbackBind(host)) {
-    LOOPBACK_AUTHORITY_HOSTS.forEach((loopback) => boundPortHosts.push(loopback));
-    // The bind value itself, normalized the same way a `Host` header is, so
-    // `HOST=127.0.0.9` answers for `127.0.0.9` and a mixed-case or bracketed
-    // value answers for its own spelling. A bare `::1` does not parse as an
-    // authority - an unbracketed colon-bearing value never can - and needs no
-    // entry, because the implicit set above already names it.
-    const bound = parseAuthority(host);
-    if (bound !== null && !boundPortHosts.includes(bound.host)) boundPortHosts.push(bound.host);
-  }
-
-  // `resolveAllowedHosts` already refused anything unparseable, so every entry
-  // parses here; the map is a re-parse of canonical text, not a second policy.
-  const entries = allowedHosts.map((entry) => parseAuthority(entry));
-
-  return Object.freeze({
-    boundPortHosts: Object.freeze(boundPortHosts),
-    entries: Object.freeze(entries),
-    configuredPort: port
-  });
-};
-
-/**
- * Reads the request's `Host` header without assuming the request came off a
- * socket, so a handler invoked directly cannot turn a missing header bag into a
- * thrown error and a `500`.
- *
- * @param {import('http').IncomingMessage} req The request.
- * @returns {unknown} The header value, or `undefined` when there is none.
- */
-const hostHeaderOf = (req) => {
-  const headers = req.headers;
-  if (headers === null || typeof headers !== 'object') return undefined;
-  return headers.host;
-};
-
-/**
- * Counts the request's `Host` header lines.
- *
- * `req.headers.host` collapses duplicates to the first value, so the count has
- * to come from `req.rawHeaders`. It matters because two `Host` lines make the
- * authority ambiguous - this process would judge the first while anything else
- * reading the same bytes might take the second - and RFC 9112 3.2 requires such
- * a request to be refused.
- *
- * @param {import('http').IncomingMessage} req The request.
- * @returns {number} How many `Host` header lines arrived.
- */
-const countHostHeaders = (req) => {
-  const raw = req.rawHeaders;
-  if (!Array.isArray(raw)) return typeof hostHeaderOf(req) === 'string' ? 1 : 0;
-
-  let count = 0;
-  for (let index = 0; index < raw.length; index += 2) {
-    if (typeof raw[index] === 'string' && raw[index].toLowerCase() === 'host') count += 1;
-  }
-  return count;
-};
-
-/**
- * The port this request actually arrived on.
- *
- * Read from the socket rather than from the configuration, because the two
- * differ exactly where it matters: `PORT=0` resolves to `0` and binds whatever
- * the kernel chose, and comparing an authority against `0` would refuse every
- * request an ephemeral run received. The configured port is the fallback for
- * the case where the socket no longer reports one.
- *
- * @param {import('http').IncomingMessage} req The request.
- * @param {number} fallback The configured port.
- * @returns {number} The port the request arrived on.
- */
-const boundPortOfRequest = (req, fallback) => {
-  const socket = req.socket;
-  if (socket !== null && socket !== undefined && Number.isInteger(socket.localPort)) {
-    return socket.localPort;
-  }
-  return fallback;
-};
-
-/**
- * Whether the request's protocol version obliges it to carry a `Host` header.
- *
- * HTTP/1.1 and later require one (RFC 9112 3.2); HTTP/1.0 does not. A request
- * whose version cannot be read - a handler invoked directly rather than through
- * a socket - is treated as not obliged, because there is no wire format to be
- * non-conformant with.
- *
- * @param {import('http').IncomingMessage} req The request.
- * @returns {boolean} `true` when the header is mandatory.
- */
-const requiresHostHeader = (req) => {
-  const major = req.httpVersionMajor;
-  const minor = req.httpVersionMinor;
-  if (!Number.isInteger(major) || !Number.isInteger(minor)) return false;
-  return major > 1 || (major === 1 && minor >= 1);
-};
-
-/**
- * Decides one request's authority against the policy.
- *
- * The three outcomes turn on what the client asserted, not on what it wanted:
- *
- *   - **It asserted nothing.** No `Host` header at all, which only an HTTP/1.0
- *     client may send - the runtime refuses a header-less HTTP/1.1 request with
- *     its own `400` before this handler, verified on the pinned runtime. Such a
- *     request names no origin, so there is no origin to be misdirected from and
- *     nothing to compare: it is served under the server's own authority. This
- *     cannot be the rebinding vehicle, because a browser always sends `Host`
- *     and script cannot change it - `Host` is a forbidden header name - so
- *     every request the attack can produce takes one of the two branches below.
- *     A version at or above 1.1 arriving without the header is still refused,
- *     so the rule stays true even if the parser is ever run in lenient mode.
- *   - **It asserted something unusable** - an empty value, two `Host` lines, or
- *     text that is not an authority. Refused as `400`.
- *   - **It asserted an authority.** Served only if the policy answers for it;
- *     otherwise `421`.
- *
- * @param {ReturnType<typeof createAuthorityPolicy>} policy The policy.
- * @param {import('http').IncomingMessage} req The request.
- * @returns {string} `AUTHORITY_ALLOWED`, `AUTHORITY_INVALID` or
- *   `AUTHORITY_MISDIRECTED`.
- */
-const decideAuthority = (policy, req) => {
-  const hostHeaders = countHostHeaders(req);
-  if (hostHeaders === 0) {
-    return requiresHostHeader(req) ? AUTHORITY_INVALID : AUTHORITY_ALLOWED;
-  }
-  // Two `Host` lines make the authority ambiguous, which is unusable rather
-  // than merely unrecognised.
-  if (hostHeaders > 1) return AUTHORITY_INVALID;
-
-  const authority = parseAuthority(hostHeaderOf(req));
-  if (authority === null) return AUTHORITY_INVALID;
-
-  // An authority that carries no port means the scheme's default, so a portless
-  // `Host` matches a loopback bind only when the service really is on port 80.
-  const port = authority.port === null ? DEFAULT_HTTP_PORT : authority.port;
-  if (
-    policy.boundPortHosts.includes(authority.host)
-    && port === boundPortOfRequest(req, policy.configuredPort)
-  ) {
-    return AUTHORITY_ALLOWED;
-  }
-
-  const named = policy.entries.some((entry) => entry !== null
-    && entry.host === authority.host
-    && (entry.port === null || entry.port === authority.port));
-
-  return named ? AUTHORITY_ALLOWED : AUTHORITY_MISDIRECTED;
-};
-
 const splitPathSegments = (pathText) => {
   const parts = pathText.split('/');
   if (parts[0] === '') parts.shift();
@@ -1209,34 +574,19 @@ const parseRequestTarget = (req) => {
 /**
  * Builds the `http.createServer` handler.
  *
- * Ownership, so that no status is produced in two places: the authority gate
- * runs first, before the target is parsed and before any route sees the request
- * (`400 INVALID_HOST` or `421 MISDIRECTED_REQUEST`, both answered here); `/` is
- * answered here (`GET` and `HEAD` return the greeting, any other method `405`
- * with `Allow: GET, HEAD`); a malformed percent-escape is answered here;
- * everything else is offered to the API handler, and the `false` it returns for
- * a path it does not recognise is answered here with the single `404 NOT_FOUND`.
+ * Ownership, so that no status is produced in two places: dispatch begins at
+ * path recognition; `/` is answered here (`GET` and `HEAD` return the greeting,
+ * any other method `405` with `Allow: GET, HEAD`); a malformed percent-escape is
+ * answered here; everything else is offered to the API handler, and the `false`
+ * it returns for a path it does not recognise is answered here with the single
+ * `404 NOT_FOUND`.
  *
  * @param {(req: import('http').IncomingMessage, res: import('http').ServerResponse, route: {method: string, segments: string[], rawPath: string, query: URLSearchParams}) => boolean} apiHandler
  *   The handler built by `lib/activityRoutes.js`.
- * @param {ReturnType<typeof createAuthorityPolicy>} authorityPolicy The policy
- *   built by `createServer` from the resolved configuration. Required: this
- *   function is module-private and `createServer` is its only caller, so there
- *   is deliberately no default - a policy-less handler could only fail open.
  * @returns {(req: import('http').IncomingMessage, res: import('http').ServerResponse) => void}
  *   The request handler.
  */
-const createRequestHandler = (apiHandler, authorityPolicy) => (req, res) => {
-  // The authority gate, first and unconditionally. A loopback bind keeps remote
-  // packets out but not a rebound remote origin, whose requests arrive locally
-  // and are refused here on the one field it cannot forge - and refused before
-  // the target is parsed, so nothing downstream ever sees them.
-  const authority = decideAuthority(authorityPolicy, req);
-  if (authority !== AUTHORITY_ALLOWED) {
-    sendAuthorityRejection(req, res, authority);
-    return;
-  }
-
+const createRequestHandler = (apiHandler) => (req, res) => {
   const { method, rawPath, rawQuery, rawSegments, segments } = parseRequestTarget(req);
 
   if (rawPath === ROOT_PATH) {
@@ -1296,17 +646,9 @@ const createRequestHandler = (apiHandler, authorityPolicy) => (req, res) => {
  *   port?: number|string,
  *   activitiesDataPath?: string,
  *   workbookDir?: string,
- *   allowedHosts?: string|readonly string[],
- *   maxPendingWrites?: number|string,
- *   maxActivitiesPerStudent?: number|string,
- *   maxRegistryRecords?: number|string,
- *   maxRegistryBytes?: number|string,
  *   directory?: object,
  *   repository?: object
- * }} [options] Configuration overrides plus the two injection seams. An
- *   injected `repository` brings its own ceilings, so the four `max…` values
- *   are resolved either way but reach a repository only when this file builds
- *   one.
+ * }} [options] Configuration overrides plus the two injection seams.
  * @returns {import('http').Server} A **non-listening** server, carrying the
  *   resolved configuration as the read-only property `server.config`.
  * @throws {Error} Synchronously, with `code === 'SERVER_CONFIG_INVALID'` for a
@@ -1322,11 +664,7 @@ const createServer = (options) => {
   const repository = source.repository ?? activityRepository.load({ ...config, directory });
   const apiHandler = activityRoutes.create({ directory, repository });
 
-  // The authority policy is derived from the resolved configuration, so it is
-  // fixed for the life of the server and computed once rather than per request.
-  const server = http.createServer(
-    createRequestHandler(apiHandler, createAuthorityPolicy(config))
-  );
+  const server = http.createServer(createRequestHandler(apiHandler));
 
   // Read-only, because `start` reads its bind arguments from here and must
   // neither re-resolve nor mutate anything.
