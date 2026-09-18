@@ -78,7 +78,8 @@ const CHECKOUT_TOKEN = crypto
   .slice(0, 12);
 
 /**
- * The `fs.mkdtempSync` prefix for every throwaway registry directory.
+ * The temporary-directory NAMESPACE this file shares with
+ * `test/workbooks.test.js`.
  *
  * `os.tmpdir()` is HOST-WIDE and many checkouts of this repository can run
  * their suites under that one temp root at once, so embedding `CHECKOUT_TOKEN`
@@ -93,7 +94,27 @@ const CHECKOUT_TOKEN = crypto
  * `.js` file inside a directory named `test/` is executed as a test, and the
  * two files run in separate processes.
  */
-const TEMP_PREFIX = `student-activities-${CHECKOUT_TOKEN}-`;
+const TEMP_NAMESPACE = `student-activities-${CHECKOUT_TOKEN}-`;
+
+/**
+ * The `fs.mkdtempSync` prefix for every throwaway registry directory: the
+ * shared namespace, then an OWNER SEGMENT - `p`, this process's pid and a
+ * hyphen - with `mkdtempSync`'s six random characters appended after it.
+ *
+ * The owner segment is a CONTRACT `test/workbooks.test.js` PARSES rather than a
+ * cosmetic detail, and it too MUST STAY IN STEP with the pattern that file
+ * applies to whatever follows the namespace. Naming the owner is what lets that
+ * file's leftover check tell an artifact the suite failed to remove from a
+ * directory a still-running sibling process is legitimately mid-use of: the two
+ * files run in separate child processes, and `node --test` at its DEFAULT
+ * concurrency runs them at the same time, so a bare namespace match cannot
+ * separate the two cases and reported a live sibling's registry directory as a
+ * leak. A directory whose owner has exited - which is every directory of this
+ * file's under the serialized runner `verify-tests.js` uses, because that
+ * runner reaches `test/workbooks.test.js` only after this process is gone - is
+ * still reported, so the check keeps its teeth.
+ */
+const TEMP_PREFIX = `${TEMP_NAMESPACE}p${process.pid}-`;
 
 const REGISTRY_FILENAME = 'activities.json';
 
@@ -2212,7 +2233,7 @@ test('every payload carries exactly its documented keys and no discarded column'
  * a socket, which is why the seams exist.
  * ------------------------------------------------------------------------- */
 
-test('a missing registry file warns and serves the workbook data anyway', async () => {
+test('a missing registry warns, but an unusable registry directory is fatal', async () => {
   const missingRegistry = path.join(mkTemp(), REGISTRY_FILENAME);
   const directory = studentDirectory.load({ workbookDir: REPO_ROOT });
   const collected = [];
@@ -2308,6 +2329,274 @@ test('a missing registry file warns and serves the workbook data anyway', async 
     'the warning must name the missing path with the override escaped; got '
       + `${JSON.stringify(hostileWarning)}`
   );
+
+  /*
+   * The registry's DIRECTORY, which is the other half of this load-time check:
+   * it must exist, be a directory, and accept a write, and the writability half
+   * is proven by creating and immediately removing a uniquely named probe file
+   * rather than by asking `fs.accessSync` - which consults mode bits and so
+   * reports a deny-write ACL as writable on Windows. What the probe must not do
+   * is leave anything behind, or touch anything it did not create, so every
+   * successful load below is followed by a listing of the directory it loaded
+   * from.
+   */
+
+  // The same capture the two loads above perform, as one local closure rather
+  // than a third and fourth copy of it. Scoped to this test body deliberately:
+  // the swap of `process.stderr.write` is process-wide while it is installed,
+  // so it is installed for exactly one call and restored in a `finally`.
+  const captureStderr = (action) => {
+    const written = [];
+    const restore = process.stderr.write;
+    process.stderr.write = (chunk, encoding, callback) => {
+      written.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      if (typeof encoding === 'function') encoding();
+      else if (typeof callback === 'function') callback();
+      return true;
+    };
+    let thrown = null;
+    try {
+      action();
+    } catch (error) {
+      thrown = error;
+    } finally {
+      process.stderr.write = restore;
+    }
+    return { thrown, text: written.join('') };
+  };
+
+  // (a) The load that has just succeeded above went through a directory holding
+  // nothing at all, and must have left it that way: no probe entry, and no
+  // registry file invented by a check that only ever reads.
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(missingRegistry)),
+    [],
+    'absent registry: the writability probe must leave the directory empty'
+  );
+
+  // (b) The same guarantee with a registry present: the probe neither replaces
+  // it nor rewrites a byte of it.
+  const seededDirectory = mkTemp();
+  const seededRegistry = path.join(seededDirectory, REGISTRY_FILENAME);
+  fs.writeFileSync(seededRegistry, EMPTY_REGISTRY, 'utf8');
+  const seededRepository = activityRepository.load({
+    workbookDir: REPO_ROOT,
+    activitiesDataPath: seededRegistry,
+    directory
+  });
+  assert.equal(
+    seededRepository.recordCount(),
+    EXPECTED_RECORD_COUNT,
+    'seeded registry: an empty array adds no record to the workbook ten'
+  );
+  assert.deepEqual(
+    fs.readdirSync(seededDirectory).sort(),
+    [REGISTRY_FILENAME],
+    'seeded registry: the probe must leave the registry as the only entry'
+  );
+  assert.equal(
+    fs.readFileSync(seededRegistry, 'utf8'),
+    EMPTY_REGISTRY,
+    'seeded registry: a read-only load must not rewrite a byte of the file'
+  );
+
+  // (c) The writer's scratch path is the one name in that directory the service
+  // must never write through or remove unless it created it, so a probe that
+  // reused `<registry>.tmp` would be caught here: the sentinel survives the
+  // load byte for byte.
+  const decoyDirectory = mkTemp();
+  const decoyRegistry = path.join(decoyDirectory, REGISTRY_FILENAME);
+  const decoyScratch = `${decoyRegistry}${REGISTRY_TEMPORARY_SUFFIX}`;
+  fs.writeFileSync(decoyRegistry, EMPTY_REGISTRY, 'utf8');
+  fs.writeFileSync(decoyScratch, DECOY_CONTENTS, 'utf8');
+  const decoyRepository = activityRepository.load({
+    workbookDir: REPO_ROOT,
+    activitiesDataPath: decoyRegistry,
+    directory
+  });
+  assert.equal(
+    decoyRepository.recordCount(),
+    EXPECTED_RECORD_COUNT,
+    'planted scratch file: an occupied scratch path must not affect the load'
+  );
+  assert.equal(
+    fs.readFileSync(decoyScratch, 'utf8'),
+    DECOY_CONTENTS,
+    'planted scratch file: the sentinel must survive the load byte for byte'
+  );
+  assert.deepEqual(
+    fs.readdirSync(decoyDirectory).sort(),
+    [REGISTRY_FILENAME, `${REGISTRY_FILENAME}${REGISTRY_TEMPORARY_SUFFIX}`],
+    'planted scratch file: the probe must add and remove no entry of its own'
+  );
+
+  // (d) A directory that does not exist at all. The registry read runs first
+  // and reports the file as merely absent, so this case warns AND THEN throws -
+  // both are asserted, because a warning alone is what the service does for a
+  // usable directory.
+  const absentDirectory = path.join(mkTemp(), 'absent');
+  const registryUnderAbsent = path.join(absentDirectory, REGISTRY_FILENAME);
+  const absentOutcome = captureStderr(() => activityRepository.load({
+    workbookDir: REPO_ROOT,
+    activitiesDataPath: registryUnderAbsent,
+    directory
+  }));
+  assert.notEqual(
+    absentOutcome.thrown,
+    null,
+    'missing directory: the load must abort rather than serve a server that could never persist'
+  );
+  assert.equal(
+    absentOutcome.thrown.code,
+    CODE_REPOSITORY_INVALID,
+    `missing directory: wrong error code; got ${absentOutcome.thrown.code}`
+  );
+  assert.ok(
+    absentOutcome.thrown.message.includes(registryUnderAbsent),
+    'missing directory: the message must name the registry file; got '
+      + `"${absentOutcome.thrown.message}"`
+  );
+  assert.ok(
+    absentOutcome.thrown.message.includes(absentDirectory),
+    `missing directory: the message must name the directory; got "${absentOutcome.thrown.message}"`
+  );
+  assert.ok(
+    absentOutcome.thrown.message.includes('cannot be inspected'),
+    'missing directory: the message must say the directory cannot be inspected; got '
+      + `"${absentOutcome.thrown.message}"`
+  );
+  assert.ok(
+    absentOutcome.text.includes(registryUnderAbsent),
+    `missing directory: the registry read must still warn first; got "${absentOutcome.text}"`
+  );
+
+  // (e) A parent that exists and is a regular file. Which of the two refusals
+  // sees it first is a platform property, so the fixture is PROBED rather than
+  // assumed: a read THROUGH a file answers `ENOTDIR` on POSIX, where the
+  // registry read refuses the path as unreadable, and `ENOENT` on Windows,
+  // where the read only warns and the directory check is what refuses it.
+  // Either way the load is fatal with the same code and names the parent.
+  const parentFile = path.join(mkTemp(), 'not-a-directory');
+  fs.writeFileSync(parentFile, DECOY_CONTENTS, 'utf8');
+  const registryUnderFile = path.join(parentFile, REGISTRY_FILENAME);
+  let readThroughFileCode = null;
+  try {
+    fs.readFileSync(registryUnderFile, 'utf8');
+  } catch (error) {
+    readThroughFileCode = error.code;
+  }
+  const fileParentFault =
+    readThroughFileCode === 'ENOENT' ? 'is not a directory' : 'the file could not be read';
+  const fileParentOutcome = captureStderr(() => activityRepository.load({
+    workbookDir: REPO_ROOT,
+    activitiesDataPath: registryUnderFile,
+    directory
+  }));
+  assert.notEqual(
+    fileParentOutcome.thrown,
+    null,
+    'file as parent: the load must abort rather than accept a path through a file'
+  );
+  assert.equal(
+    fileParentOutcome.thrown.code,
+    CODE_REPOSITORY_INVALID,
+    `file as parent: wrong error code; got ${fileParentOutcome.thrown.code}`
+  );
+  assert.ok(
+    fileParentOutcome.thrown.message.includes(parentFile),
+    `file as parent: the message must name the parent; got "${fileParentOutcome.thrown.message}"`
+  );
+  assert.ok(
+    fileParentOutcome.thrown.message.includes(fileParentFault),
+    `file as parent: the message must state "${fileParentFault}" on a host whose read `
+      + `through a file answers ${readThroughFileCode}; got "${fileParentOutcome.thrown.message}"`
+  );
+
+  /*
+   * (f) A directory that exists and refuses writes.
+   *
+   * There is no in-process way to deny writes on every platform - `chmod`
+   * carries no access decision on Windows, and a deny-ACL needs `icacls`, which
+   * is a child process this file may not spawn (the deny-ACL case is covered by
+   * process-level verification outside this suite instead). So the fixture is
+   * made and then VERIFIED with a real exclusive create, exactly as
+   * `MODE_BITS_ARE_MEANINGFUL` and `trySymlink` gate their own platform
+   * assumptions, and each outcome asserts the guarantee it can actually reach:
+   * the refusal where the denial took, and a successful load leaving no
+   * artifact where it did not. Neither branch can pass on nothing.
+   */
+  const restrictedDirectory = mkTemp();
+  const restrictedRegistry = path.join(restrictedDirectory, REGISTRY_FILENAME);
+  fs.writeFileSync(restrictedRegistry, EMPTY_REGISTRY, 'utf8');
+  try {
+    fs.chmodSync(restrictedDirectory, 0o500);
+    const fixtureProbe = path.join(restrictedDirectory, '.writability-fixture-probe');
+    let denialTook = true;
+    try {
+      const descriptor = fs.openSync(fixtureProbe, 'wx', REGISTRY_TEMPORARY_FILE_MODE);
+      fs.closeSync(descriptor);
+      fs.unlinkSync(fixtureProbe);
+      denialTook = false;
+    } catch {
+      // The create was refused, so this host's mode bits carry the decision and
+      // the loader must reach the same verdict the hard way.
+      denialTook = true;
+    }
+
+    if (denialTook) {
+      const restrictedOutcome = captureStderr(() => activityRepository.load({
+        workbookDir: REPO_ROOT,
+        activitiesDataPath: restrictedRegistry,
+        directory
+      }));
+      assert.notEqual(
+        restrictedOutcome.thrown,
+        null,
+        'unwritable directory: the load must abort while the server is being built'
+      );
+      assert.equal(
+        restrictedOutcome.thrown.code,
+        CODE_REPOSITORY_INVALID,
+        `unwritable directory: wrong error code; got ${restrictedOutcome.thrown.code}`
+      );
+      assert.ok(
+        restrictedOutcome.thrown.message.includes('is not writable'),
+        'unwritable directory: the message must state "is not writable"; got '
+          + `"${restrictedOutcome.thrown.message}"`
+      );
+      assert.ok(
+        restrictedOutcome.thrown.message.includes(restrictedDirectory),
+        'unwritable directory: the message must name the directory; got '
+          + `"${restrictedOutcome.thrown.message}"`
+      );
+      fs.chmodSync(restrictedDirectory, 0o700);
+      assert.deepEqual(
+        fs.readdirSync(restrictedDirectory).sort(),
+        [REGISTRY_FILENAME],
+        'unwritable directory: a refused probe must leave no entry behind'
+      );
+    } else {
+      const writableRepository = activityRepository.load({
+        workbookDir: REPO_ROOT,
+        activitiesDataPath: restrictedRegistry,
+        directory
+      });
+      assert.equal(
+        writableRepository.recordCount(),
+        EXPECTED_RECORD_COUNT,
+        'writable directory: the probe must not stand in the way of a load'
+      );
+      assert.deepEqual(
+        fs.readdirSync(restrictedDirectory).sort(),
+        [REGISTRY_FILENAME],
+        'writable directory: the probe must leave the registry as the only entry'
+      );
+    }
+  } finally {
+    // Restored whatever happened, so the `after` hook can still remove the
+    // directory on a host where the mode bits bite.
+    fs.chmodSync(restrictedDirectory, 0o700);
+  }
 });
 
 test('a corrupt registry file aborts the load and names the fault', async () => {

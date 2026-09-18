@@ -21,6 +21,11 @@
  *     contract: `engines` merely warns with no `.npmrc` setting
  *     `engine-strict`, and `.nvmrc` is inert without a version manager.
  *   - Every declared test file exists.
+ *   - `127.0.0.1:3000` is free, checked only when the declared suite includes
+ *     `test/server.test.js` - the one file that binds it. A suite blocked by a
+ *     port it does not own aborts here as an environmental precondition,
+ *     naming the port once, instead of running and reporting failures whose
+ *     titles impute a product regression.
  *   - The cumulative summary reports `passed >= MIN_TESTS` with `failed === 0`
  *     and `cancelled === 0`. The floor is 45 by default; `MIN_TESTS` may set
  *     any floor of at least 1, never 0, which a run that executed nothing
@@ -36,7 +41,9 @@
  */
 
 const { run } = require('node:test');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const net = require('node:net');
 const path = require('node:path');
 
 const EXIT_SUCCESS = 0;
@@ -78,10 +85,59 @@ const MESSAGE_EXCERPT_LIMIT = 200;
 const VALUE_EXCERPT_LIMIT = 64;
 const LOG_PREFIX = 'verify-tests.js';
 
+/**
+ * The one fixed network resource the suite needs, and the only declared file
+ * that binds it. That bind is deliberate - `test/server.test.js` asserts the
+ * default-port banner and the greeting's exact bytes against the artifact an
+ * operator runs - so a busy port is reported here rather than worked around by
+ * moving those assertions off the port.
+ *
+ * The binder is written relatively for readability and resolved against
+ * `__dirname`, so the comparison in `bindsDefaultPort` never depends on the
+ * working directory the guard was invoked from.
+ */
+const DEFAULT_PORT_HOST = '127.0.0.1';
+const DEFAULT_PORT = 3000;
+const DEFAULT_PORT_BINDER_RELATIVE = 'test/server.test.js';
+const DEFAULT_PORT_BINDER = path.join(__dirname, DEFAULT_PORT_BINDER_RELATIVE);
+
+/**
+ * Bounds for the port precondition: how long a `listen` may take to settle
+ * before the check gives up, and how long - plus how much output - the
+ * best-effort owner lookup on the abort path may consume. Both are small: this
+ * work happens before any test runs and must never become the reason a gate
+ * hangs.
+ */
+const PORT_PROBE_TIMEOUT_MS = 2000;
+const PORT_OWNER_TIMEOUT_MS = 2000;
+const PORT_OWNER_OUTPUT_LIMIT = 1024 * 1024;
+
+/**
+ * Marks a verdict the product did not cause.
+ *
+ * `ENVIRONMENTAL PRECONDITION` is the prefix a reader greps for, and
+ * `test/server.test.js` opens its own conflict messages with the same words,
+ * so one search finds every such report wherever it was produced. The
+ * parenthetical differs deliberately between the two: this one aborts a gate
+ * that ran nothing, so it says the run did not fail on the product, while that
+ * file marks an individual test that did go red and says the redness is not a
+ * regression. Neither file can import the other's constant - a test file
+ * requiring the guard would execute the guard's module body - so the shared
+ * part is the prefix, not the whole sentence.
+ */
+const ENVIRONMENTAL_PRECONDITION_MARKER = 'ENVIRONMENTAL PRECONDITION (not a product failure)';
+
 const ERROR_CODE_MANIFEST = 'ERR_VERIFY_TESTS_MANIFEST';
 const ERROR_CODE_ENGINE = 'ERR_VERIFY_TESTS_ENGINE';
 const ERROR_CODE_CONFIG = 'ERR_VERIFY_TESTS_CONFIG';
 const ERROR_CODE_MISSING_FILE = 'ERR_VERIFY_TESTS_MISSING_FILE';
+/**
+ * One code for the whole port precondition, EADDRINUSE and every other reason
+ * the port could not be certified free alike: it names the condition that
+ * stopped the gate - the suite's fixed port is not usable - and the message
+ * carries the underlying errno.
+ */
+const ERROR_CODE_PORT_BUSY = 'ERR_VERIFY_TESTS_PORT_BUSY';
 const ERROR_CODE_RUNNER = 'ERR_VERIFY_TESTS_RUNNER';
 
 const guardError = (summary, code, cause) => {
@@ -1007,6 +1063,280 @@ const auditFileSummaries = (files, fileSummaries) => {
   return reasons;
 };
 
+/* ---------------------------------------------------------------------------
+ * The port precondition.
+ *
+ * `test/server.test.js` binds `127.0.0.1:3000` deliberately - it is the only
+ * place the shipped entrypoint's banner, greeting bytes and bind-conflict
+ * contracts are observable - so a host that already has a listener there turns
+ * seven of that file's tests red with titles about the greeting, the activity
+ * route and shutdown. Read alone, those titles impute a product regression to
+ * what is only a resource the suite does not own. The checks below turn that
+ * into one abort, before anything runs and before any output claims a run.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Decides whether the port precondition applies to this run.
+ *
+ * It applies only when the declared suite actually contains the file that
+ * binds the default port. `main({ files })` is a supported seam, and a subset
+ * that omits `test/server.test.js` never touches the port, so aborting such a
+ * run over a busy port would refuse work that would have succeeded.
+ *
+ * Spellings are compared through `summaryPathKey`, which resolves a relative
+ * path and folds case on win32, so any spelling of the binder is recognized.
+ *
+ * @param {unknown} files The declared suite, as passed to `main`.
+ * @returns {boolean} `true` when the suite includes the default-port binder.
+ */
+const bindsDefaultPort = (files) => {
+  if (!Array.isArray(files)) {
+    return false;
+  }
+  const binderKey = summaryPathKey(DEFAULT_PORT_BINDER);
+  return files.some((file) => typeof file === 'string'
+    && file !== ''
+    && summaryPathKey(file) === binderKey);
+};
+
+/**
+ * The command a reader can run to identify the holder themselves, used
+ * whenever the lookup below cannot name one.
+ *
+ * @param {number} port The port to look up.
+ * @returns {string} A platform-appropriate, copy-pasteable hint.
+ */
+const portOwnerHint = (port) => (process.platform === 'win32'
+  ? `identify it with \`netstat -ano | findstr :${port}\``
+  : `identify it with \`lsof -nP -iTCP:${port} -sTCP:LISTEN\``);
+
+/**
+ * Extracts the listening pids for one port from `netstat -ano` output.
+ *
+ * Every row is matched on its own terms rather than by column slicing, because
+ * the column widths shift with the address family: `Proto`, `Local Address`,
+ * `Foreign Address`, `State`, `PID`. UDP rows carry no state and fall out on
+ * the field count, and the port is taken from after the last `:` so
+ * `127.0.0.1:3000`, `0.0.0.0:3000` and `[::]:3000` are all recognized - a
+ * wildcard holder blocks the loopback bind just as a loopback holder does.
+ *
+ * The `LISTENING` literal is the English state name; on a localized Windows
+ * nothing matches, which degrades to the hint rather than misreporting.
+ *
+ * @param {string} output The captured stdout of `netstat -ano`.
+ * @param {number} port The port whose holders are wanted.
+ * @returns {string[]} The distinct pids found, possibly empty.
+ */
+const windowsListenerPids = (output, port) => {
+  const pids = [];
+  for (const line of String(output).split(/\r?\n/)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 5 || fields[3] !== 'LISTENING') {
+      continue;
+    }
+    const localPort = fields[1].slice(fields[1].lastIndexOf(':') + 1);
+    if (localPort !== String(port) || !DIGITS_ONLY_PATTERN.test(fields[4]) || pids.includes(fields[4])) {
+      continue;
+    }
+    pids.push(fields[4]);
+  }
+  return pids;
+};
+
+/**
+ * Best-effort identification of what holds the port, for the abort message
+ * only.
+ *
+ * Everything here is failure-tolerant by construction: the tool may be absent,
+ * restricted, localized or slow, and none of that may turn a clear
+ * environmental diagnostic into a crash inside the guard's own failure path.
+ * Any failure - including `lsof`'s non-zero exit when it matches nothing -
+ * degrades to `portOwnerHint`. This runs only when the gate is already
+ * aborting, so it cannot affect a passing run.
+ *
+ * @param {number} port The port that could not be bound.
+ * @returns {string} The holding pid(s), or the hint command; never empty, and
+ *   never a second rendering of the `host:port` the caller has already named.
+ */
+const describeDefaultPortOwner = (port) => {
+  const onWindows = process.platform === 'win32';
+  try {
+    const output = execFileSync(
+      onWindows ? 'netstat' : 'lsof',
+      onWindows ? ['-ano'] : ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'],
+      {
+        encoding: 'utf8',
+        timeout: PORT_OWNER_TIMEOUT_MS,
+        maxBuffer: PORT_OWNER_OUTPUT_LIMIT,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      },
+    );
+    const pids = onWindows
+      ? windowsListenerPids(output, port)
+      : String(output)
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => DIGITS_ONLY_PATTERN.test(line));
+    if (pids.length === 0) {
+      return `owner not identified, ${portOwnerHint(port)}`;
+    }
+    return `held by pid ${pids.join(', ')}`;
+  } catch {
+    // Binding nothing: the failure is the lookup's, not the run's, and the
+    // hint is the answer in every one of its forms.
+    return `owner not identified, ${portOwnerHint(port)}`;
+  }
+};
+
+/**
+ * Binds a throwaway listener to decide whether the suite's fixed port is free,
+ * and releases it again before resolving.
+ *
+ * Ordering matters twice. The `'error'` listener is attached BEFORE `listen`,
+ * because `EADDRINUSE` arrives as an event and an unhandled `'error'` aborts
+ * the process - the guard would die where it is supposed to report. And the
+ * close on the success path is AWAITED: resolving while the probe still held
+ * the socket would hand the suite a port this check itself occupies, which is
+ * the exact failure being prevented.
+ *
+ * TOCTOU: a port found free here can be taken between this release and the
+ * suite's own bind. Nothing running on a shared host can close that window, so
+ * it is not pretended away - `test/server.test.js` carries the same
+ * environmental-precondition marker on its own bind-failure paths, and that is
+ * what covers the race.
+ *
+ * @param {string} host The host to bind.
+ * @param {number} port The port to bind.
+ * @param {number} timeoutMs Bound on the whole probe, so a `listen` that never
+ *   settles cannot hang the gate.
+ * @returns {Promise<void>} Resolves once the port was bound AND released.
+ * @throws {Error} With `ERROR_CODE_PORT_BUSY`: the port is held, could not be
+ *   probed, did not settle in time, or could not be released again.
+ */
+const probePort = (host, port, timeoutMs) => new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  let settled = false;
+  let timer = null;
+
+  const cleanup = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    probe.removeListener('error', onError);
+    probe.removeListener('listening', onListening);
+    // A throwaway handle can still emit after the verdict is decided; a noop
+    // keeps such a late event from aborting the process.
+    probe.on('error', () => {});
+  };
+
+  const fail = (error) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    cleanup();
+    reject(error);
+    // Release the handle however the probe ended. `close` on a probe that
+    // never listened only reports `ERR_SERVER_NOT_RUNNING` to this callback,
+    // which is nothing to act on, and the verdict is already rejected.
+    probe.close(() => {});
+  };
+
+  const onError = (error) => {
+    const code = typeof error.code === 'string' && error.code !== '' ? error.code : 'an unnamed listen error';
+    if (code === 'EADDRINUSE') {
+      fail(guardError(
+        `${ENVIRONMENTAL_PRECONDITION_MARKER}: ${host}:${port} is already in use, ${describeDefaultPortOwner(port)}. `
+          + `${DEFAULT_PORT_BINDER_RELATIVE} must bind that exact address - the banner and greeting it asserts are `
+          + 'only observable there, so the address is fixed and no environment variable moves it. '
+          + 'No test was run. Free the port, or wait for the run holding it to finish, then re-run `npm test`.',
+        ERROR_CODE_PORT_BUSY,
+        error,
+      ));
+      return;
+    }
+    // Fail closed on anything else - `EACCES`, `EADDRNOTAVAIL`, a host that
+    // does not resolve. The port could not be certified free, and running the
+    // suite on an unknown precondition is what this check exists to prevent.
+    // The errno is named; the message is not repeated, since it echoes the
+    // address already named here.
+    fail(guardError(
+      `${ENVIRONMENTAL_PRECONDITION_MARKER}: ${host}:${port} could not be probed before the run (${code}), `
+        + 'so the port the suite needs cannot be certified free. No test was run.',
+      ERROR_CODE_PORT_BUSY,
+      error,
+    ));
+  };
+
+  const onListening = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    cleanup();
+    probe.close((closeError) => {
+      if (closeError) {
+        reject(guardError(
+          `${ENVIRONMENTAL_PRECONDITION_MARKER}: ${host}:${port} was free, but the pre-flight probe could not release it `
+            + `(${renderValue(closeError.code === undefined ? closeError.message : closeError.code)}), `
+            + 'so the suite would have met a port this check still held. No test was run.',
+          ERROR_CODE_PORT_BUSY,
+          closeError,
+        ));
+        return;
+      }
+      resolve();
+    });
+  };
+
+  timer = setTimeout(() => fail(guardError(
+    `${ENVIRONMENTAL_PRECONDITION_MARKER}: the pre-flight probe of ${host}:${port} did not settle within `
+      + `${timeoutMs} ms, so the port the suite needs cannot be certified free. No test was run.`,
+    ERROR_CODE_PORT_BUSY,
+  )), timeoutMs);
+
+  probe.once('error', onError);
+  probe.once('listening', onListening);
+  probe.listen(port, host);
+});
+
+/**
+ * The precondition itself: the suite's fixed port must be free before the run,
+ * whenever the run includes the file that binds it.
+ *
+ * It is deliberately not a skip and not a retry. Skipping the port-dependent
+ * tests would let the contract they hold regress unnoticed, and retrying would
+ * make the gate's duration depend on a neighbour's run. Aborting with one
+ * named diagnostic is the only outcome that keeps a blocked run and a broken
+ * product distinguishable.
+ *
+ * @param {unknown} files The declared suite, as passed to `main`.
+ * @param {{host?: string, port?: number, timeoutMs?: number}} [probe] Probe
+ *   target and bound, defaulted to the suite's own; injectable so the check is
+ *   exercisable in process without contending for the real port.
+ * @returns {Promise<boolean>} `true` when the port was probed and found free,
+ *   `false` when the declared suite does not include the binder and the check
+ *   therefore does not apply.
+ * @throws {Error} With `ERROR_CODE_PORT_BUSY` when the port cannot be
+ *   certified free, carrying the environmental-precondition marker, the
+ *   `host:port` named once, its owner where identifiable, and the remedy.
+ */
+const assertDefaultPortAvailable = async (files, probe = {}) => {
+  if (!bindsDefaultPort(files)) {
+    return false;
+  }
+  const settings = probe === null || typeof probe !== 'object' ? {} : probe;
+  const host = typeof settings.host === 'string' && settings.host !== '' ? settings.host : DEFAULT_PORT_HOST;
+  const port = Number.isInteger(settings.port) ? settings.port : DEFAULT_PORT;
+  const timeoutMs = Number.isInteger(settings.timeoutMs) && settings.timeoutMs > 0
+    ? settings.timeoutMs
+    : PORT_PROBE_TIMEOUT_MS;
+  await probePort(host, port, timeoutMs);
+  return true;
+};
+
 /**
  * Echoes the failing tests, bounded, so a red run is diagnosable from this
  * output alone without re-running `npm run test:raw`.
@@ -1058,6 +1388,10 @@ const main = async (options = {}) => {
     const runtime = assertRuntimeSupported(options.version === undefined ? process.version : options.version);
     const minTests = resolveMinTests(options.environment === undefined ? process.env : options.environment);
     assertTestFilesPresent(files);
+    // Last precondition, and the only one about the host rather than the
+    // repository: it aborts before the lines below, so an aborted gate never
+    // prints that it is running a suite it did not run.
+    await assertDefaultPortAvailable(files);
 
     writeOut(`${LOG_PREFIX}: Node ${runtime.version} satisfies engines.node "${runtime.range}"`);
     writeOut(`${LOG_PREFIX}: running ${files.length} test file(s) at concurrency ${TEST_CONCURRENCY}, requiring at least ${minTests} passing test(s)`);
@@ -1102,6 +1436,9 @@ module.exports = {
   assertRuntimeSupported,
   resolveMinTests,
   assertTestFilesPresent,
+  bindsDefaultPort,
+  describeDefaultPortOwner,
+  assertDefaultPortAvailable,
   runSuite,
   evaluateRun,
   auditFileSummaries,

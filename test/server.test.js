@@ -101,6 +101,20 @@ const TEXT_MEDIA_TYPE = 'text/plain';
 const JSON_MEDIA_TYPE = 'application/json';
 
 /**
+ * Prefixes a failure this file did not cause: `127.0.0.1:3000` is a shared
+ * resource, and a process outside the suite holding it turns the bodies below
+ * red under titles about the greeting, the activity route and shutdown - which
+ * reads as a product regression when it is only a blocked bind.
+ *
+ * Root `verify-tests.js` probes the port and aborts the whole gate before any
+ * test runs, so this marker is the second line of defence: it covers the
+ * window where the port is taken AFTER that probe released it, which no
+ * pre-flight check can close, and the raw-runner invocations that bypass the
+ * guard entirely.
+ */
+const ENVIRONMENT_MARKER = 'ENVIRONMENTAL PRECONDITION (not a product regression):';
+
+/**
  * The committed answer for `S001`: one workbook-sourced activity, because
  * `activities.json` ships empty. Read out of the workbooks
  * (`Student Details!A2,B2` and `Other Info!A2,C2`) and confirmed over HTTP.
@@ -325,6 +339,24 @@ const describeChild = (handle) =>
   `\n  stdout: ${JSON.stringify(handle.stdout)}\n  stderr: ${JSON.stringify(handle.stderr)}`;
 
 /**
+ * Recognizes a child that died because something else already held this file's
+ * port, as opposed to one that died on any other bind error.
+ *
+ * Both halves are required: `EADDRINUSE` alone would also match a child
+ * launched on some other port by the configuration tests, and the address
+ * alone appears in output that is not a failure at all. The entrypoint prints
+ * `server.js: Cannot listen on 127.0.0.1:3000 (EADDRINUSE): ...`, so a
+ * conflict on the default port carries both.
+ *
+ * @param {string} stderr The child's captured stderr.
+ * @returns {boolean} `true` when the child was blocked on `127.0.0.1:3000`.
+ */
+const isDefaultPortConflict = (stderr) =>
+  typeof stderr === 'string'
+    && stderr.includes('EADDRINUSE')
+    && stderr.includes(`${HOST}:${DEFAULT_PORT}`);
+
+/**
  * Waits for the entrypoint's readiness signal: the FIRST COMPLETE LINE of its
  * stdout.
  *
@@ -392,11 +424,25 @@ const waitForBanner = (handle) => new Promise((resolve, reject) => {
   const onError = (error) =>
     fail(`the entrypoint could not be spawned: ${error.message}`);
 
-  const onClose = () =>
+  const onClose = () => {
+    // A child that died on a bind conflict was blocked by a resource this file
+    // does not own, so the message says so outright: the test's own title is
+    // about the banner, the greeting or a route, and nothing in it would
+    // otherwise tell a reader that the product is fine. The `describeChild`
+    // dump below stays either way - the child's stderr is the evidence.
+    if (isDefaultPortConflict(handle.stderr)) {
+      fail(
+        `${ENVIRONMENT_MARKER} another process holds ${HOST}:${DEFAULT_PORT}, `
+          + 'so the entrypoint exited before printing its banner '
+          + `(code ${handle.code}, signal ${handle.signal})`
+      );
+      return;
+    }
     fail(
       'the entrypoint exited before printing its banner '
         + `(code ${handle.code}, signal ${handle.signal})`
     );
+  };
 
   const onTimeout = () => {
     if (handle.exited && !handle.closed) {
@@ -601,7 +647,12 @@ const holdPort = (port) => new Promise((resolve, reject) => {
 
   const onError = (error) => {
     holder.removeListener('listening', onListening);
-    reject(new Error(`could not occupy ${HOST}:${port} for a conflict test: ${error.message}`));
+    // `EADDRINUSE` here means a process outside the suite already holds the
+    // port this conflict test needs to hold itself. That is an environmental
+    // precondition, not a regression in the code under test, and the two must
+    // not read alike.
+    const marker = error.code === 'EADDRINUSE' ? `${ENVIRONMENT_MARKER} ` : '';
+    reject(new Error(`${marker}could not occupy ${HOST}:${port} for a conflict test: ${error.message}`));
   };
 
   const onListening = () => {

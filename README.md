@@ -49,7 +49,7 @@ Every value has the same precedence: an explicit `options` property passed to `c
 | ---------------------- | --------------------- | --------------------------------- | ---------- |
 | `PORT`                 | `port`                | `3000`                            | Must match one to five decimal digits in full and fall in `0`–`65535`. `0` means "bind an ephemeral port". `1.5`, `3000abc`, `70000` and an empty value are startup errors, not silently coerced values. |
 | `HOST`                 | `host`                | `127.0.0.1`                       | Must be non-empty after trimming. An empty or whitespace-only value is a startup error rather than an implicit bind to every interface. Any other value is accepted, including one beyond loopback — see the warning under [Security](#security) before using one. |
-| `ACTIVITIES_DATA_PATH` | `activitiesDataPath`  | `activities.json` beside `server.js` | A relative value is resolved against the entrypoint's directory. The file itself may be absent, but its directory must exist and be writable, or startup fails. |
+| `ACTIVITIES_DATA_PATH` | `activitiesDataPath`  | `activities.json` beside `server.js` | A relative value is resolved against the entrypoint's directory. The file itself may be absent, but its directory must exist and be writable, or startup fails. Writability is checked by creating and immediately removing a probe file there, so a directory whose permissions or ACLs refuse writes is caught wherever the service runs — see [Operational notes](#operational-notes). |
 | `WORKBOOK_DIR`         | `workbookDir`         | the directory of `server.js`      | Any path holding `student_details.xlsx` and `student_other_info.xlsx`. A relative value is resolved against the entrypoint's directory. |
 
 **Relative path values resolve against the entrypoint's directory, never against the current
@@ -352,7 +352,22 @@ the group's first member, and groups are ordered by `activityKey` ascending.
     directory`.
 - The registry's **directory** is a different matter: it must exist and be writable at startup, so a
   misconfigured `ACTIVITIES_DATA_PATH` fails while the server is being built rather than on the
-  first `POST` hours later.
+  first `POST` hours later. Writability is established by **writing**, not by asking: startup
+  creates a uniquely named probe file — `.activities-registry-probe-<pid>-<random>` — in that
+  directory, writes no bytes to it, and removes it again immediately, so nothing of it survives a
+  normal run. Asking would not be dependable, which is why the probe exists: a `W_OK` access check
+  consults mode bits, so on Windows a deny-write ACL stays invisible to it and such a directory
+  would start a server that could never persist an activity. A directory that **refuses** the probe
+  is the fatal `Activity registry (<path>): the registry's directory <dir> is not writable, so an
+  activity could never be persisted (…)`. A probe that **cannot be completed** for any other reason
+  — the directory has just been removed, the filesystem is full — is the fatal `Activity registry
+  (<path>): the registry's directory <dir> could not be probed for writability, so an activity
+  could never be persisted (…)`. If the probe file is created and then cannot be **removed**,
+  startup carries on — writability is already proven — and the reason is written to stderr as
+  `Could not remove the activity registry writability probe file <path>: …`; that file is empty, so
+  it is safe to delete by hand. None of this promises that a later write will succeed: permissions
+  changed under a running process, a full disk or a lock still surface as a `500 INTERNAL_ERROR`
+  for the one request that meets them.
 - The same integrity rules apply to the workbooks: a header cell that is not exactly its expected
   label, a malformed or duplicate `Student ID`, a blank `Name`, an activity row naming a student the
   directory does not know, or a workbook that is missing or unreadable all abort startup with the
@@ -397,7 +412,51 @@ still **exits 0**, so an exit status alone cannot prove the suite ran.
 `npm run test:raw` is the same three files through `node --test` with no guard; use it to read
 per-test output while developing, not as the gate. Both commands name the test files explicitly,
 because passing a directory to `node --test` fails and because every `.js` file inside `test/` would
-otherwise be executed as a test.
+otherwise be executed as a test. Keep the `--test-concurrency=1` the script already carries — the
+reason is the next subsection.
+
+### One runner at a time: the suite owns `127.0.0.1:3000`
+
+`test/server.test.js` binds the default address deliberately. It is the only place the shipped
+entrypoint's startup banner, the greeting's exact 34 bytes and both bind-conflict paths are
+observable at all, so the address is fixed and **no environment variable moves it** — `PORT` and
+`HOST` are stripped from every child that file spawns. The practical consequence is a rule about the
+host rather than about the code:
+
+- Only **one** runner of this suite may be active on a machine at a time. A second `npm test`, a
+  second checkout of this repository, or anything else listening on `127.0.0.1:3000` blocks it.
+- A default-configuration `npm start` holds that same address. **Stop it before running the suite.**
+
+`npm test` checks this before it runs anything. When the port is already held it exits `1` having
+executed **no test**, with a single line on stderr:
+
+```text
+verify-tests.js: ENVIRONMENTAL PRECONDITION (not a product failure): 127.0.0.1:3000 is already in
+use, held by pid 80612. test/server.test.js must bind that exact address … No test was run. Free
+the port, or wait for the run holding it to finish, then re-run `npm test`.
+```
+
+That line is the whole report: the address is named once, the holder is identified where the host
+permits it (`netstat -ano` on Windows, `lsof` elsewhere) and degrades to the command you can run
+yourself when it does not. Without the check the suite ran anyway and reported **seven** failing
+tests whose titles — the baseline greeting, the activity route, the port being released after
+shutdown — read as product breakage when nothing was wrong with the product.
+
+Two limits of the check are worth knowing:
+
+- It applies only when the suite being run actually includes `test/server.test.js`, so a subset that
+  omits it is never blocked by a port it does not touch.
+- A port that is free when the check runs can still be taken before the suite binds it. Nothing
+  running on a shared host can close that window, so instead each affected failure message begins
+  with the same `ENVIRONMENTAL PRECONDITION` words — one search finds every such report, however it
+  was produced, and a blocked run stays distinguishable from a regression.
+
+`--test-concurrency=1` is what keeps that single fixed bind exclusive: at concurrency 1 the
+port-binding file cannot overlap any other file in the suite. The raw runner is defined with the
+flag for that reason, and it should stay. It is no longer load-bearing for temporary directories —
+each one now names the process that created it, so the fixture suite's leftover check excludes a
+directory a concurrently running sibling is still using while continuing to fail for one whose owner
+has exited.
 
 ### `MIN_TESTS` — the guard's minimum passing count
 
@@ -445,9 +504,9 @@ comparison up whatever else is uncommitted: one asserts the SHA-256 of each of t
 against its recorded baseline together with the absence of any `activities.json.tmp` or leftover
 temporary directory, and another asserts that same absence on the write-failure path specifically.
 
-`npm audit` needs registry access; a network failure there is not a feature failure. Note that
-`test/server.test.js` deliberately spawns the real entrypoint on `127.0.0.1:3000`, so stop a running
-`npm start` before running the suite.
+`npm audit` needs registry access; a network failure there is not a feature failure. The suite's one
+environmental precondition — a free `127.0.0.1:3000`, and so a stopped `npm start` — is covered
+above in [One runner at a time](#one-runner-at-a-time-the-suite-owns-1270013000).
 
 There is no linter, formatter, type checker, coverage tool or CI pipeline in this project;
 `node --check` is the static gate.

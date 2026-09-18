@@ -125,17 +125,29 @@ const CHECKOUT_TOKEN = crypto
   .slice(0, 12);
 
 /**
- * The `fs.mkdtempSync` prefix `test/activities.test.js` uses for its throwaway
- * registry directories. `os.tmpdir()` is host-wide and shared with other
- * checkouts and processes, so embedding `CHECKOUT_TOKEN` keeps the namespace
- * private to this working tree and the leftover assertion covers only the
- * directories this suite created. The derivation is duplicated rather than
- * shared because every `.js` file inside a directory named `test/` runs as a
- * test under default discovery, so no helper module can hold it, and the two
- * files run in separate child processes; it must stay in step with
- * `test/activities.test.js`, or the leftover check can never fail.
+ * The namespace every throwaway registry directory `test/activities.test.js`
+ * creates carries. `os.tmpdir()` is host-wide and shared with other checkouts
+ * and processes, so embedding `CHECKOUT_TOKEN` keeps the namespace private to
+ * this working tree and the leftover assertion covers only the directories this
+ * suite created. The derivation is duplicated rather than shared because every
+ * `.js` file inside a directory named `test/` runs as a test under default
+ * discovery, so no helper module can hold it, and the two files run in separate
+ * child processes; it must stay in step with `test/activities.test.js`, or the
+ * leftover check can never fail.
  */
-const TEMP_PREFIX = `student-activities-${CHECKOUT_TOKEN}-`;
+const TEMP_NAMESPACE = `student-activities-${CHECKOUT_TOKEN}-`;
+
+/**
+ * The OWNER SEGMENT `test/activities.test.js` writes immediately after the
+ * namespace: `p`, the pid of the process that created the directory, and a
+ * hyphen, before `fs.mkdtempSync`'s own random characters. Matched against the
+ * remainder of an entry name once the namespace has been stripped, so the
+ * captured group is the owning pid in decimal. The two files MUST STAY IN STEP
+ * on this shape as well as on the namespace: an owner this pattern cannot read
+ * is classified as a leftover, which is the safe direction - a convention
+ * changed on one side alone fails loudly here instead of silently passing.
+ */
+const TEMP_OWNER_PATTERN = /^p(\d+)-/;
 
 /**
  * The only directories the artifact walk does not descend into. Both are
@@ -307,6 +319,62 @@ const findTmpArtifacts = (dir, depth = 0) => {
     if (entry.name === TMP_ARTIFACT_NAME) found.artifacts.push(absolute);
   }
   return found;
+};
+
+/**
+ * Splits this checkout's temporary-directory entries into the ones a live
+ * sibling process is legitimately using and the ones nothing owns any more,
+ * which are the leftovers the suite failed to clean up.
+ *
+ * Only the second class is a fault. Under `node --test` at its default
+ * concurrency `test/activities.test.js` runs in a child process alongside this
+ * one and is mid-use of its registry directories, so matching the namespace
+ * alone reports a working directory as a leak; under the serialized runner
+ * `verify-tests.js` uses, that process has already exited and every directory
+ * it left behind is attributed to a dead owner and reported.
+ *
+ * Liveness is probed with `process.kill(pid, 0)`, which sends no signal and
+ * only asks the kernel about the pid. It has three outcomes and all three are
+ * handled: a normal return means the process exists; `EPERM` means it exists
+ * but this account may not signal it, which is ALIVE and must not be read as
+ * dead; `ESRCH` means no such process, so the directory is a leftover. Any
+ * other error is not evidence of liveness either and is treated the same way.
+ *
+ * An entry whose owner segment cannot be parsed - an old-format name predating
+ * the convention, or a directory created by something else inside this
+ * namespace - is a leftover, as is one owned by THIS process: this file creates
+ * no temporary directory, so its own pid appearing there is a fault, and
+ * treating it as "alive" would be a hole in the check.
+ *
+ * @param {string[]} names `os.tmpdir()` entry names, unfiltered.
+ * @returns {{leftovers: string[], liveSiblings: string[]}} The names of this
+ *   checkout's entries in each class, in `readdir` order.
+ */
+const classifyTempEntries = (names) => {
+  const classified = { leftovers: [], liveSiblings: [] };
+  for (const name of names) {
+    if (!name.startsWith(TEMP_NAMESPACE)) continue;
+    const owner = TEMP_OWNER_PATTERN.exec(name.slice(TEMP_NAMESPACE.length));
+    const pid = owner === null ? Number.NaN : Number(owner[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) {
+      classified.leftovers.push(name);
+      continue;
+    }
+    let alive;
+    try {
+      process.kill(pid, 0);
+      alive = true;
+    } catch (cause) {
+      const code =
+        cause !== null && typeof cause === 'object' && cause.code !== undefined
+          ? String(cause.code)
+          : 'UNKNOWN';
+      alive = code === 'EPERM';
+    }
+    if (alive) classified.liveSiblings.push(name);
+    else classified.leftovers.push(name);
+  }
+  return classified;
 };
 
 test('every workbook holds a header row plus ten student records', () => {
@@ -539,17 +607,32 @@ test('committed workbooks match their baseline digests and leave no temporary ar
     `no ${TMP_ARTIFACT_NAME} may remain under ${REPO_ROOT}; found ${walk.artifacts.join(', ')}`
   );
 
-  // `verify-tests.js` runs the test files at concurrency 1 with this file
-  // last, so any registry directory `test/activities.test.js` created has
-  // already been removed by its own `after` hook - reordering TEST_FILES would
-  // leave this filter asserting nothing. The filter matches TEMP_PREFIX, which
-  // carries this checkout's own token, so temp entries belonging to other
-  // checkouts or processes cannot fail it.
+  // The entries are matched on TEMP_NAMESPACE, which carries this checkout's
+  // own token, so temp directories belonging to other checkouts cannot fail
+  // this - and then classified by the owner pid each name declares, which is
+  // what makes the assertion independent of how the runner schedules the files.
+  // Under the serialized runner `verify-tests.js` uses, `test/activities.test.js`
+  // has exited by the time this file runs, so its pid is dead and any directory
+  // its `after` hook failed to remove is still caught; under a concurrent
+  // runner that process is alive and its working directories are excluded,
+  // because a directory in active use is not a failed cleanup. The invariant no
+  // longer depends on the order of TEST_FILES, only on the convention the two
+  // files share.
+  //
+  // The residual hazard, stated plainly: a dead owner's pid number can in
+  // principle be reused by an unrelated process, and a leftover would then be
+  // excluded here. Nothing in a test run can rely on that not happening, which
+  // is why this is the backstop and not the primary alarm - that remains
+  // `test/activities.test.js`'s own `after` hook, whose `fs.rmSync` throws
+  // after its retries and fails that file rather than this one.
   const tempRoot = os.tmpdir();
-  const leftovers = fs.readdirSync(tempRoot).filter((name) => name.startsWith(TEMP_PREFIX));
+  const { leftovers, liveSiblings } = classifyTempEntries(fs.readdirSync(tempRoot));
   assert.deepEqual(
     leftovers,
     [],
-    `no ${TEMP_PREFIX}* entry may remain in ${tempRoot}; found ${leftovers.join(', ')}`
+    `no ${TEMP_NAMESPACE}* entry whose owning process has exited may remain in ` +
+      `${tempRoot}; found ${leftovers.join(', ')} (${liveSiblings.length} entr` +
+      `${liveSiblings.length === 1 ? 'y' : 'ies'} excluded as a live sibling's ` +
+      `working directory${liveSiblings.length === 0 ? '' : `: ${liveSiblings.join(', ')}`})`
   );
 });
